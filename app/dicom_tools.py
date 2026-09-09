@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from app.config import DCMCJPEG, FINDSCU, MOVESCU, STORESCP
+
+
+class ToolMissing(RuntimeError):
+    pass
+
+
+_SENSITIVE_DICOM_FIELDS = re.compile(
+    r"(PatientName|PatientID|PatientBirthDate|AccessionNumber|"
+    r"0010,0010|0010,0020|0010,0030|0008,0050)",
+    re.IGNORECASE,
+)
+
+
+def _require(path: str, name: str) -> str:
+    if Path(path).exists() or shutil.which(path):
+        return path
+    which = shutil.which(name)
+    if which:
+        return which
+    raise ToolMissing(f"{name} não encontrado ({path})")
+
+
+def findscu_cmd(
+    bin_path: str,
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    accession: str,
+    birth_date: str,
+) -> list[str]:
+    return [
+        bin_path,
+        "-v",
+        "-S",
+        "-k",
+        "0008,0052=STUDY",
+        "-k",
+        "0008,0061=",
+        "-k",
+        "0010,0010=",
+        "-k",
+        "0010,0020=",
+        "-k",
+        f"0010,0030={birth_date}",
+        "-k",
+        f"0008,0050={accession}",
+        "-k",
+        "0020,000d=",
+        "-aet",
+        calling_aet,
+        "-aec",
+        pacs_aet,
+        pacs_ip,
+        str(pacs_port),
+    ]
+
+
+def movescu_cmd(
+    bin_path: str,
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    study_uid: str,
+    destination_aet: str,
+) -> list[str]:
+    """Build a Study Root C-MOVE with an explicit move destination."""
+    return [
+        bin_path,
+        "-v",
+        "-S",
+        "-pdu",
+        "65534",
+        "-aet",
+        calling_aet,
+        "-aec",
+        pacs_aet,
+        "-aem",
+        destination_aet,
+        "-k",
+        "0008,0052=STUDY",
+        "-k",
+        f"0020,000D={study_uid}",
+        pacs_ip,
+        str(pacs_port),
+    ]
+
+
+def storescp_cmd(bin_path: str, aet: str, port: int, output_dir: str) -> list[str]:
+    return [
+        bin_path,
+        "+xa",
+        "-pdu",
+        "65534",
+        "--fork",
+        "-od",
+        output_dir,
+        "-aet",
+        aet,
+        str(port),
+    ]
+
+
+def dcmcjpeg_cmd(bin_path: str, flag: str, src: str, dest: str) -> list[str]:
+    return [bin_path, "-q", "+un", flag, src, dest]
+
+
+def c_find(
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    accession: str,
+    birth_date: str,
+    timeout: int = 60,
+) -> tuple[int, str]:
+    bin_path = _require(FINDSCU, "findscu")
+    return _run(
+        findscu_cmd(
+            bin_path, calling_aet, pacs_aet, pacs_ip, pacs_port, accession, birth_date
+        ),
+        timeout,
+    )
+
+
+def c_move(
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    study_uid: str,
+    destination_aet: str,
+    timeout: int,
+) -> tuple[int, str]:
+    bin_path = _require(MOVESCU, "movescu")
+    return _run(
+        movescu_cmd(
+            bin_path,
+            calling_aet,
+            pacs_aet,
+            pacs_ip,
+            pacs_port,
+            study_uid,
+            destination_aet,
+        ),
+        timeout,
+    )
+
+
+def start_storescp(aet: str, port: int, output_dir: str) -> subprocess.Popen:
+    bin_path = _require(STORESCP, "storescp")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen(
+        storescp_cmd(bin_path, aet, port, output_dir),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def dcmcjpeg(flag: str, src: str, dest: str, timeout: int = 120) -> tuple[int, str]:
+    bin_path = _require(DCMCJPEG, "dcmcjpeg")
+    return _run(dcmcjpeg_cmd(bin_path, flag, src, dest), timeout)
+
+
+def _run(cmd: list[str], timeout: int) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            errors="replace",
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out
+    except subprocess.TimeoutExpired as exc:
+        stdout = (
+            exc.stdout.decode("utf-8", "replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", "replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        )
+        out = stdout + stderr
+        return 124, out + "\nTIMEOUT"
+    except FileNotFoundError as exc:
+        raise ToolMissing(str(exc)) from exc
+
+
+def redact_dicom_output(output: str) -> str:
+    """Remove PHI-bearing DCMTK lines before persisting diagnostic output."""
+    return "\n".join(
+        "[REDACTED]" if _SENSITIVE_DICOM_FIELDS.search(line) else line
+        for line in (output or "").splitlines()
+    )

@@ -1,0 +1,26 @@
+{% from "icons.html" import icon %}
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#102d3c">
+  <title>{{ status_code }} · Retrieve Manager</title>
+  <link rel="stylesheet" href="/static/app.css?v=4">
+</head>
+<body>
+<main class="error-page">
+  <section class="surface error-panel" aria-labelledby="error-title">
+    <a class="brand" href="{{ home_href }}" aria-label="Retrieve Manager — início">
+      <span class="brand__mark">{{ icon("activity") }}</span>
+      <span class="visually-hidden">Retrieve Manager</span>
+    </a>
+    <div class="error-panel__code">ERRO {{ status_code }}</div>
+    <h1 id="error-title">{{ title }}</h1>
+    <p>{{ message }}</p>
+    <a class="btn btn--primary" href="{{ action_href }}">{{ action_label }}</a>
+    {% if request_id %}<small class="error-panel__request">ID da solicitação: <span class="mono">{{ request_id }}</span></small>{% endif %}
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,65 @@
+{% from "icons.html" import icon %}
+{% if not units %}
+<div class="surface empty-state">
+  <div class="empty-state__content">
+    <div class="empty-state__icon">{{ icon("building") }}</div>
+    <h2>Nenhuma unidade configurada</h2>
+    <p>Cadastre a primeira unidade para iniciar o recebimento e o envio de imagens.</p>
+    <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Cadastrar unidade</a>
+  </div>
+</div>
+{% else %}
+<div class="unit-grid">
+  {% for u in units %}
+  <article class="card unit-card{% if not u.enabled %} is-paused{% elif not u.store_up %} is-offline{% endif %}">
+    <div class="unit-card__header">
+      <div>
+        <h2 class="unit-card__title">{{ u.name }}</h2>
+        <p class="unit-card__meta">{{ u.dest_aet }} → {{ u.pacs_aet }} · {{ u.pacs_ip }}:{{ u.pacs_port }}</p>
+      </div>
+      <div class="unit-card__statuses" aria-label="Status da unidade">
+        {% if u.enabled %}
+          <span class="status-badge status-badge--success">Ativa</span>
+        {% else %}
+          <span class="status-badge status-badge--neutral">Pausada</span>
+        {% endif %}
+        {% if u.store_up %}
+          <span class="status-badge status-badge--success">Store ativo · {{ u.store_port }}</span>
+        {% else %}
+          <span class="status-badge status-badge--danger">Store indisponível</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="unit-card__stats" aria-label="Volumes por etapa">
+      <div class="metric"><strong class="metric__value">{{ u.counts.watching }}</strong><span class="metric__label">No PACS</span></div>
+      <div class="metric"><strong class="metric__value">{{ u.counts.queue }}</strong><span class="metric__label">Na fila</span></div>
+      <div class="metric"><strong class="metric__value">{{ u.counts.running }}</strong><span class="metric__label">Em processo</span></div>
+      <div class="metric"><strong class="metric__value">{{ u.counts.error }}</strong><span class="metric__label">Erros em 24h</span></div>
+    </div>
+
+    <div class="unit-card__folders" aria-label="Arquivos por pasta">
+      <span class="folder-count">Pedidos <strong>{{ u.folders.input }}</strong></span>
+      <span class="folder-count">Recebimento <strong>{{ u.folders.receive }}</strong></span>
+      <span class="folder-count">Envio <strong>{{ u.folders.send }}</strong></span>
+      <span class="folder-count">Erro <strong>{{ u.folders.error }}</strong></span>
+    </div>
+
+    <footer class="unit-card__footer">
+      <div class="button-group">
+        <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
+        <a class="btn btn--quiet btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
+      </div>
+      <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
+        <button class="btn btn--secondary btn--sm" type="submit">
+          {{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}
+        </button>
+      </form>
+    </footer>
+  </article>
+  {% endfor %}
+</div>
+{% if pager and pager.pages > 1 %}
+<div class="surface">{% include "pager.html" %}</div>
+{% endif %}
+{% endif %}

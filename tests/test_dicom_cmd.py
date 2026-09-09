@@ -1,0 +1,75 @@
+import unittest
+
+from app.dicom_tools import (
+    dcmcjpeg_cmd,
+    findscu_cmd,
+    movescu_cmd,
+    redact_dicom_output,
+    storescp_cmd,
+)
+
+
+class DicomCmdTest(unittest.TestCase):
+    def test_findscu_is_dcmtk(self):
+        cmd = findscu_cmd(
+            "/opt/dcmtk/bin/findscu",
+            "mob",
+            "srvpacsFIR",
+            "10.20.0.31",
+            2104,
+            "9202604600211333",
+            "19820226",
+        )
+        self.assertEqual(cmd[0], "/opt/dcmtk/bin/findscu")
+        self.assertIn("-S", cmd)
+        self.assertIn("-aet", cmd)
+        self.assertIn("mob", cmd)
+        self.assertIn("-aec", cmd)
+        self.assertIn("srvpacsFIR", cmd)
+        self.assertIn("0008,0050=9202604600211333", cmd)
+        self.assertIn("0010,0030=19820226", cmd)
+        self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
+        self.assertNotIn("--bind", cmd)
+
+    def test_movescu_is_dcmtk_not_dcm4che(self):
+        cmd = movescu_cmd(
+            "/opt/dcmtk/bin/movescu",
+            "mob",
+            "srvpacsFIR",
+            "10.20.0.31",
+            2104,
+            "1.2.840.1",
+            "retrieve-dest",
+        )
+        self.assertEqual(cmd[0], "/opt/dcmtk/bin/movescu")
+        self.assertIn("-S", cmd)
+        self.assertIn("-aet", cmd)
+        self.assertIn("mob", cmd)
+        self.assertIn("-aec", cmd)
+        self.assertIn("srvpacsFIR", cmd)
+        self.assertIn("0020,000D=1.2.840.1", cmd)
+        self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
+        self.assertIn("-aem", cmd)
+        self.assertIn("retrieve-dest", cmd)
+        self.assertNotIn("--bind", cmd)
+        self.assertNotIn("--dest", cmd)
+        self.assertNotIn("-c", cmd)
+        self.assertNotIn("+P", cmd)
+        self.assertNotIn("--port", cmd)
+
+    def test_storescp_and_jpeg_unchanged(self):
+        scp = storescp_cmd("/opt/dcmtk/bin/storescp", "mob", 444, "/data/in")
+        self.assertIn("+xa", scp)
+        self.assertIn("--fork", scp)
+        jpeg = dcmcjpeg_cmd("/opt/dcmtk/bin/dcmcjpeg", "+e1", "a.dcm", "b.dcm")
+        self.assertEqual(jpeg[1:4], ["-q", "+un", "+e1"])
+
+    def test_dicom_output_redacts_phi(self):
+        output = "(0010,0010) PN [SILVA^JOAO] # PatientName\nstatus ok"
+        safe = redact_dicom_output(output)
+        self.assertNotIn("SILVA", safe)
+        self.assertIn("status ok", safe)
+
+
+if __name__ == "__main__":
+    unittest.main()

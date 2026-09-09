@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Pedido {{ order.acc }} · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <nav class="breadcrumb" aria-label="Navegação estrutural">
+        <a href="/orders">Fila de pedidos</a><span aria-hidden="true">/</span><span>{{ order.unit.name }}</span>
+      </nav>
+      <h1>{{ order.acc }}</h1>
+      <p class="page-header__description">Arquivo {{ order.filename }}</p>
+    </div>
+    <div class="page-header__actions">
+      {% if order.status == 'error' %}
+      <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry">
+        <button class="btn btn--primary" type="submit">{{ icon("retry") }} Reprocessar</button>
+      </form>
+      {% endif %}
+      {% if order.status not in ('done', 'cancelled') %}
+      <form class="inline-form" method="post" action="/orders/{{ order.id }}/cancel" data-confirm="Cancelar este pedido? O processamento atual será interrompido." data-confirm-label="Cancelar pedido">
+        <button class="btn btn--danger" type="submit">Cancelar pedido</button>
+      </form>
+      {% endif %}
+      <a class="btn btn--secondary" href="/orders">{{ icon("arrow-left") }} Voltar</a>
+    </div>
+  </header>
+
+  <div class="section-grid section-grid--detail">
+    <section class="card" aria-labelledby="order-data-title">
+      <div class="card__header">
+        <div>
+          <h2 id="order-data-title">Dados do pedido</h2>
+          <p>Identificação e agendamento do fluxo.</p>
+        </div>
+        <span class="status-badge {{ badge }}">{{ status_label }}</span>
+      </div>
+      <dl class="description-list">
+        <dt>Unidade</dt><dd>{{ order.unit.name }}</dd>
+        <dt>Correlation ID</dt><dd class="mono">{{ order.correlation_id }}</dd>
+        <dt>Patient ID</dt><dd>{{ order.pat_id or 'Não informado' }}</dd>
+        <dt>Accession</dt><dd class="mono">{{ order.acc }}</dd>
+        <dt>Nascimento</dt><dd>{{ order.birth_date or 'Não informado' }}</dd>
+        <dt>Data do exame</dt><dd>{{ order.exam_date or 'Não informado' }}</dd>
+        <dt>Modalidade</dt><dd>{{ order.modality or 'Não informada' }}</dd>
+        <dt>Study UID</dt><dd class="mono">{{ order.study_uid or 'Não informado' }}</dd>
+        <dt>1º retrieve</dt><dd>{{ order.retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.retrieve_at else 'Não agendado' }}</dd>
+        <dt>2º retrieve</dt><dd>{{ order.second_retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.second_retrieve_at else 'Não agendado' }}</dd>
+        <dt>Tentativas</dt><dd>{{ order.attempts }}</dd>
+        {% if order.last_error %}<dt>Último erro</dt><dd class="text-danger">{{ order.last_error }}</dd>{% endif %}
+      </dl>
+
+      <div class="card__section" aria-labelledby="images-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="images-title">Imagens</h2>
+            <p>Arquivos associados a este pedido.</p>
+          </div>
+        </div>
+        {% if transfer_stats %}
+        <div class="button-group" aria-label="Imagens por status">
+          {% for transfer_status, count in transfer_stats %}
+          <span class="chip">{{ transfer_status }} · {{ count }}</span>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="muted small">Nenhuma imagem foi correlacionada até o momento.</p>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="timeline-title">
+      <div class="card__header">
+        <div>
+          <h2 id="timeline-title">Linha do tempo</h2>
+          <p>Eventos mais recentes do processamento.</p>
+        </div>
+        {{ icon("timeline") }}
+      </div>
+      {% if not events %}
+      <div class="empty-state">
+        <div class="empty-state__content">
+          <div class="empty-state__icon">{{ icon("timeline") }}</div>
+          <h2>Ainda não há eventos</h2>
+          <p>O histórico será atualizado quando o processamento começar.</p>
+        </div>
+      </div>
+      {% else %}
+      <ol class="timeline">
+        {% for e in events %}
+        <li class="timeline__item">
+          <span class="timeline__marker" aria-hidden="true"></span>
+          <div class="timeline__meta">{{ e.created_at.strftime('%d/%m/%Y · %H:%M:%S') }} · {{ e.level }}</div>
+          <p class="timeline__message">{{ e.message }}</p>
+          {% if e.detail %}
+          <details>
+            <summary>Ver detalhes técnicos</summary>
+            <pre class="log-box">{{ e.detail[-8000:] }}</pre>
+          </details>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% include "pager.html" %}
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

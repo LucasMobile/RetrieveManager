@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Fila de pedidos · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Operação</p>
+      <h1>Fila de pedidos</h1>
+      <p class="page-header__description">Consulte cada pedido e acompanhe a etapa atual do processamento.</p>
+    </div>
+  </header>
+
+  <form class="surface filter-bar" method="get" action="/orders" aria-label="Filtros da fila">
+    <div class="filter-grid">
+      <div class="field">
+        <label for="filter-unit">Unidade</label>
+        <select id="filter-unit" name="unit_id">
+          <option value="">Todas as unidades</option>
+          {% for u in units %}
+          <option value="{{ u.id }}" {% if unit_id == u.id %}selected{% endif %}>{{ u.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="filter-status">Status</label>
+        <select id="filter-status" name="status">
+          <option value="">Todos os status</option>
+          {% for key, label in statuses.items() %}
+          <option value="{{ key }}" {% if status == key %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="filter-query">Pedido ou paciente</label>
+        <input id="filter-query" name="q" value="{{ q }}" placeholder="Accession, Patient ID ou arquivo">
+      </div>
+      <div class="filter-actions">
+        <button class="btn btn--primary" type="submit">{{ icon("search") }} Filtrar</button>
+        {% if unit_id or status or q %}<a class="btn btn--quiet" href="/orders">Limpar</a>{% endif %}
+      </div>
+    </div>
+  </form>
+
+  <section class="surface card--flush" aria-labelledby="orders-table-title">
+    <h2 class="visually-hidden" id="orders-table-title">Pedidos encontrados</h2>
+    {% if not orders %}
+    <div class="empty-state">
+      <div class="empty-state__content">
+        <div class="empty-state__icon">{{ icon("orders") }}</div>
+        {% if unit_id or status or q %}
+          <h2>Nenhum pedido encontrado</h2>
+          <p>Revise os filtros ou limpe a busca para visualizar toda a fila.</p>
+          <a class="btn btn--secondary" href="/orders">Limpar filtros</a>
+        {% else %}
+          <h2>A fila está vazia</h2>
+          <p>Os pedidos aparecerão aqui assim que forem detectados nas unidades ativas.</p>
+        {% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <caption>{{ pager.total }} pedido{% if pager.total != 1 %}s{% endif %} na seleção atual</caption>
+        <thead>
+          <tr>
+            <th scope="col">Recebido</th>
+            <th scope="col">Unidade</th>
+            <th scope="col">Paciente / accession</th>
+            <th scope="col">Modalidade</th>
+            <th scope="col">Status</th>
+            <th scope="col">Próximo passo</th>
+            <th scope="col"><span class="visually-hidden">Ações</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for o in orders %}
+          <tr>
+            <td><span class="table-secondary">{{ o.created_at.strftime('%d/%m/%Y') }}</span><span class="table-primary">{{ o.created_at.strftime('%H:%M') }}</span></td>
+            <td>{{ o.unit.name }}</td>
+            <td>
+              <a class="table-primary" href="/orders/{{ o.id }}">{{ o.pat_id or 'Paciente não informado' }}</a>
+              <span class="table-secondary mono">{{ o.acc }}</span>
+            </td>
+            <td>{{ o.modality or '—' }}</td>
+            <td><span class="status-badge {{ o.badge }}">{{ o.status_label }}</span></td>
+            <td class="small">
+              {% if o.retrieve_at and o.status == 'wait_retrieve' %}<span class="table-primary">1º retrieve às {{ o.retrieve_at.strftime('%H:%M') }}</span>{% endif %}
+              {% if o.second_retrieve_at and o.status == 'wait_second' %}<span class="table-primary">2º retrieve às {{ o.second_retrieve_at.strftime('%H:%M') }}</span>{% endif %}
+              {% if o.last_error %}<span class="table-secondary text-danger">{{ o.last_error[:80] }}</span>{% endif %}
+              {% if not o.last_error and o.status not in ('wait_retrieve', 'wait_second') %}<span class="muted">—</span>{% endif %}
+            </td>
+            <td>
+              <div class="table-actions">
+                {% if o.status == 'error' %}
+                <form class="inline-form" method="post" action="/orders/{{ o.id }}/retry">
+                  <button class="btn btn--secondary btn--sm" type="submit">{{ icon("retry") }} Reprocessar</button>
+                </form>
+                {% endif %}
+                {% if o.status not in ('done', 'cancelled') %}
+                <form class="inline-form" method="post" action="/orders/{{ o.id }}/cancel" data-confirm="Cancelar este pedido? O processamento atual será interrompido." data-confirm-label="Cancelar pedido">
+                  <button class="btn btn--danger btn--sm" type="submit">Cancelar</button>
+                </form>
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "pager.html" %}
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Tempo de retrieve · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Configurações</p>
+      <h1>Tempo de retrieve</h1>
+      <p class="page-header__description">Defina quando cada modalidade será buscada no PACS. A regra <code>*</code> atende modalidades sem configuração específica.</p>
+    </div>
+  </header>
+
+  <section class="card" aria-labelledby="retrieve-rules-title">
+    <div class="card__header">
+      <div><h2 id="retrieve-rules-title">Regras por modalidade</h2><p>Os tempos são contados a partir da detecção do pedido.</p></div>
+    </div>
+
+    <div class="rule-list">
+      <div class="rule-list__header rule-grid--retrieve" aria-hidden="true">
+        <span>Modalidade</span><span>1º retrieve</span><span>Nova tentativa</span><span>2º retrieve</span><span>Ação</span>
+      </div>
+      {% for r in rules %}
+      <form method="post" action="/rules/retrieve/{{ r.id }}" class="rule-row rule-grid--retrieve">
+        <div class="rule-field">
+          <label for="modality-{{ r.id }}">Modalidade</label>
+          <input id="modality-{{ r.id }}" name="modality" value="{{ r.modality }}" maxlength="8" {% if r.modality == '*' %}readonly{% endif %} required>
+        </div>
+        <div class="rule-field">
+          <label for="wait-{{ r.id }}">1º retrieve (min)</label>
+          <input id="wait-{{ r.id }}" name="wait_minutes" type="number" min="0" max="1440" value="{{ r.wait_minutes }}" required>
+        </div>
+        <div class="rule-field">
+          <label for="second-{{ r.id }}">Nova tentativa</label>
+          <select id="second-{{ r.id }}" name="second_retrieve">
+            <option value="1" {% if r.second_retrieve %}selected{% endif %}>Ativada</option>
+            <option value="0" {% if not r.second_retrieve %}selected{% endif %}>Desativada</option>
+          </select>
+        </div>
+        <div class="rule-field">
+          <label for="second-wait-{{ r.id }}">2º retrieve (min)</label>
+          <input id="second-wait-{{ r.id }}" name="second_wait_minutes" type="number" min="0" max="2880" value="{{ r.second_wait_minutes }}" required>
+        </div>
+        <button class="btn btn--secondary btn--sm" type="submit">Salvar</button>
+      </form>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="new-retrieve-title">
+    <div class="card__header">
+      <div><h2 id="new-retrieve-title">Adicionar modalidade</h2><p>Crie uma exceção à regra padrão.</p></div>
+    </div>
+    <form method="post" action="/rules/retrieve" class="inline-create inline-create--retrieve">
+      <div class="field"><label for="new-modality">Modalidade</label><input id="new-modality" name="modality" placeholder="Ex.: XA" maxlength="8" required></div>
+      <div class="field"><label for="new-wait">1º retrieve (min)</label><input id="new-wait" name="wait_minutes" type="number" min="0" max="1440" value="10" required></div>
+      <div class="field"><label for="new-second">Nova tentativa</label><select id="new-second" name="second_retrieve"><option value="0">Desativada</option><option value="1">Ativada</option></select></div>
+      <div class="field"><label for="new-second-wait">2º retrieve (min)</label><input id="new-second-wait" name="second_wait_minutes" type="number" min="0" max="2880" value="90" required></div>
+      <button class="btn btn--primary" type="submit">{{ icon("plus") }} Adicionar</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

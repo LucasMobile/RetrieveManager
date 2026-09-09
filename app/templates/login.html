@@ -1,0 +1,60 @@
+{% from "icons.html" import icon %}
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#102d3c">
+  <title>Entrar · Retrieve Manager</title>
+  <link rel="stylesheet" href="/static/app.css?v=4">
+  <script src="/static/app.js?v=4" defer></script>
+</head>
+<body class="login-page">
+<a class="skip-link" href="#login-form">Pular para o formulário</a>
+<main class="login-shell">
+  <section class="login-context" aria-label="Sobre o sistema">
+    <div class="brand">
+      <span class="brand__mark">{{ icon("activity") }}</span>
+      <span class="brand__copy">
+        <strong>Retrieve Manager</strong>
+        <span>Operação de imagens</span>
+      </span>
+    </div>
+    <div class="login-context__copy">
+      <h1>Fluxos PACS sob controle.</h1>
+      <p>Acompanhe recebimento, processamento e envio de imagens em uma única operação.</p>
+    </div>
+    <span class="login-context__status">Acesso restrito a usuários autorizados</span>
+  </section>
+
+  <section class="login-main">
+    <div class="login-panel">
+      <p class="login-panel__eyebrow">Área administrativa</p>
+      <h2>Entrar</h2>
+      <p class="login-panel__description">Use suas credenciais para acessar a operação.</p>
+
+      {% if error %}
+      <div class="login-alert" role="alert">
+        {{ icon("alert") }}<span>{{ error }}</span>
+      </div>
+      {% endif %}
+
+      <form class="form-stack" id="login-form" method="post" action="/login">
+        <div class="field">
+          <label for="username">Usuário</label>
+          <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+        </div>
+        <div class="field">
+          <label for="password">Senha</label>
+          <div class="field__control">
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+            <button class="field__action" type="button" data-password-toggle="password" aria-pressed="false">Mostrar</button>
+          </div>
+        </div>
+        <button class="btn btn--primary" type="submit">Entrar</button>
+      </form>
+    </div>
+  </section>
+</main>
+</body>
+</html>

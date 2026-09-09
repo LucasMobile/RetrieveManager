@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Unidades · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Cadastro</p>
+      <h1>Unidades</h1>
+      <p class="page-header__description">Gerencie conexões PACS, serviços de store e diretórios de cada operação.</p>
+    </div>
+    <div class="page-header__actions">
+      <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
+    </div>
+  </header>
+
+  <section class="surface card--flush" aria-labelledby="units-title">
+    <h2 class="visually-hidden" id="units-title">Unidades cadastradas</h2>
+    {% if not units %}
+    <div class="empty-state">
+      <div class="empty-state__content">
+        <div class="empty-state__icon">{{ icon("building") }}</div>
+        <h2>Nenhuma unidade cadastrada</h2>
+        <p>O retrieve poderá começar assim que a primeira conexão PACS estiver configurada.</p>
+        <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Cadastrar unidade</a>
+      </div>
+    </div>
+    {% else %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <caption>{{ pager.total }} unidade{% if pager.total != 1 %}s{% endif %} cadastrada{% if pager.total != 1 %}s{% endif %}</caption>
+        <thead>
+          <tr>
+            <th scope="col">Unidade</th>
+            <th scope="col">Estado</th>
+            <th scope="col">PACS</th>
+            <th scope="col">Store</th>
+            <th scope="col">Pasta de pedidos</th>
+            <th scope="col"><span class="visually-hidden">Ações</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for u in units %}
+          <tr>
+            <td><a href="/units/{{ u.id }}">{{ u.name }}</a></td>
+            <td>
+              {% if u.enabled %}<span class="status-badge status-badge--success">Ativa</span>
+              {% else %}<span class="status-badge status-badge--neutral">Pausada</span>{% endif %}
+            </td>
+            <td><span class="table-primary">{{ u.pacs_aet }}</span><span class="table-secondary mono">{{ u.pacs_ip }}:{{ u.pacs_port }}</span></td>
+            <td><span class="table-primary">{{ u.dest_aet }}</span><span class="table-secondary">Porta {{ u.store_port }}</span></td>
+            <td class="mono small">{{ u.input_dir }}</td>
+            <td>
+              <div class="table-actions">
+                <a class="btn btn--quiet btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
+                <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
+                  <button class="btn btn--secondary btn--sm" type="submit">{{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "pager.html" %}
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

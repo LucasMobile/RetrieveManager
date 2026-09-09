@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Visão geral · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Operação</p>
+      <h1>Visão geral</h1>
+      <p class="page-header__description">Acompanhe a disponibilidade das unidades e o volume em cada etapa do processamento.</p>
+    </div>
+    <div class="page-header__actions">
+      <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
+    </div>
+  </header>
+
+  <section class="poll-region" data-poll="/dashboard/partial?page={{ pager.page if pager else 1 }}" data-interval="5000" aria-live="polite" aria-label="Estado das unidades">
+    {% include "dashboard_partial.html" %}
+  </section>
+</div>
+{% endblock %}

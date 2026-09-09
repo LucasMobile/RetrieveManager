@@ -1,0 +1,19 @@
+{% from "icons.html" import icon %}
+{% if pager and pager.total %}
+<nav class="pager" aria-label="Paginação">
+  <span>Exibindo {{ pager.from }}–{{ pager.to }} de {{ pager.total }}</span>
+  <div class="pager__controls">
+    {% if pager.has_prev %}
+      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}page={{ pager.prev }}" rel="prev" aria-label="Página anterior">{{ icon("chevron-left") }} <span>Anterior</span></a>
+    {% else %}
+      <span class="pager__link is-disabled" aria-disabled="true">{{ icon("chevron-left") }} <span>Anterior</span></span>
+    {% endif %}
+    <span class="pager__current" aria-current="page">{{ pager.page }} de {{ pager.pages }}</span>
+    {% if pager.has_next %}
+      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}page={{ pager.next }}" rel="next" aria-label="Próxima página"><span>Próxima</span> {{ icon("chevron-right") }}</a>
+    {% else %}
+      <span class="pager__link is-disabled" aria-disabled="true"><span>Próxima</span> {{ icon("chevron-right") }}</span>
+    {% endif %}
+  </div>
+</nav>
+{% endif %}

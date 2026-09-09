@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Compactação · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Configurações</p>
+      <h1>Compactação e descarte</h1>
+      <p class="page-header__description">Controle o perfil JPEG por modalidade e quais imagens devem ser descartadas no recebimento.</p>
+    </div>
+  </header>
+
+  <div class="section-grid section-grid--2">
+    <section class="card" aria-labelledby="compression-title">
+      <div class="card__header">
+        <div>
+          <h2 id="compression-title">Perfil JPEG</h2>
+          <p>A regra <code>*</code> é aplicada quando não há perfil específico.</p>
+        </div>
+      </div>
+
+      <div class="rule-list">
+        <div class="rule-list__header rule-grid--compress" aria-hidden="true"><span>Modalidade</span><span>Perfil</span><span>Ação</span></div>
+        {% for r in compress %}
+        <form method="post" action="/rules/compress/{{ r.id }}" class="rule-row rule-grid--compress">
+          <div class="rule-field">
+            <label for="compress-modality-{{ r.id }}">Modalidade</label>
+            <input id="compress-modality-{{ r.id }}" name="modality" value="{{ r.modality }}" maxlength="8" {% if r.modality == '*' %}readonly{% endif %} required>
+          </div>
+          <div class="rule-field">
+            <label for="jpeg-flag-{{ r.id }}">Perfil JPEG</label>
+            <select id="jpeg-flag-{{ r.id }}" name="jpeg_flag">
+              <option value="+e1" {% if r.jpeg_flag == '+e1' %}selected{% endif %}>+e1 · Lossless SV1</option>
+              <option value="+eb" {% if r.jpeg_flag == '+eb' %}selected{% endif %}>+eb · Baseline lossy</option>
+              <option value="+ee" {% if r.jpeg_flag == '+ee' %}selected{% endif %}>+ee · Extended</option>
+            </select>
+          </div>
+          <button class="btn btn--secondary btn--sm" type="submit">Salvar</button>
+        </form>
+        {% endfor %}
+      </div>
+
+      <form method="post" action="/rules/compress" class="inline-create">
+        <div class="field"><label for="compress-new-modality">Modalidade</label><input id="compress-new-modality" name="modality" placeholder="Ex.: CT" maxlength="8" required></div>
+        <div class="field"><label for="compress-new-flag">Perfil JPEG</label><select id="compress-new-flag" name="jpeg_flag"><option value="+e1">+e1 · Lossless SV1</option><option value="+eb">+eb · Baseline lossy</option><option value="+ee">+ee · Extended</option></select></div>
+        <button class="btn btn--primary" type="submit">{{ icon("plus") }} Adicionar</button>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="drop-title">
+      <div class="card__header">
+        <div>
+          <h2 id="drop-title">Descarte no recebimento</h2>
+          <p>Compara o código com a modalidade ou com os dois primeiros caracteres do arquivo.</p>
+        </div>
+      </div>
+
+      {% if drops %}
+      <div class="rule-list">
+        <div class="rule-list__header rule-grid--drop" aria-hidden="true"><span>Código</span><span>Ação</span></div>
+        {% for d in drops %}
+        <div class="rule-row rule-grid--drop">
+          <span class="chip">{{ d.code }}</span>
+          <form class="inline-form" method="post" action="/rules/drop/{{ d.id }}/delete" data-confirm="Remover {{ d.code }} da lista de descarte? Novos arquivos dessa modalidade deixarão de ser descartados." data-confirm-label="Remover código">
+            <button class="btn btn--danger btn--sm" type="submit">{{ icon("trash") }} Remover</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="muted small">Nenhum código configurado para descarte.</p>
+      {% endif %}
+
+      <form method="post" action="/rules/drop" class="inline-create inline-create--drop">
+        <div class="field"><label for="drop-code">Novo código</label><input id="drop-code" name="code" placeholder="Ex.: US" maxlength="8" required></div>
+        <button class="btn btn--secondary" type="submit">{{ icon("plus") }} Adicionar código</button>
+      </form>
+    </section>
+  </div>
+</div>
+{% endblock %}

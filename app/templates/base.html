@@ -1,0 +1,108 @@
+{% from "icons.html" import icon %}
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#102d3c">
+  <title>{% block title %}Retrieve Manager{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css?v=4">
+  <script src="/static/app.js?v=4" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Pular para o conteúdo</a>
+
+<div class="app-shell">
+  <aside class="sidebar" id="primary-navigation" aria-label="Navegação principal">
+    <div class="sidebar__header">
+      <a class="brand" href="/" aria-label="Retrieve Manager — início">
+        <span class="brand__mark">{{ icon("activity") }}</span>
+        <span class="brand__copy">
+          <strong>Retrieve Manager</strong>
+          <span>Operação de imagens</span>
+        </span>
+      </a>
+      <button class="icon-button sidebar__close" type="button" data-sidebar-close aria-label="Fechar menu">
+        {{ icon("close") }}
+      </button>
+    </div>
+
+    <nav class="nav">
+      <p class="nav__label">Operação</p>
+      <a href="/" class="nav__item{% if nav == 'dash' %} is-active{% endif %}"{% if nav == 'dash' %} aria-current="page"{% endif %}>
+        {{ icon("dashboard") }}<span>Visão geral</span>
+      </a>
+      <a href="/orders" class="nav__item{% if nav == 'orders' %} is-active{% endif %}"{% if nav == 'orders' %} aria-current="page"{% endif %}>
+        {{ icon("orders") }}<span>Fila de pedidos</span>
+      </a>
+      <a href="/units" class="nav__item{% if nav == 'units' %} is-active{% endif %}"{% if nav == 'units' %} aria-current="page"{% endif %}>
+        {{ icon("building") }}<span>Unidades</span>
+      </a>
+
+      <p class="nav__label">Configurações</p>
+      <a href="/rules/retrieve" class="nav__item{% if nav == 'retrieve' %} is-active{% endif %}"{% if nav == 'retrieve' %} aria-current="page"{% endif %}>
+        {{ icon("clock") }}<span>Tempo de retrieve</span>
+      </a>
+      <a href="/rules/compress" class="nav__item{% if nav == 'compress' %} is-active{% endif %}"{% if nav == 'compress' %} aria-current="page"{% endif %}>
+        {{ icon("compress") }}<span>Compactação</span>
+      </a>
+      <a href="/settings" class="nav__item{% if nav == 'settings' %} is-active{% endif %}"{% if nav == 'settings' %} aria-current="page"{% endif %}>
+        {{ icon("settings") }}<span>Nuvem e acesso</span>
+      </a>
+    </nav>
+
+    {% if user %}
+    <div class="account">
+      <div class="account__avatar" aria-hidden="true">{{ user.username[:1]|upper }}</div>
+      <div class="account__copy">
+        <strong>{{ user.username }}</strong>
+        <span>Administrador</span>
+      </div>
+      <form method="post" action="/logout">
+        <button class="icon-button icon-button--inverse" type="submit" aria-label="Sair da conta" title="Sair">
+          {{ icon("log-out") }}
+        </button>
+      </form>
+    </div>
+    {% endif %}
+  </aside>
+
+  <button class="sidebar-backdrop" type="button" data-sidebar-close aria-label="Fechar menu"></button>
+
+  <div class="workspace">
+    <header class="mobile-header">
+      <button class="icon-button" type="button" data-sidebar-open aria-controls="primary-navigation" aria-expanded="false" aria-label="Abrir menu">
+        {{ icon("menu") }}
+      </button>
+      <a class="mobile-brand" href="/">
+        <span class="brand__mark">{{ icon("activity") }}</span>
+        <strong>Retrieve Manager</strong>
+      </a>
+    </header>
+
+    <main class="page" id="main-content" tabindex="-1">
+      {% if flash %}
+      <div class="toast toast--{{ 'error' if flash.kind == 'err' else 'success' }}" role="{{ 'alert' if flash.kind == 'err' else 'status' }}" data-toast>
+        <span class="toast__icon">{{ icon("alert" if flash.kind == "err" else "check") }}</span>
+        <span class="toast__message">{{ flash.text }}</span>
+        <button class="icon-button toast__close" type="button" data-toast-close aria-label="Fechar notificação">{{ icon("close") }}</button>
+      </div>
+      {% endif %}
+      {% block body %}{% endblock %}
+    </main>
+  </div>
+</div>
+
+<dialog class="confirm-dialog" data-confirm-dialog aria-labelledby="confirm-title" aria-describedby="confirm-message">
+  <div class="confirm-dialog__icon">{{ icon("alert") }}</div>
+  <div>
+    <h2 id="confirm-title">Confirmar ação</h2>
+    <p id="confirm-message" data-confirm-message></p>
+  </div>
+  <div class="confirm-dialog__actions">
+    <button class="btn btn--secondary" type="button" data-confirm-cancel>Voltar</button>
+    <button class="btn btn--danger" type="button" data-confirm-accept>Confirmar</button>
+  </div>
+</dialog>
+</body>
+</html>

@@ -1,0 +1,97 @@
+x-service-defaults: &service-defaults
+  build: .
+  env_file: .env
+  init: true
+  read_only: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+  volumes:
+    - retrieve-data:/data
+    - /mobilemed:/mobilemed
+    - /opt/idr:/opt/idr
+  environment: &service-environment
+    APP_ENV: production
+    TZ: America/Sao_Paulo
+    DATA_DIR: /data
+    DATABASE_URL: sqlite:////data/retrieve.db
+    ALLOWED_DATA_ROOTS: /mobilemed,/opt/idr
+
+services:
+  data-permissions:
+    build: .
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/data"]
+    network_mode: none
+    read_only: true
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    volumes:
+      - retrieve-data:/data
+
+  web:
+    <<: *service-defaults
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --no-access-log
+    environment:
+      <<: *service-environment
+      SERVICE_NAME: retrieve-manager-web
+      STORE_CHECK_HOSTS: worker
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      data-permissions:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *service-defaults
+    command: python -m app.worker
+    environment:
+      <<: *service-environment
+      SERVICE_NAME: retrieve-manager-worker
+    cap_add:
+      - NET_BIND_SERVICE
+    ports:
+      - "444:444"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time; p='/tmp/retrieve-worker.ready'; raise SystemExit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<900 else 1)"
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  retrieve-data:

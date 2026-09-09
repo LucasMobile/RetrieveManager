@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Nuvem e acesso · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Configurações</p>
+      <h1>Nuvem e acesso</h1>
+      <p class="page-header__description">Defina o destino dos arquivos e mantenha a credencial administrativa atualizada.</p>
+    </div>
+  </header>
+
+  <div class="section-grid section-grid--2">
+    <section class="card" aria-labelledby="cloud-settings-title">
+      <div class="card__header">
+        <div><h2 id="cloud-settings-title">Envio para a nuvem</h2><p>A mesma URL atende todas as unidades; o token DICOM identifica a origem.</p></div>
+        <span class="card__icon">{{ icon("cloud") }}</span>
+      </div>
+      <form class="form-stack" method="post" action="/settings">
+        <div class="field">
+          <label for="cloud-url">URL de destino</label>
+          <input id="cloud-url" name="cloud_url" type="url" maxlength="500" value="{{ settings.cloud_url }}" placeholder="https://api.exemplo.com/imagens" spellcheck="false" required>
+          <span class="field__hint">Endpoint que recebe os arquivos por POST.</span>
+        </div>
+        <div class="field">
+          <label for="drop-prefix">Prefixo de Study ID para descarte</label>
+          <input id="drop-prefix" name="drop_study_prefix" maxlength="32" value="{{ settings.drop_study_prefix }}" placeholder="Ex.: SLRX">
+        </div>
+        <div class="field">
+          <label for="settle-seconds">Espera antes de compactar e enviar</label>
+          <input id="settle-seconds" name="file_settle_seconds" type="number" min="0" max="3600" value="{{ settings.file_settle_seconds }}">
+          <span class="field__hint">Tempo em segundos para garantir que a gravação do arquivo terminou.</span>
+        </div>
+        <div class="button-group">
+          <button class="btn btn--primary" type="submit">Salvar envio</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="password-title">
+      <div class="card__header">
+        <div><h2 id="password-title">Senha administrativa</h2><p>Atualize a senha usada para acessar este painel.</p></div>
+        <span class="card__icon">{{ icon("lock") }}</span>
+      </div>
+      <form class="form-stack" method="post" action="/settings/password">
+        <div class="field">
+          <label for="current-password">Senha atual</label>
+          <div class="field__control">
+            <input id="current-password" name="current" type="password" autocomplete="current-password" required>
+            <button class="field__action" type="button" data-password-toggle="current-password" aria-pressed="false">Mostrar</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="new-password">Nova senha</label>
+          <div class="field__control">
+            <input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" required>
+            <button class="field__action" type="button" data-password-toggle="new-password" aria-pressed="false">Mostrar</button>
+          </div>
+          <span class="field__hint">Use entre 12 e 72 bytes.</span>
+        </div>
+        <div class="button-group">
+          <button class="btn btn--secondary" type="submit">Atualizar senha</button>
+        </div>
+      </form>
+    </section>
+  </div>
+</div>
+{% endblock %}
