@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from app.config import DCMCJPEG, FINDSCU, MOVESCU, STORESCP
+from app.config import DCMCJPEG, ECHOSCU, FINDSCU, MOVESCU, STORESCP
 
 
 class ToolMissing(RuntimeError):
@@ -64,6 +64,25 @@ def findscu_cmd(
     ]
 
 
+def echoscu_cmd(
+    bin_path: str,
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+) -> list[str]:
+    return [
+        bin_path,
+        "-v",
+        "-aet",
+        calling_aet,
+        "-aec",
+        pacs_aet,
+        pacs_ip,
+        str(pacs_port),
+    ]
+
+
 def movescu_cmd(
     bin_path: str,
     calling_aet: str,
@@ -71,9 +90,8 @@ def movescu_cmd(
     pacs_ip: str,
     pacs_port: int,
     study_uid: str,
-    destination_aet: str,
 ) -> list[str]:
-    """Build a Study Root C-MOVE with an explicit move destination."""
+    """Build a Study Root C-MOVE using the calling AET as move destination."""
     return [
         bin_path,
         "-v",
@@ -84,8 +102,6 @@ def movescu_cmd(
         calling_aet,
         "-aec",
         pacs_aet,
-        "-aem",
-        destination_aet,
         "-k",
         "0008,0052=STUDY",
         "-k",
@@ -132,13 +148,25 @@ def c_find(
     )
 
 
+def c_echo(
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    timeout: int = 10,
+) -> tuple[int, str]:
+    bin_path = _require(ECHOSCU, "echoscu")
+    return _run(
+        echoscu_cmd(bin_path, calling_aet, pacs_aet, pacs_ip, pacs_port), timeout
+    )
+
+
 def c_move(
     calling_aet: str,
     pacs_aet: str,
     pacs_ip: str,
     pacs_port: int,
     study_uid: str,
-    destination_aet: str,
     timeout: int,
 ) -> tuple[int, str]:
     bin_path = _require(MOVESCU, "movescu")
@@ -150,7 +178,6 @@ def c_move(
             pacs_ip,
             pacs_port,
             study_uid,
-            destination_aet,
         ),
         timeout,
     )

@@ -36,7 +36,7 @@ class StoreSupervisor:
             sig = self._sig.get(uid)
             dead = proc.poll() is not None
             mismatch = unit is None or sig != (
-                unit.dest_aet,
+                unit.calling_aet,
                 unit.store_port,
                 unit.receive_dir,
             )
@@ -53,9 +53,9 @@ class StoreSupervisor:
                 continue
             try:
                 bind_port = store_bind_port(unit.store_port)
-                proc = start_storescp(unit.dest_aet, bind_port, unit.receive_dir)
+                proc = start_storescp(unit.calling_aet, bind_port, unit.receive_dir)
                 self._procs[uid] = proc
-                self._sig[uid] = (unit.dest_aet, unit.store_port, unit.receive_dir)
+                self._sig[uid] = (unit.calling_aet, unit.store_port, unit.receive_dir)
                 self._start_output_reader(uid, proc)
                 try:
                     return_code = proc.wait(timeout=_STARTUP_TIMEOUT_SECONDS)

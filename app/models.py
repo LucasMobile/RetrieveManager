@@ -49,7 +49,6 @@ class Unit(Base):
     pacs_port: Mapped[int] = mapped_column(Integer, nullable=False)
 
     calling_aet: Mapped[str] = mapped_column(String(64), nullable=False)
-    dest_aet: Mapped[str] = mapped_column(String(64), nullable=False)
     store_port: Mapped[int] = mapped_column(Integer, nullable=False)
 
     receive_dir: Mapped[str] = mapped_column(String(500), nullable=False)

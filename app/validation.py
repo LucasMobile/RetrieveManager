@@ -70,17 +70,7 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
     return {
         "name": name,
         "enabled": form.get("enabled", "1") == "1",
-        "pacs_aet": validate_aet(form.get("pacs_aet", ""), "AET do PACS"),
-        "pacs_ip": validate_host(form.get("pacs_ip", "")),
-        "pacs_port": bounded_int(
-            form.get("pacs_port"),
-            "Porta do PACS",
-            minimum=1,
-            maximum=65535,
-            default=2104,
-        ),
-        "calling_aet": validate_aet(form.get("calling_aet", ""), "Calling AET"),
-        "dest_aet": validate_aet(form.get("dest_aet", ""), "Dest AET"),
+        **validate_pacs_connection(form),
         "store_port": bounded_int(
             form.get("store_port"),
             "Porta do store",
@@ -138,6 +128,22 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
             maximum=64,
             default=16,
         ),
+    }
+
+
+def validate_pacs_connection(form: dict[str, str]) -> dict[str, str | int]:
+    """Validate only the fields required for a DICOM association."""
+    return {
+        "pacs_aet": validate_aet(form.get("pacs_aet", ""), "AET do PACS"),
+        "pacs_ip": validate_host(form.get("pacs_ip", "")),
+        "pacs_port": bounded_int(
+            form.get("pacs_port"),
+            "Porta do PACS",
+            minimum=1,
+            maximum=65535,
+            default=2104,
+        ),
+        "calling_aet": validate_aet(form.get("calling_aet", ""), "Calling AET"),
     }
 
 

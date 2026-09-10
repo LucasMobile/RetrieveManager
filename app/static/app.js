@@ -132,4 +132,65 @@
     const interval = Number.parseInt(element.dataset.interval || "5000", 10);
     window.setInterval(() => refreshPartial(element), Math.max(interval, 2000));
   });
+
+  const unitForm = document.querySelector("[data-unit-form]");
+  const echoPanel = unitForm?.querySelector("[data-echo-test]");
+  const echoButton = echoPanel?.querySelector("[data-echo-button]");
+  const echoStatus = echoPanel?.querySelector("[data-echo-status]");
+  const connectionFields = unitForm?.querySelectorAll("[data-connection-field]") || [];
+
+  const setEchoStatus = (message, state = "") => {
+    if (!echoStatus) return;
+    echoStatus.textContent = message;
+    echoStatus.classList.toggle("is-success", state === "success");
+    echoStatus.classList.toggle("is-error", state === "error");
+  };
+
+  connectionFields.forEach((field) => {
+    const output = unitForm?.querySelector(
+      `[data-connection-output="${field.dataset.connectionField}"]`,
+    );
+    const syncConnection = () => {
+      if (output) output.textContent = field.value.trim() || "—";
+      setEchoStatus("Não testado");
+    };
+    field.addEventListener("input", syncConnection);
+  });
+
+  echoButton?.addEventListener("click", async () => {
+    const invalidField = Array.from(connectionFields).find((field) => !field.checkValidity());
+    if (invalidField) {
+      invalidField.reportValidity();
+      invalidField.focus();
+      return;
+    }
+
+    const payload = new FormData();
+    connectionFields.forEach((field) => payload.append(field.name, field.value));
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    echoButton.disabled = true;
+    echoButton.classList.add("is-loading");
+    setEchoStatus("Testando conexão…");
+
+    try {
+      const response = await fetch(echoPanel.dataset.url, {
+        method: "POST",
+        body: payload,
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      });
+      const result = await response.json();
+      setEchoStatus(result.message || "Não foi possível concluir o teste.", result.ok ? "success" : "error");
+    } catch (error) {
+      const message = error.name === "AbortError"
+        ? "O teste excedeu o tempo limite."
+        : "Falha de comunicação ao executar o teste.";
+      setEchoStatus(message, "error");
+    } finally {
+      window.clearTimeout(timeout);
+      echoButton.disabled = false;
+      echoButton.classList.remove("is-loading");
+    }
+  });
 })();

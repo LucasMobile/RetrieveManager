@@ -32,7 +32,6 @@ class DashboardTest(unittest.TestCase):
             pacs_ip="127.0.0.1",
             pacs_port=2104,
             calling_aet="RETRIEVE",
-            dest_aet="RETRIEVE",
             store_port=444,
             receive_dir=path,
             send_dir=path,

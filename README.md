@@ -15,7 +15,8 @@ Cada hospital vira uma **unidade** cadastrada na tela. A lista começa vazia.
 
 `storescp` do host antigo, `compacta_retrieve.py` e `envio_ret.py` **não precisam mais rodar**. Compacta/envio da nuvem que já existiam fora deste fluxo continuam independentes só se você quiser — este programa cobre a cadeia de retrieve.
 
-O PACS ainda precisa conhecer o AET de destino (o store) e o IP deste servidor.
+O PACS precisa conhecer o **Calling AET** da unidade como destino de store e o IP
+deste servidor. O mesmo AET é usado pelo `findscu`, `movescu` e `storescp`.
 
 ## Subir no Linux
 

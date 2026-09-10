@@ -6,6 +6,7 @@ import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from fastapi import Depends, FastAPI, Form, Request
@@ -17,11 +18,13 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import BASE_DIR, SECRET_KEY, SESSION_HTTPS_ONLY
 from app.db import get_db, init_db
+from app.dicom_tools import ToolMissing, c_echo
 from app.middleware import request_middleware
 from app.models import (
     STATUSES,
@@ -50,6 +53,7 @@ from app.validation import (
     validate_cloud_url,
     validate_jpeg_flag,
     validate_modality,
+    validate_pacs_connection,
     validate_unit_form,
 )
 
@@ -464,6 +468,10 @@ def units_list(
     user: User = Depends(require_user),
 ):
     total = db.scalar(select(func.count()).select_from(Unit)) or 0
+    enabled = (
+        db.scalar(select(func.count()).select_from(Unit).where(Unit.enabled.is_(True)))
+        or 0
+    )
     pager = paginate(total, page, UNITS_PAGE)
     units = list(
         db.scalars(
@@ -476,7 +484,15 @@ def units_list(
     return templates.TemplateResponse(
         request=request,
         name="units_list.html",
-        context=ctx(request, db, "units", units=units, pager=pager, qs=""),
+        context=ctx(
+            request,
+            db,
+            "units",
+            units=units,
+            pager=pager,
+            qs="",
+            summary={"total": total, "enabled": enabled, "paused": total - enabled},
+        ),
     )
 
 
@@ -499,7 +515,6 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
     obj.pacs_ip = str(form["pacs_ip"])
     obj.pacs_port = int(form["pacs_port"])
     obj.calling_aet = str(form["calling_aet"])
-    obj.dest_aet = str(form["dest_aet"])
     obj.store_port = int(form["store_port"])
     obj.input_dir = str(form["input_dir"])
     obj.sent_dir = str(form["sent_dir"])
@@ -556,6 +571,77 @@ async def units_create(
         return RedirectResponse("/units/new", status_code=303)
     flash(request, "Unidade criada. Cadastre o AET no PACS se ainda não existir.")
     return RedirectResponse("/units", status_code=303)
+
+
+@app.post("/units/test-echo")
+async def units_test_echo(
+    request: Request,
+    user: User = Depends(require_user),
+):
+    raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
+    try:
+        connection = validate_pacs_connection(raw_form)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+
+    started_at = perf_counter()
+    try:
+        code, _output = await run_in_threadpool(
+            c_echo,
+            str(connection["calling_aet"]),
+            str(connection["pacs_aet"]),
+            str(connection["pacs_ip"]),
+            int(connection["pacs_port"]),
+            10,
+        )
+    except ToolMissing as exc:
+        log_event(
+            log,
+            logging.ERROR,
+            "dicom.echo",
+            resource="pacs",
+            status="failure",
+            started_at=started_at,
+            error=exc,
+            user_id=user.id,
+        )
+        return JSONResponse(
+            {"ok": False, "message": "Ferramenta C-ECHO indisponível no container."},
+            status_code=503,
+        )
+
+    if code != 0:
+        log_event(
+            log,
+            logging.WARNING,
+            "dicom.echo",
+            resource="pacs",
+            status="failure",
+            started_at=started_at,
+            return_code=code,
+            user_id=user.id,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "message": (
+                    "O PACS não respondeu ao C-ECHO. Revise AET, endereço e porta."
+                ),
+            },
+            status_code=502,
+        )
+
+    log_event(
+        log,
+        logging.INFO,
+        "dicom.echo",
+        resource="pacs",
+        status="success",
+        started_at=started_at,
+        return_code=code,
+        user_id=user.id,
+    )
+    return JSONResponse({"ok": True, "message": "PACS respondeu com sucesso."})
 
 
 @app.get("/units/{unit_id}", response_class=HTMLResponse)

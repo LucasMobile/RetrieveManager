@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from app.dicom_tools import (
     dcmcjpeg_cmd,
+    echoscu_cmd,
     findscu_cmd,
     movescu_cmd,
     redact_dicom_output,
@@ -41,7 +42,6 @@ class DicomCmdTest(unittest.TestCase):
             "10.20.0.31",
             2104,
             "1.2.840.1",
-            "retrieve-dest",
         )
         self.assertEqual(cmd[0], "/opt/dcmtk/bin/movescu")
         self.assertIn("-S", cmd)
@@ -51,13 +51,23 @@ class DicomCmdTest(unittest.TestCase):
         self.assertIn("srvpacsFIR", cmd)
         self.assertIn("0020,000D=1.2.840.1", cmd)
         self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
-        self.assertIn("-aem", cmd)
-        self.assertIn("retrieve-dest", cmd)
+        self.assertNotIn("-aem", cmd)
         self.assertNotIn("--bind", cmd)
         self.assertNotIn("--dest", cmd)
         self.assertNotIn("-c", cmd)
         self.assertNotIn("+P", cmd)
         self.assertNotIn("--port", cmd)
+
+    def test_echoscu_uses_configured_association(self):
+        cmd = echoscu_cmd(
+            "/opt/dcmtk/bin/echoscu", "mob", "srvpacsFIR", "10.20.0.31", 2104
+        )
+        self.assertEqual(cmd[0], "/opt/dcmtk/bin/echoscu")
+        self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
+        self.assertIn("-aet", cmd)
+        self.assertIn("mob", cmd)
+        self.assertIn("-aec", cmd)
+        self.assertIn("srvpacsFIR", cmd)
 
     def test_storescp_and_jpeg_unchanged(self):
         scp = storescp_cmd("/opt/dcmtk/bin/storescp", "mob", 444, "/data/in")

@@ -2,20 +2,42 @@
 {% from "icons.html" import icon %}
 {% block title %}Unidades · Retrieve Manager{% endblock %}
 {% block body %}
-<div class="page-stack">
+<div class="page-stack units-page">
   <header class="page-header">
     <div class="page-header__copy">
       <p class="eyebrow">Cadastro</p>
       <h1>Unidades</h1>
-      <p class="page-header__description">Gerencie conexões PACS, serviços de store e diretórios de cada operação.</p>
+      <p class="page-header__description">Gerencie as conexões PACS, portas de recebimento e diretórios de cada unidade.</p>
     </div>
     <div class="page-header__actions">
       <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
     </div>
   </header>
 
-  <section class="surface card--flush" aria-labelledby="units-title">
-    <h2 class="visually-hidden" id="units-title">Unidades cadastradas</h2>
+  <section class="units-summary" aria-label="Resumo das unidades">
+    <div class="units-summary__item">
+      <span class="units-summary__icon">{{ icon("building") }}</span>
+      <div><strong>{{ summary.total }}</strong><span>unidade{% if summary.total != 1 %}s{% endif %} cadastrada{% if summary.total != 1 %}s{% endif %}</span></div>
+    </div>
+    <div class="units-summary__item">
+      <span class="units-summary__icon">{{ icon("check") }}</span>
+      <div><strong>{{ summary.enabled }}</strong><span>unidade{% if summary.enabled != 1 %}s{% endif %} ativa{% if summary.enabled != 1 %}s{% endif %}</span></div>
+    </div>
+    <div class="units-summary__item">
+      <span class="units-summary__icon">{{ icon("pause") }}</span>
+      <div><strong>{{ summary.paused }}</strong><span>unidade{% if summary.paused != 1 %}s{% endif %} pausada{% if summary.paused != 1 %}s{% endif %}</span></div>
+    </div>
+  </section>
+
+  <section class="surface units-table-card" aria-labelledby="units-title">
+    <div class="units-table-card__header">
+      <div>
+        <h2 id="units-title">Infraestrutura cadastrada</h2>
+        <p>Configurações usadas para buscar, receber e processar os exames.</p>
+      </div>
+      <span>{{ pager.total }} unidade{% if pager.total != 1 %}s{% endif %}</span>
+    </div>
+
     {% if not units %}
     <div class="empty-state">
       <div class="empty-state__content">
@@ -27,34 +49,53 @@
     </div>
     {% else %}
     <div class="table-wrap">
-      <table class="data-table">
-        <caption>{{ pager.total }} unidade{% if pager.total != 1 %}s{% endif %} cadastrada{% if pager.total != 1 %}s{% endif %}</caption>
+      <table class="data-table units-table">
+        <caption class="visually-hidden">{{ pager.total }} unidade{% if pager.total != 1 %}s{% endif %} cadastrada{% if pager.total != 1 %}s{% endif %}</caption>
         <thead>
           <tr>
             <th scope="col">Unidade</th>
             <th scope="col">Estado</th>
-            <th scope="col">PACS</th>
-            <th scope="col">Store</th>
-            <th scope="col">Pasta de pedidos</th>
-            <th scope="col"><span class="visually-hidden">Ações</span></th>
+            <th scope="col">Conexão PACS</th>
+            <th scope="col">Store SCP</th>
+            <th scope="col">Diretório de pedidos</th>
+            <th scope="col">Ações</th>
           </tr>
         </thead>
         <tbody>
           {% for u in units %}
           <tr>
-            <td><a href="/units/{{ u.id }}">{{ u.name }}</a></td>
+            <td>
+              <a class="unit-identity" href="/units/{{ u.id }}">
+                <span class="unit-identity__mark" aria-hidden="true">{{ u.name[:2]|upper }}</span>
+                <span><strong>{{ u.name }}</strong><small>Identificador #{{ u.id }}</small></span>
+              </a>
+            </td>
             <td>
               {% if u.enabled %}<span class="status-badge status-badge--success">Ativa</span>
-              {% else %}<span class="status-badge status-badge--neutral">Pausada</span>{% endif %}
+              {% else %}<span class="status-badge status-badge--warning">Pausada</span>{% endif %}
             </td>
-            <td><span class="table-primary">{{ u.pacs_aet }}</span><span class="table-secondary mono">{{ u.pacs_ip }}:{{ u.pacs_port }}</span></td>
-            <td><span class="table-primary">{{ u.dest_aet }}</span><span class="table-secondary">Porta {{ u.store_port }}</span></td>
-            <td class="mono small">{{ u.input_dir }}</td>
             <td>
-              <div class="table-actions">
-                <a class="btn btn--quiet btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
+              <span class="table-primary mono">{{ u.pacs_ip }}:{{ u.pacs_port }}</span>
+              <span class="table-secondary">AET: {{ u.pacs_aet }}</span>
+            </td>
+            <td>
+              <span class="tcp-endpoint">
+                <span class="tcp-endpoint__icon">{{ icon("tcp-port") }}</span>
+                <span><strong>Porta {{ u.store_port }}</strong><small>AET: {{ u.calling_aet }}</small></span>
+              </span>
+            </td>
+            <td>
+              <span class="table-primary mono units-table__path">{{ u.input_dir }}</span>
+              <span class="table-secondary">{% if u.enabled %}Monitoramento de entrada{% else %}Monitoramento suspenso{% endif %}</span>
+            </td>
+            <td>
+              <div class="table-actions units-table__actions">
+                <a class="action-icon" href="/units/{{ u.id }}" data-tooltip="Editar unidade" aria-label="Editar unidade">{{ icon("edit") }}</a>
                 <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
-                  <button class="btn btn--secondary btn--sm" type="submit">{{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}</button>
+                  <button class="action-icon" type="submit" data-tooltip="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}" aria-label="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}">{{ icon("pause" if u.enabled else "play") }}</button>
+                </form>
+                <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Excluir a unidade {{ u.name }}? Todos os pedidos e eventos do histórico também serão removidos. Esta ação não pode ser desfeita." data-confirm-label="Excluir unidade">
+                  <button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir unidade" aria-label="Excluir unidade">{{ icon("trash") }}</button>
                 </form>
               </div>
             </td>

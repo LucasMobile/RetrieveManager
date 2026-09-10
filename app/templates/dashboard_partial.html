@@ -40,7 +40,7 @@
             {% if u.store_up %}<span class="status-badge status-badge--success">Store ativo · {{ u.store_port }}</span>{% else %}<span class="status-badge status-badge--danger">Store indisponível</span>{% endif %}
           </div>
         </div>
-        <p class="unit-card__meta">{{ u.dest_aet }} → {{ u.pacs_aet }} · {{ u.pacs_ip }}:{{ u.pacs_port }}</p>
+        <p class="unit-card__meta">{{ u.calling_aet }} → {{ u.pacs_aet }} · {{ u.pacs_ip }}:{{ u.pacs_port }}</p>
       </div>
       <span class="unit-card__updated">{{ icon("clock") }} Verificado agora</span>
     </header>
@@ -64,7 +64,7 @@
     </div>
 
     <footer class="unit-card__footer">
-      <span class="unit-card__technical">AET destino: <strong>{{ u.dest_aet }}</strong> · Listener TCP {% if u.store_up %}ativo{% else %}indisponível{% endif %}</span>
+      <span class="unit-card__technical">Calling AET: <strong>{{ u.calling_aet }}</strong> · Listener TCP {% if u.store_up %}ativo{% else %}indisponível{% endif %}</span>
       <div class="button-group">
         <a class="btn btn--quiet btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
         <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>

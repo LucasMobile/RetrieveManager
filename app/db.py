@@ -88,16 +88,21 @@ def init_db() -> None:
 
 
 def _migrate_schema() -> None:
-    """Small forward-only migration for the bundled SQLite deployment.
+    """Apply small forward-only migrations for the bundled SQLite deployment.
 
     This keeps existing installations bootable without introducing a migration
-    framework for a single additive column. Future schema changes should use
-    Alembic.
+    framework. Future schema changes should use Alembic.
     """
     if not DATABASE_URL.startswith("sqlite"):
         return
     inspector = inspect(engine)
-    if "orders" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+    if "units" in table_names:
+        unit_columns = {column["name"] for column in inspector.get_columns("units")}
+        if "dest_aet" in unit_columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE units DROP COLUMN dest_aet"))
+    if "orders" not in table_names:
         return
     columns = {column["name"] for column in inspector.get_columns("orders")}
     if "correlation_id" not in columns:

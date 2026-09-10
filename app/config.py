@@ -98,6 +98,7 @@ WORKER_HEALTH_FILE = Path(os.getenv("WORKER_HEALTH_FILE", _default_health_file))
 
 _DCMTK_BIN = "/opt/dcmtk/bin"
 FINDSCU = os.getenv("FINDSCU", f"{_DCMTK_BIN}/findscu")
+ECHOSCU = os.getenv("ECHOSCU", f"{_DCMTK_BIN}/echoscu")
 MOVESCU = os.getenv("MOVESCU", f"{_DCMTK_BIN}/movescu")
 STORESCP = os.getenv("STORESCP", f"{_DCMTK_BIN}/storescp")
 DCMCJPEG = os.getenv("DCMCJPEG", f"{_DCMTK_BIN}/dcmcjpeg")

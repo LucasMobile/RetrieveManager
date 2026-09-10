@@ -42,6 +42,7 @@ RUN if [ -f "/tmp/vendor/dcmtk-${DCMTK_VERSION}-linux-x86_64.tar.bz2" ]; then \
     && test -n "$DICT" \
     && cp -a "$(dirname "$DICT")"/. /opt/dcmtk/share/ \
     && /opt/dcmtk/bin/findscu --version \
+    && /opt/dcmtk/bin/echoscu --version \
     && /opt/dcmtk/bin/movescu --version \
     && /opt/dcmtk/bin/storescp --version \
     && /opt/dcmtk/bin/dcmcjpeg --version
@@ -74,6 +75,7 @@ ENV PATH="/opt/venv/bin:/opt/dcmtk/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/dcmtk/lib" \
     DCMDICTPATH="/opt/dcmtk/share/dicom.dic:/opt/dcmtk/share/private.dic" \
     FINDSCU=/opt/dcmtk/bin/findscu \
+    ECHOSCU=/opt/dcmtk/bin/echoscu \
     MOVESCU=/opt/dcmtk/bin/movescu \
     STORESCP=/opt/dcmtk/bin/storescp \
     DCMCJPEG=/opt/dcmtk/bin/dcmcjpeg \

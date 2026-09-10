@@ -2,159 +2,199 @@
 {% from "icons.html" import icon %}
 {% block title %}{% if unit %}{{ unit.name }}{% else %}Nova unidade{% endif %} · Retrieve Manager{% endblock %}
 {% block body %}
-<div class="page-stack">
-  <header class="page-header">
+<div class="page-stack unit-form-page">
+  <header class="page-header unit-form-header">
     <div class="page-header__copy">
       <nav class="breadcrumb" aria-label="Navegação estrutural">
-        <a href="/units">Unidades</a><span aria-hidden="true">/</span><span>{% if unit %}Editar{% else %}Nova{% endif %}</span>
+        <a href="/units">Unidades</a><span aria-hidden="true">/</span><span>{% if unit %}{{ unit.name }}{% else %}Nova unidade{% endif %}</span>
       </nav>
-      <h1>{% if unit %}{{ unit.name }}{% else %}Nova unidade{% endif %}</h1>
-      <p class="page-header__description">Configure a conexão PACS, o store local e os limites de processamento.</p>
+      <p class="eyebrow">Configuração da unidade</p>
+      <div class="unit-form-title">
+        <h1>{% if unit %}Editar {{ unit.name }}{% else %}Nova unidade{% endif %}</h1>
+        {% if unit %}<span class="status-badge status-badge--{{ 'success' if unit.enabled else 'warning' }}">{{ 'Unidade ativa' if unit.enabled else 'Unidade pausada' }}</span>{% endif %}
+      </div>
+      <p class="page-header__description">Revise a origem PACS, o recebimento DICOM e os limites de processamento.</p>
     </div>
     <div class="page-header__actions">
       <a class="btn btn--secondary" href="/units">{{ icon("arrow-left") }} Voltar</a>
     </div>
   </header>
 
-  <form class="form-stack" method="post" action="{% if unit %}/units/{{ unit.id }}{% else %}/units/new{% endif %}">
-    <section class="form-section" aria-labelledby="identity-title">
-      <div class="form-section__header">
-        <span class="form-section__number">1</span>
-        <div><h2 id="identity-title">Identificação</h2><p>Nome e disponibilidade da unidade na operação.</p></div>
+  <div class="unit-form-layout">
+    <aside class="surface unit-form-nav" aria-label="Seções da configuração">
+      <div class="unit-form-nav__header">
+        <h2>Configuração</h2>
+        <p>Campos organizados por responsabilidade.</p>
       </div>
-      <div class="form-section__body">
-        <div class="form-grid form-grid--2">
-          <div class="field">
-            <label for="unit-name">Nome da unidade</label>
-            <input id="unit-name" name="name" value="{{ unit.name if unit else '' }}" maxlength="120" required>
+      <nav>
+        <a href="#identity-title"><span>01</span><strong>Identificação</strong></a>
+        <a href="#pacs-title"><span>02</span><strong>Conexão PACS</strong></a>
+        <a href="#storage-title"><span>03</span><strong>Store e pastas</strong></a>
+        <a href="#limits-title"><span>04</span><strong>Processamento</strong></a>
+      </nav>
+      <div class="unit-form-nav__note">
+        <strong>Antes de salvar</strong>
+        <span>Confirme se o PACS reconhece o Calling AET e alcança a porta configurada para o Store SCP.</span>
+      </div>
+    </aside>
+
+    <div class="unit-form-main">
+      <form class="form-stack" method="post" action="{% if unit %}/units/{{ unit.id }}{% else %}/units/new{% endif %}" data-unit-form>
+        <section class="form-section" aria-labelledby="identity-title">
+          <div class="form-section__header">
+            <span class="form-section__number">01</span>
+            <div><h2 id="identity-title">Identificação</h2><p>Nome visível e disponibilidade operacional da unidade.</p></div>
           </div>
-          <div class="field">
-            <label for="unit-enabled">Situação</label>
-            <select id="unit-enabled" name="enabled">
-              <option value="1" {% if not unit or unit.enabled %}selected{% endif %}>Ativa</option>
-              <option value="0" {% if unit and not unit.enabled %}selected{% endif %}>Pausada</option>
-            </select>
-            <span class="field__hint">Unidades pausadas permanecem cadastradas, sem novos processamentos.</span>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--2">
+              <div class="field">
+                <label for="unit-name">Nome da unidade</label>
+                <input id="unit-name" name="name" value="{{ unit.name if unit else '' }}" maxlength="120" required>
+                <span class="field__hint">Use um nome reconhecível pela equipe de operação.</span>
+              </div>
+              <div class="field">
+                <label for="unit-enabled">Estado da unidade</label>
+                <select id="unit-enabled" name="enabled">
+                  <option value="1" {% if not unit or unit.enabled %}selected{% endif %}>Ativa</option>
+                  <option value="0" {% if unit and not unit.enabled %}selected{% endif %}>Pausada</option>
+                </select>
+                <span class="field__hint">Unidades pausadas permanecem cadastradas, sem novos processamentos.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="form-section" aria-labelledby="pacs-title">
+          <div class="form-section__header">
+            <span class="form-section__number">02</span>
+            <div><h2 id="pacs-title">Conexão PACS</h2><p>Origem consultada nas operações C-FIND e C-MOVE.</p></div>
+          </div>
+          <div class="form-section__body pacs-configuration">
+            <div class="form-grid form-grid--2">
+              <div class="field">
+                <label for="pacs-aet">AET do PACS</label>
+                <input id="pacs-aet" class="mono" name="pacs_aet" value="{{ unit.pacs_aet if unit else '' }}" maxlength="16" data-connection-field="pacs-aet" required>
+              </div>
+              <div class="field">
+                <label for="calling-aet">Calling AET</label>
+                <input id="calling-aet" class="mono" name="calling_aet" value="{{ unit.calling_aet if unit else '' }}" maxlength="16" data-connection-field="calling-aet" required>
+                <span class="field__hint">Identificação enviada pelo findscu, movescu e anunciada pelo storescp.</span>
+              </div>
+              <div class="field">
+                <label for="pacs-ip">Endereço IP ou host</label>
+                <input id="pacs-ip" class="mono" name="pacs_ip" value="{{ unit.pacs_ip if unit else '' }}" autocapitalize="none" spellcheck="false" data-connection-field="pacs-ip" required>
+              </div>
+              <div class="field">
+                <label for="pacs-port">Porta do PACS</label>
+                <input id="pacs-port" class="mono" name="pacs_port" type="number" min="1" max="65535" value="{{ unit.pacs_port if unit else 2104 }}" data-connection-field="pacs-port" required>
+              </div>
+
+              <div class="echo-test field--full" data-echo-test data-url="/units/test-echo">
+                <div class="echo-test__copy">
+                  <span class="echo-test__icon">{{ icon("activity") }}</span>
+                  <div><strong>Validar conexão com o PACS</strong><small>Executa um C-ECHO com os dados informados, sem salvar a unidade.</small></div>
+                </div>
+                <div class="echo-test__action">
+                  <span class="echo-test__status" data-echo-status role="status" aria-live="polite">Não testado</span>
+                  <button class="btn btn--secondary" type="button" data-echo-button>{{ icon("activity") }} Testar C-ECHO</button>
+                </div>
+              </div>
+            </div>
+
+            <aside class="connection-summary" aria-label="Resumo da conexão">
+              <h3>Resumo da conexão</h3>
+              <div><span>PACS AET</span><strong class="mono" data-connection-output="pacs-aet">{{ unit.pacs_aet if unit else '—' }}</strong></div>
+              <div><span>Endpoint</span><strong class="mono"><span data-connection-output="pacs-ip">{{ unit.pacs_ip if unit else '—' }}</span>:<span data-connection-output="pacs-port">{{ unit.pacs_port if unit else 2104 }}</span></strong></div>
+              <div><span>Calling AET</span><strong class="mono" data-connection-output="calling-aet">{{ unit.calling_aet if unit else '—' }}</strong></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="form-section" aria-labelledby="storage-title">
+          <div class="form-section__header">
+            <span class="form-section__number">03</span>
+            <div><h2 id="storage-title">Store SCP e diretórios</h2><p>Recebimento dos arquivos DICOM e organização das etapas locais.</p></div>
+          </div>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--2">
+              <div class="field">
+                <label for="store-port">Porta do Store SCP</label>
+                <input id="store-port" class="mono" name="store_port" type="number" min="1" max="65535" value="{{ unit.store_port if unit else 444 }}" required>
+                <span class="field__hint">Use uma porta publicada pelo container e liberada no host.</span>
+              </div>
+              <div class="field">
+                <label for="unit-token">Token da unidade</label>
+                <input id="unit-token" name="token" type="password" maxlength="64" value="" autocomplete="off" {% if not unit %}required{% endif %}>
+                <span class="field__hint">Tag DICOM 0008,1040.{% if unit %} Deixe em branco para manter o token atual.{% endif %}</span>
+              </div>
+              <div class="field">
+                <label for="input-dir">Pasta de pedidos</label>
+                <input id="input-dir" class="mono" name="input_dir" value="{{ unit.input_dir if unit else '' }}" spellcheck="false" required>
+              </div>
+              <div class="field">
+                <label for="sent-dir">Pedidos processados</label>
+                <input id="sent-dir" class="mono" name="sent_dir" value="{{ unit.sent_dir if unit else '' }}" spellcheck="false" required>
+              </div>
+              <div class="field">
+                <label for="receive-dir">Recebimento DICOM</label>
+                <input id="receive-dir" class="mono" name="receive_dir" value="{{ unit.receive_dir if unit else '' }}" spellcheck="false" required>
+              </div>
+              <div class="field">
+                <label for="send-dir">Prontos para envio</label>
+                <input id="send-dir" class="mono" name="send_dir" value="{{ unit.send_dir if unit else '' }}" spellcheck="false" required>
+              </div>
+              <div class="field field--full">
+                <label for="error-dir">Arquivos com erro</label>
+                <input id="error-dir" class="mono" name="error_dir" value="{{ unit.error_dir if unit else '' }}" spellcheck="false" required>
+                <span class="field__hint">Use caminhos absolutos acessíveis dentro do container.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="form-section" aria-labelledby="limits-title">
+          <div class="form-section__header">
+            <span class="form-section__number">04</span>
+            <div><h2 id="limits-title">Limites de processamento</h2><p>Timeouts, paralelismo e frequência de busca desta unidade.</p></div>
+          </div>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--3">
+              <div class="field"><label for="move-timeout-first">Timeout do 1º C-MOVE</label><input id="move-timeout-first" name="move_timeout_first" type="number" min="10" max="7200" value="{{ unit.move_timeout_first if unit else 600 }}"><span class="field__hint">Em segundos.</span></div>
+              <div class="field"><label for="move-timeout-second">Timeout do 2º C-MOVE</label><input id="move-timeout-second" name="move_timeout_second" type="number" min="10" max="7200" value="{{ unit.move_timeout_second if unit else 900 }}"><span class="field__hint">Em segundos.</span></div>
+              <div class="field"><label for="parallel-moves">C-MOVEs paralelos</label><input id="parallel-moves" name="max_parallel_moves" type="number" min="1" max="16" value="{{ unit.max_parallel_moves if unit else 1 }}"></div>
+              <div class="field"><label for="find-interval">Intervalo de busca</label><input id="find-interval" name="find_interval_seconds" type="number" min="5" max="3600" value="{{ unit.find_interval_seconds if unit else 30 }}"><span class="field__hint">Em segundos.</span></div>
+              <div class="field"><label for="compact-workers">Workers de compactação</label><input id="compact-workers" name="compact_workers" type="number" min="1" max="32" value="{{ unit.compact_workers if unit else 8 }}"></div>
+              <div class="field"><label for="send-workers">Workers de envio</label><input id="send-workers" name="send_workers" type="number" min="1" max="64" value="{{ unit.send_workers if unit else 16 }}"></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="form-actions">
+          <span class="muted small">As alterações entram em vigor depois de salvar.</span>
+          <div class="button-group">
+            <a class="btn btn--quiet" href="/units">Cancelar</a>
+            <button class="btn btn--primary" type="submit">{{ icon("check") }} {% if unit %}Salvar alterações{% else %}Criar unidade{% endif %}</button>
           </div>
         </div>
-      </div>
-    </section>
-
-    <section class="form-section" aria-labelledby="pacs-title">
-      <div class="form-section__header">
-        <span class="form-section__number">2</span>
-        <div><h2 id="pacs-title">Conexão PACS</h2><p>Parâmetros usados nas operações C-FIND e C-MOVE.</p></div>
-      </div>
-      <div class="form-section__body">
-        <div class="form-grid form-grid--3">
-          <div class="field">
-            <label for="pacs-aet">AET chamado</label>
-            <input id="pacs-aet" name="pacs_aet" value="{{ unit.pacs_aet if unit else '' }}" maxlength="16" required>
-          </div>
-          <div class="field">
-            <label for="pacs-ip">IP ou host</label>
-            <input id="pacs-ip" name="pacs_ip" value="{{ unit.pacs_ip if unit else '' }}" autocapitalize="none" spellcheck="false" required>
-          </div>
-          <div class="field">
-            <label for="pacs-port">Porta do PACS</label>
-            <input id="pacs-port" name="pacs_port" type="number" min="1" max="65535" value="{{ unit.pacs_port if unit else 2104 }}" required>
-          </div>
-          <div class="field">
-            <label for="calling-aet">Calling AET</label>
-            <input id="calling-aet" name="calling_aet" value="{{ unit.calling_aet if unit else '' }}" maxlength="16" required>
-            <span class="field__hint">Identificação enviada pelo findscu e movescu.</span>
-          </div>
-          <div class="field">
-            <label for="dest-aet">AET de destino</label>
-            <input id="dest-aet" name="dest_aet" value="{{ unit.dest_aet if unit else '' }}" maxlength="16" required>
-            <span class="field__hint">AET do storescp que deve estar cadastrado no PACS.</span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="form-section" aria-labelledby="storage-title">
-      <div class="form-section__header">
-        <span class="form-section__number">3</span>
-        <div><h2 id="storage-title">Store e diretórios</h2><p>Recebimento, separação e envio dos arquivos da unidade.</p></div>
-      </div>
-      <div class="form-section__body">
-        <div class="form-grid form-grid--2">
-          <div class="field">
-            <label for="store-port">Porta do storescp</label>
-            <input id="store-port" name="store_port" type="number" min="1" max="65535" value="{{ unit.store_port if unit else 444 }}" required>
-          </div>
-          <div class="field">
-            <label for="unit-token">Token da unidade</label>
-            <input id="unit-token" name="token" type="password" maxlength="64" value="" autocomplete="off" {% if not unit %}required{% endif %}>
-            <span class="field__hint">Tag DICOM 0008,1040.{% if unit %} Deixe em branco para manter o token atual.{% endif %}</span>
-          </div>
-          <div class="field field--full">
-            <label for="input-dir">Pasta de pedidos</label>
-            <input id="input-dir" name="input_dir" value="{{ unit.input_dir if unit else '' }}" spellcheck="false" required>
-          </div>
-          <div class="field field--full">
-            <label for="sent-dir">Pasta de pedidos processados</label>
-            <input id="sent-dir" name="sent_dir" value="{{ unit.sent_dir if unit else '' }}" spellcheck="false" required>
-          </div>
-          <div class="field field--full">
-            <label for="receive-dir">Pasta de recebimento</label>
-            <input id="receive-dir" name="receive_dir" value="{{ unit.receive_dir if unit else '' }}" spellcheck="false" required>
-          </div>
-          <div class="field field--full">
-            <label for="send-dir">Pasta de envio ao portal</label>
-            <input id="send-dir" name="send_dir" value="{{ unit.send_dir if unit else '' }}" spellcheck="false" required>
-          </div>
-          <div class="field field--full">
-            <label for="error-dir">Pasta de erro</label>
-            <input id="error-dir" name="error_dir" value="{{ unit.error_dir if unit else '' }}" spellcheck="false" required>
-            <span class="field__hint">Use caminhos absolutos acessíveis dentro do container.</span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="form-section" aria-labelledby="limits-title">
-      <div class="form-section__header">
-        <span class="form-section__number">4</span>
-        <div><h2 id="limits-title">Limites de processamento</h2><p>Timeouts e paralelismo aplicados apenas a esta unidade.</p></div>
-      </div>
-      <div class="form-section__body">
-        <div class="form-grid form-grid--3">
-          <div class="field"><label for="move-timeout-first">Timeout do 1º C-MOVE</label><input id="move-timeout-first" name="move_timeout_first" type="number" min="10" max="7200" value="{{ unit.move_timeout_first if unit else 600 }}"><span class="field__hint">Em segundos.</span></div>
-          <div class="field"><label for="move-timeout-second">Timeout do 2º C-MOVE</label><input id="move-timeout-second" name="move_timeout_second" type="number" min="10" max="7200" value="{{ unit.move_timeout_second if unit else 900 }}"><span class="field__hint">Em segundos.</span></div>
-          <div class="field"><label for="parallel-moves">C-MOVE em paralelo</label><input id="parallel-moves" name="max_parallel_moves" type="number" min="1" max="16" value="{{ unit.max_parallel_moves if unit else 1 }}"></div>
-          <div class="field"><label for="find-interval">Intervalo do C-FIND</label><input id="find-interval" name="find_interval_seconds" type="number" min="5" max="3600" value="{{ unit.find_interval_seconds if unit else 30 }}"><span class="field__hint">Em segundos.</span></div>
-          <div class="field"><label for="compact-workers">Processos de compactação</label><input id="compact-workers" name="compact_workers" type="number" min="1" max="32" value="{{ unit.compact_workers if unit else 8 }}"></div>
-          <div class="field"><label for="send-workers">Envios HTTP em paralelo</label><input id="send-workers" name="send_workers" type="number" min="1" max="64" value="{{ unit.send_workers if unit else 16 }}"></div>
-        </div>
-      </div>
-    </section>
-
-    <div class="form-actions">
-      <span class="muted small">Revise os dados antes de salvar.</span>
-      <div class="button-group">
-        <a class="btn btn--quiet" href="/units">Cancelar</a>
-        <button class="btn btn--primary" type="submit">Salvar unidade</button>
-      </div>
-    </div>
-  </form>
-
-  {% if unit %}
-  <section class="danger-zone" aria-labelledby="danger-title">
-    <div>
-      <h2 id="danger-title">Ações da unidade</h2>
-      <p>Reprocesse os arquivos com erro ou remova definitivamente a unidade e seu histórico.</p>
-    </div>
-    <div class="button-group">
-      <form class="inline-form" method="post" action="/units/{{ unit.id }}/retry-errors">
-        <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar erros</button>
       </form>
-      <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Excluir esta unidade? Todos os pedidos e eventos do histórico também serão removidos. Esta ação não pode ser desfeita." data-confirm-label="Excluir unidade">
-        <button class="btn btn--danger" type="submit">{{ icon("trash") }} Excluir unidade</button>
-      </form>
+
+      {% if unit %}
+      <section class="danger-zone unit-danger-zone" aria-labelledby="danger-title">
+        <div>
+          <h2 id="danger-title">Área de atenção</h2>
+          <p>Ações administrativas que afetam o fluxo ou os dados desta unidade.</p>
+        </div>
+        <div class="button-group">
+          <form class="inline-form" method="post" action="/units/{{ unit.id }}/retry-errors">
+            <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar erros</button>
+          </form>
+          <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Excluir esta unidade? Todos os pedidos e eventos do histórico também serão removidos. Esta ação não pode ser desfeita." data-confirm-label="Excluir unidade">
+            <button class="btn btn--danger" type="submit">{{ icon("trash") }} Excluir unidade</button>
+          </form>
+        </div>
+      </section>
+      {% endif %}
     </div>
-  </section>
-  {% endif %}
+  </div>
 </div>
 {% endblock %}

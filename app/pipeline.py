@@ -424,7 +424,6 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
                 unit.pacs_ip,
                 unit.pacs_port,
                 order.study_uid,
-                unit.dest_aet,
                 timeout,
             )
         except ToolMissing as exc:
