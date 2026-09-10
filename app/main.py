@@ -338,7 +338,7 @@ def _unit_view(unit: Unit, counts: tuple[int, int, int, int]) -> Unit:
 
 def _dashboard_units(
     db: Session, page: int
-) -> tuple[list[Unit], dict[str, int | bool]]:
+) -> tuple[list[Unit], dict[str, int | bool], dict[str, int]]:
     total = db.scalar(select(func.count()).select_from(Unit)) or 0
     pager = paginate(total, page, DASH_PAGE)
     units = list(
@@ -388,7 +388,37 @@ def _dashboard_units(
                 int(row[3] or 0),
                 int(row[4] or 0),
             )
-    return [_unit_view(unit, stats.get(unit.id, (0, 0, 0, 0))) for unit in units], pager
+    day = datetime.now() - timedelta(hours=24)
+    active_statuses = (
+        "watching",
+        "wait_retrieve",
+        "wait_second",
+        "retrieving",
+        "retrieving_second",
+    )
+    status_counts = dict(
+        db.execute(
+            select(Order.status, func.count())
+            .where(
+                Order.status.in_(active_statuses)
+                | ((Order.status == "error") & (Order.updated_at >= day))
+            )
+            .group_by(Order.status)
+        ).all()
+    )
+    summary = {
+        "enabled": int(
+            db.scalar(select(func.count()).select_from(Unit).where(Unit.enabled)) or 0
+        ),
+        "watching": int(status_counts.get("watching", 0)),
+        "queue": int(status_counts.get("wait_retrieve", 0))
+        + int(status_counts.get("wait_second", 0)),
+        "running": int(status_counts.get("retrieving", 0))
+        + int(status_counts.get("retrieving_second", 0)),
+        "error": int(status_counts.get("error", 0)),
+    }
+    views = [_unit_view(unit, stats.get(unit.id, (0, 0, 0, 0))) for unit in units]
+    return views, pager, summary
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -398,11 +428,13 @@ def dashboard(
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
-    units, pager = _dashboard_units(db, page)
+    units, pager, summary = _dashboard_units(db, page)
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context=ctx(request, db, "dash", units=units, pager=pager, qs=""),
+        context=ctx(
+            request, db, "dash", units=units, pager=pager, summary=summary, qs=""
+        ),
     )
 
 
@@ -413,11 +445,13 @@ def dashboard_partial(
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
-    units, pager = _dashboard_units(db, page)
+    units, pager, summary = _dashboard_units(db, page)
     return templates.TemplateResponse(
         request=request,
         name="dashboard_partial.html",
-        context=ctx(request, db, "dash", units=units, pager=pager, qs=""),
+        context=ctx(
+            request, db, "dash", units=units, pager=pager, summary=summary, qs=""
+        ),
     )
 
 

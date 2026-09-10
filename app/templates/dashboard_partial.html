@@ -1,4 +1,23 @@
 {% from "icons.html" import icon %}
+<section class="operation-summary" aria-label="Resumo da operação">
+  <div class="operation-summary__lead">
+    <span class="operation-summary__icon">{{ icon("building") }}</span>
+    <span class="operation-summary__copy">
+      <strong>{% if summary.error %}Operação requer atenção{% elif summary.enabled %}Operação normal{% else %}Operação pausada{% endif %}</strong>
+      <span>{{ summary.enabled }} unidade{% if summary.enabled != 1 %}s{% endif %} ativa{% if summary.enabled != 1 %}s{% endif %} no monitoramento</span>
+    </span>
+  </div>
+  <div class="operation-summary__metric"><strong>{{ summary.enabled }}</strong><span>Unidades ativas</span></div>
+  <div class="operation-summary__metric"><strong>{{ summary.queue }}</strong><span>Pedidos na fila</span></div>
+  <div class="operation-summary__metric"><strong>{{ summary.running }}</strong><span>Em processamento</span></div>
+  <div class="operation-summary__metric{% if summary.error %} has-error{% endif %}"><strong>{{ summary.error }}</strong><span>Erros em 24h</span></div>
+</section>
+
+<div class="dashboard-section-heading">
+  <h2>Unidades monitoradas</h2>
+  <span><i aria-hidden="true"></i>Atualização automática a cada 5 segundos</span>
+</div>
+
 {% if not units %}
 <div class="surface empty-state">
   <div class="empty-state__content">
@@ -11,55 +30,51 @@
 {% else %}
 <div class="unit-grid">
   {% for u in units %}
-  <article class="card unit-card{% if not u.enabled %} is-paused{% elif not u.store_up %} is-offline{% endif %}">
-    <div class="unit-card__header">
+  <article class="unit-card{% if not u.enabled %} is-paused{% elif not u.store_up %} is-offline{% endif %}">
+    <header class="unit-card__header">
       <div>
-        <h2 class="unit-card__title">{{ u.name }}</h2>
+        <div class="unit-card__title-row">
+          <h3 class="unit-card__title">{{ u.name }}</h3>
+          <div class="unit-card__statuses" aria-label="Status da unidade">
+            {% if u.enabled %}<span class="status-badge status-badge--success">Ativa</span>{% else %}<span class="status-badge status-badge--neutral">Pausada</span>{% endif %}
+            {% if u.store_up %}<span class="status-badge status-badge--success">Store ativo · {{ u.store_port }}</span>{% else %}<span class="status-badge status-badge--danger">Store indisponível</span>{% endif %}
+          </div>
+        </div>
         <p class="unit-card__meta">{{ u.dest_aet }} → {{ u.pacs_aet }} · {{ u.pacs_ip }}:{{ u.pacs_port }}</p>
       </div>
-      <div class="unit-card__statuses" aria-label="Status da unidade">
-        {% if u.enabled %}
-          <span class="status-badge status-badge--success">Ativa</span>
-        {% else %}
-          <span class="status-badge status-badge--neutral">Pausada</span>
-        {% endif %}
-        {% if u.store_up %}
-          <span class="status-badge status-badge--success">Store ativo · {{ u.store_port }}</span>
-        {% else %}
-          <span class="status-badge status-badge--danger">Store indisponível</span>
-        {% endif %}
+      <span class="unit-card__updated">{{ icon("clock") }} Verificado agora</span>
+    </header>
+
+    <div class="unit-card__body">
+      <div class="unit-card__stats" aria-label="Volumes por etapa">
+        <div class="metric"><strong class="metric__value">{{ u.counts.watching }}</strong><span class="metric__label">No PACS</span><small>Aguardando retrieve</small></div>
+        <div class="metric"><strong class="metric__value">{{ u.counts.queue }}</strong><span class="metric__label">Na fila</span><small>Prontos para processar</small></div>
+        <div class="metric"><strong class="metric__value">{{ u.counts.running }}</strong><span class="metric__label">Em processo</span><small>Retrieve ou envio</small></div>
+        <div class="metric"><strong class="metric__value">{{ u.counts.error }}</strong><span class="metric__label">Erros em 24h</span><small>{% if u.counts.error %}Requer atenção{% else %}Sem ocorrências{% endif %}</small></div>
       </div>
-    </div>
-
-    <div class="unit-card__stats" aria-label="Volumes por etapa">
-      <div class="metric"><strong class="metric__value">{{ u.counts.watching }}</strong><span class="metric__label">No PACS</span></div>
-      <div class="metric"><strong class="metric__value">{{ u.counts.queue }}</strong><span class="metric__label">Na fila</span></div>
-      <div class="metric"><strong class="metric__value">{{ u.counts.running }}</strong><span class="metric__label">Em processo</span></div>
-      <div class="metric"><strong class="metric__value">{{ u.counts.error }}</strong><span class="metric__label">Erros em 24h</span></div>
-    </div>
-
-    <div class="unit-card__folders" aria-label="Arquivos por pasta">
-      <span class="folder-count">Pedidos <strong>{{ u.folders.input }}</strong></span>
-      <span class="folder-count">Recebimento <strong>{{ u.folders.receive }}</strong></span>
-      <span class="folder-count">Envio <strong>{{ u.folders.send }}</strong></span>
-      <span class="folder-count">Erro <strong>{{ u.folders.error }}</strong></span>
+      <aside class="unit-card__pipeline" aria-label="Arquivos por pasta">
+        <div class="unit-card__pipeline-title"><strong>Arquivos por etapa</strong><span>Pastas</span></div>
+        <div class="unit-card__folders">
+          <span class="folder-count">Pedidos <strong>{{ u.folders.input }}</strong></span>
+          <span class="folder-count">Recebimento <strong>{{ u.folders.receive }}</strong></span>
+          <span class="folder-count">Envio <strong>{{ u.folders.send }}</strong></span>
+          <span class="folder-count">Erro <strong>{{ u.folders.error }}</strong></span>
+        </div>
+      </aside>
     </div>
 
     <footer class="unit-card__footer">
+      <span class="unit-card__technical">AET destino: <strong>{{ u.dest_aet }}</strong> · Listener TCP {% if u.store_up %}ativo{% else %}indisponível{% endif %}</span>
       <div class="button-group">
-        <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
         <a class="btn btn--quiet btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
+        <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
+        <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
+          <button class="btn btn--secondary btn--sm" type="submit">{{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}</button>
+        </form>
       </div>
-      <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
-        <button class="btn btn--secondary btn--sm" type="submit">
-          {{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}
-        </button>
-      </form>
     </footer>
   </article>
   {% endfor %}
 </div>
-{% if pager and pager.pages > 1 %}
-<div class="surface">{% include "pager.html" %}</div>
-{% endif %}
+{% if pager and pager.pages > 1 %}<div class="surface">{% include "pager.html" %}</div>{% endif %}
 {% endif %}

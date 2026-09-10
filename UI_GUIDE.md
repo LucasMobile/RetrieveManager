@@ -40,7 +40,7 @@ Os tokens ficam em `app/static/app.css`, dentro de `:root`.
 | Fonte | `--font-sans` | Inter quando instalada, Segoe UI e fontes do sistema como fallback |
 | Mono | `--font-mono` | UIDs, caminhos, correlation IDs e logs |
 | Espaço | `--space-1` a `--space-16` | escala de 4 a 64 px |
-| Raios | `--radius-sm/md/lg` | 6, 10 e 14 px |
+| Raios | `--radius-sm/md/lg` | 3, 4 e 6 px |
 | Elevação | `--shadow-xs` | cards; quase imperceptível |
 | Elevação alta | `--shadow-popover` | modal e skip link |
 | Foco | `--focus-ring` | anel azul-petróleo com contraste visível |
