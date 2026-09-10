@@ -161,8 +161,11 @@ def start_storescp(aet: str, port: int, output_dir: str) -> subprocess.Popen:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     return subprocess.Popen(
         storescp_cmd(bin_path, aet, port, output_dir),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
     )
 
 

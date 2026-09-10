@@ -1,4 +1,6 @@
 import unittest
+from subprocess import PIPE, STDOUT
+from unittest.mock import patch
 
 from app.dicom_tools import (
     dcmcjpeg_cmd,
@@ -63,6 +65,18 @@ class DicomCmdTest(unittest.TestCase):
         self.assertIn("--fork", scp)
         jpeg = dcmcjpeg_cmd("/opt/dcmtk/bin/dcmcjpeg", "+e1", "a.dcm", "b.dcm")
         self.assertEqual(jpeg[1:4], ["-q", "+un", "+e1"])
+
+    @patch("app.dicom_tools.subprocess.Popen")
+    @patch("app.dicom_tools._require", return_value="/opt/dcmtk/bin/storescp")
+    def test_storescp_output_is_captured_for_diagnostics(self, _require, popen):
+        from app.dicom_tools import start_storescp
+
+        start_storescp("RETRIEVE", 444, ".")
+
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(kwargs["stdout"], PIPE)
+        self.assertEqual(kwargs["stderr"], STDOUT)
+        self.assertTrue(kwargs["text"])
 
     def test_dicom_output_redacts_phi(self):
         output = "(0010,0010) PN [SILVA^JOAO] # PatientName\nstatus ok"
