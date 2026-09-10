@@ -26,6 +26,7 @@ x-service-defaults: &service-defaults
     DATA_DIR: /data
     DATABASE_URL: sqlite:////data/retrieve.db
     ALLOWED_DATA_ROOTS: /mobilemed,/opt/idr
+    STORE_PORT_MAP: "444:10444"
 
 services:
   data-permissions:
@@ -75,10 +76,8 @@ services:
     environment:
       <<: *service-environment
       SERVICE_NAME: retrieve-manager-worker
-    sysctls:
-      net.ipv4.ip_unprivileged_port_start: "0"
     ports:
-      - "444:444"
+      - "444:10444"
     healthcheck:
       test:
         - CMD

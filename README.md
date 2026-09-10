@@ -71,12 +71,16 @@ O comando não imprime a senha e usa o mesmo volume de dados do serviço web. Se
 senha contiver `#`, `$`, espaços ou outros caracteres especiais, coloque o valor
 entre aspas simples no `.env`.
 
-Portas publicadas: **8080** (tela) e **444** (`storescp` da primeira unidade). Volume `/mobilemed` é o mesmo das pastas que você cadastrar na unidade. Outra porta de store (ex.: 450) entra em `worker.ports` no `docker-compose.yml`.
+Portas publicadas: **8080** (tela) e **444** (`storescp` da primeira unidade).
+Internamente, o listener usa a porta não privilegiada **10444**, conforme
+`STORE_PORT_MAP=444:10444`; o cadastro e o PACS continuam usando **444**. Volume
+`/mobilemed` é o mesmo das pastas cadastradas na unidade. Outra porta de store
+deve entrar em `worker.ports` e em `STORE_PORT_MAP` no `docker-compose.yml`.
 
 O runtime executa como usuário não-root `10001:10001`, com filesystem raiz
-somente leitura, capabilities removidas e apenas `NET_BIND_SERVICE` no worker
-para permitir a porta 444. Em bind mounts, ajuste previamente o proprietário ou
-ACL de `/mobilemed` e `/opt/idr`.
+somente leitura e capabilities removidas. A tradução Docker de 444 para 10444
+evita conceder privilégio de bind ao worker. Em bind mounts, ajuste previamente o
+proprietário ou ACL de `/mobilemed` e `/opt/idr`.
 
 Se o painel estiver atrás de HTTPS, configure `SESSION_HTTPS_ONLY=true`. Em
 acesso HTTP direto mantenha `false`, caso contrário o navegador não enviará o

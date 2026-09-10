@@ -5,6 +5,7 @@ import subprocess
 from collections import deque
 from threading import Thread
 
+from app.config import store_bind_port
 from app.dicom_tools import ToolMissing, redact_dicom_output, start_storescp
 from app.models import Unit
 from app.observability import log_event
@@ -51,7 +52,8 @@ class StoreSupervisor:
                 status[uid] = "no ar"
                 continue
             try:
-                proc = start_storescp(unit.dest_aet, unit.store_port, unit.receive_dir)
+                bind_port = store_bind_port(unit.store_port)
+                proc = start_storescp(unit.dest_aet, bind_port, unit.receive_dir)
                 self._procs[uid] = proc
                 self._sig[uid] = (unit.dest_aet, unit.store_port, unit.receive_dir)
                 self._start_output_reader(uid, proc)
@@ -91,6 +93,7 @@ class StoreSupervisor:
                     error=exc,
                     unit_id=uid,
                     store_port=unit.store_port,
+                    bind_port=store_bind_port(unit.store_port),
                     error_detail=str(exc),
                 )
                 status[uid] = "falha ao subir"
@@ -105,6 +108,7 @@ class StoreSupervisor:
                 unit_id=uid,
                 process_id=proc.pid,
                 store_port=unit.store_port,
+                bind_port=store_bind_port(unit.store_port),
             )
         return status
 

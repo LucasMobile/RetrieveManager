@@ -1,6 +1,6 @@
 import unittest
 
-from app.config import BASE_DIR
+from app.config import BASE_DIR, store_bind_port
 from app.validation import (
     validate_cloud_url,
     validate_jpeg_flag,
@@ -9,6 +9,10 @@ from app.validation import (
 
 
 class ValidationTest(unittest.TestCase):
+    def test_external_store_port_maps_to_unprivileged_listener(self):
+        self.assertEqual(store_bind_port(444), 10444)
+        self.assertEqual(store_bind_port(445), 445)
+
     def test_valid_unit_form_is_normalized(self):
         root = str(BASE_DIR)
         form = {

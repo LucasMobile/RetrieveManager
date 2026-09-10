@@ -32,6 +32,26 @@ def _read_secret(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
+def _env_port_map(name: str, default: str = "") -> dict[int, int]:
+    """Parse external:internal port mappings used by the store listener."""
+    mappings: dict[int, int] = {}
+    for item in os.getenv(name, default).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            external_raw, internal_raw = item.split(":", maxsplit=1)
+            external, internal = int(external_raw), int(internal_raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} deve usar o formato externa:interna") from exc
+        if not 1 <= external <= 65535 or not 1024 <= internal <= 65535:
+            raise RuntimeError(
+                f"{name}: portas devem estar entre 1-65535; a interna deve ser >= 1024"
+            )
+        mappings[external] = internal
+    return mappings
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,6 +101,12 @@ FINDSCU = os.getenv("FINDSCU", f"{_DCMTK_BIN}/findscu")
 MOVESCU = os.getenv("MOVESCU", f"{_DCMTK_BIN}/movescu")
 STORESCP = os.getenv("STORESCP", f"{_DCMTK_BIN}/storescp")
 DCMCJPEG = os.getenv("DCMCJPEG", f"{_DCMTK_BIN}/dcmcjpeg")
+STORE_PORT_MAP = _env_port_map("STORE_PORT_MAP", "444:10444")
+
+
+def store_bind_port(external_port: int) -> int:
+    return STORE_PORT_MAP.get(external_port, external_port)
+
 
 KNOWN_MODALITIES = ("CR", "DX", "MR", "CT", "US", "SC", "OT", "XA", "MG")
 DEFAULT_CLOUD_URL = "https://idr.mobilemed.com.br/api/router/send-image"
