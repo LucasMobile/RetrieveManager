@@ -75,8 +75,8 @@ services:
     environment:
       <<: *service-environment
       SERVICE_NAME: retrieve-manager-worker
-    cap_add:
-      - NET_BIND_SERVICE
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
     ports:
       - "444:444"
     healthcheck:
