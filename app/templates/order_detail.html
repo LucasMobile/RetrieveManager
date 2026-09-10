@@ -3,101 +3,92 @@
 {% block title %}Pedido {{ order.acc }} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack">
-  <header class="page-header">
+  <header class="page-header order-detail-header">
     <div class="page-header__copy">
       <nav class="breadcrumb" aria-label="Navegação estrutural">
         <a href="/orders">Fila de pedidos</a><span aria-hidden="true">/</span><span>{{ order.unit.name }}</span>
       </nav>
-      <h1>{{ order.acc }}</h1>
-      <p class="page-header__description">Arquivo {{ order.filename }}</p>
+      <div class="order-detail-title">
+        <h1>Pedido {{ order.acc }}</h1>
+        <span class="status-badge {{ badge }}">{{ status_label }}</span>
+      </div>
+      <p class="page-header__description mono">Arquivo {{ order.filename }}</p>
     </div>
     <div class="page-header__actions">
-      {% if order.status == 'error' %}
-      <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry">
+      {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') %}
+      <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
         <button class="btn btn--primary" type="submit">{{ icon("retry") }} Reprocessar</button>
+      </form>
+      <form class="inline-form" method="post" action="/orders/{{ order.id }}/delete" data-confirm="Excluir este pedido? O histórico será removido, mas os arquivos clínicos serão preservados." data-confirm-label="Excluir pedido">
+        <button class="btn btn--danger" type="submit">{{ icon("trash") }} Excluir</button>
       </form>
       {% endif %}
       {% if order.status not in ('done', 'cancelled') %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/cancel" data-confirm="Cancelar este pedido? O processamento atual será interrompido." data-confirm-label="Cancelar pedido">
-        <button class="btn btn--danger" type="submit">Cancelar pedido</button>
+        <button class="btn btn--secondary" type="submit">Cancelar</button>
       </form>
       {% endif %}
       <a class="btn btn--secondary" href="/orders">{{ icon("arrow-left") }} Voltar</a>
     </div>
   </header>
 
-  <div class="section-grid section-grid--detail">
-    <section class="card" aria-labelledby="order-data-title">
-      <div class="card__header">
-        <div>
-          <h2 id="order-data-title">Dados do pedido</h2>
-          <p>Identificação e agendamento do fluxo.</p>
-        </div>
-        <span class="status-badge {{ badge }}">{{ status_label }}</span>
-      </div>
-      <dl class="description-list">
-        <dt>Unidade</dt><dd>{{ order.unit.name }}</dd>
-        <dt>Correlation ID</dt><dd class="mono">{{ order.correlation_id }}</dd>
-        <dt>Patient ID</dt><dd>{{ order.pat_id or 'Não informado' }}</dd>
-        <dt>Accession</dt><dd class="mono">{{ order.acc }}</dd>
-        <dt>Nascimento</dt><dd>{{ order.birth_date or 'Não informado' }}</dd>
-        <dt>Data do exame</dt><dd>{{ order.exam_date or 'Não informado' }}</dd>
-        <dt>Modalidade</dt><dd>{{ order.modality or 'Não informada' }}</dd>
-        <dt>Study UID</dt><dd class="mono">{{ order.study_uid or 'Não informado' }}</dd>
-        <dt>1º retrieve</dt><dd>{{ order.retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.retrieve_at else 'Não agendado' }}</dd>
-        <dt>2º retrieve</dt><dd>{{ order.second_retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.second_retrieve_at else 'Não agendado' }}</dd>
-        <dt>Tentativas</dt><dd>{{ order.attempts }}</dd>
-        {% if order.last_error %}<dt>Último erro</dt><dd class="text-danger">{{ order.last_error }}</dd>{% endif %}
-      </dl>
+  <div class="order-detail-grid">
+    <div class="order-detail-stack">
+      <section class="surface order-panel" aria-labelledby="order-data-title">
+        <header class="order-panel__header">
+          <div><h2 id="order-data-title">Dados do pedido</h2><p>Identificação e origem do estudo.</p></div>
+        </header>
+        <dl class="order-data-list">
+          <div><dt>Unidade</dt><dd>{{ order.unit.name }}</dd></div>
+          <div><dt>Correlation ID</dt><dd class="mono">{{ order.correlation_id }}</dd></div>
+          <div><dt>Patient ID</dt><dd>{{ order.pat_id or 'Não informado' }}</dd></div>
+          <div><dt>Accession</dt><dd class="mono">{{ order.acc }}</dd></div>
+          <div><dt>Nascimento</dt><dd>{{ order.birth_date or 'Não informado' }}</dd></div>
+          <div><dt>Data do exame</dt><dd>{{ order.exam_date or 'Não informado' }}</dd></div>
+          <div><dt>Modalidade</dt><dd><span class="modality-mark">{{ order.modality or '—' }}</span></dd></div>
+          <div><dt>Study UID</dt><dd class="mono">{{ order.study_uid or 'Não informado' }}</dd></div>
+        </dl>
+      </section>
 
-      <div class="card__section" aria-labelledby="images-title">
-        <div class="section-heading">
-          <div>
-            <h2 id="images-title">Imagens</h2>
-            <p>Arquivos associados a este pedido.</p>
-          </div>
+      <section class="surface order-panel" aria-labelledby="schedule-title">
+        <header class="order-panel__header">
+          <div><h2 id="schedule-title">Agendamento</h2><p>Execuções previstas para o retrieve.</p></div>
+          <span class="chip">{{ order.attempts }} tentativa{% if order.attempts != 1 %}s{% endif %}</span>
+        </header>
+        <div class="retrieve-schedule">
+          <div><span>1º retrieve</span><strong>{{ order.retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.retrieve_at else 'Não agendado' }}</strong></div>
+          <div><span>2º retrieve</span><strong>{{ order.second_retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.second_retrieve_at else 'Não agendado' }}</strong></div>
         </div>
-        {% if transfer_stats %}
-        <div class="button-group" aria-label="Imagens por status">
-          {% for transfer_status, count in transfer_stats %}
-          <span class="chip">{{ transfer_status }} · {{ count }}</span>
-          {% endfor %}
-        </div>
-        {% else %}
-        <p class="muted small">Nenhuma imagem foi correlacionada até o momento.</p>
-        {% endif %}
-      </div>
-    </section>
+        {% if order.last_error %}<div class="order-error"><strong>Último erro</strong><span>{{ order.last_error }}</span></div>{% endif %}
+      </section>
 
-    <section class="card" aria-labelledby="timeline-title">
-      <div class="card__header">
-        <div>
-          <h2 id="timeline-title">Linha do tempo</h2>
-          <p>Eventos mais recentes do processamento.</p>
-        </div>
+      <section class="surface order-images" aria-labelledby="images-title">
+        <div><h2 id="images-title">Imagens associadas</h2><p>Arquivos processados neste pedido.</p></div>
+        {% if transfer_stats %}<div class="button-group" aria-label="Imagens por status">{% for transfer_status, count in transfer_stats %}<span class="chip">{{ transfer_status }} · {{ count }}</span>{% endfor %}</div>{% else %}<span class="muted small">Nenhuma imagem correlacionada.</span>{% endif %}
+      </section>
+    </div>
+
+    <section class="surface order-panel timeline-panel" aria-labelledby="timeline-title">
+      <header class="order-panel__header">
+        <div><h2 id="timeline-title">Linha do tempo</h2><p>Eventos mais recentes do processamento.</p></div>
         {{ icon("timeline") }}
+      </header>
+      <div class="flow-progress" aria-label="Progresso do pedido">
+        <div class="is-done"><span>01 · Entrada</span><strong>Recebido</strong></div>
+        <div{% if order.study_uid %} class="is-done"{% endif %}><span>02 · Busca</span><strong>{% if order.study_uid %}Encontrado{% else %}Pendente{% endif %}</strong></div>
+        <div{% if order.status in ('wait_second', 'retrieving_second', 'done') %} class="is-done"{% endif %}><span>03 · Retrieve</span><strong>{% if order.status in ('wait_second', 'retrieving_second', 'done') %}Concluído{% else %}Em curso{% endif %}</strong></div>
+        <div{% if transfer_counts.get('uploaded', 0) %} class="is-done"{% endif %}><span>04 · Envio</span><strong>{% if transfer_counts.get('uploaded', 0) %}{{ transfer_counts.get('uploaded') }} enviadas{% elif transfer_stats %}Em curso{% else %}Pendente{% endif %}</strong></div>
       </div>
       {% if not events %}
-      <div class="empty-state">
-        <div class="empty-state__content">
-          <div class="empty-state__icon">{{ icon("timeline") }}</div>
-          <h2>Ainda não há eventos</h2>
-          <p>O histórico será atualizado quando o processamento começar.</p>
-        </div>
-      </div>
+      <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("timeline") }}</div><h2>Ainda não há eventos</h2><p>O histórico será atualizado quando o processamento começar.</p></div></div>
       {% else %}
-      <ol class="timeline">
+      <ol class="timeline order-timeline">
         {% for e in events %}
         <li class="timeline__item">
           <span class="timeline__marker" aria-hidden="true"></span>
           <div class="timeline__meta">{{ e.created_at.strftime('%d/%m/%Y · %H:%M:%S') }} · {{ e.level }}</div>
           <p class="timeline__message">{{ e.message }}</p>
-          {% if e.detail %}
-          <details>
-            <summary>Ver detalhes técnicos</summary>
-            <pre class="log-box">{{ e.detail[-8000:] }}</pre>
-          </details>
-          {% endif %}
+          {% if e.detail %}<details><summary>Ver detalhes técnicos</summary><pre class="log-box">{{ e.detail[-8000:] }}</pre></details>{% endif %}
         </li>
         {% endfor %}
       </ol>

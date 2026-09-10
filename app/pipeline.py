@@ -657,6 +657,12 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         )
         db.add(transfer)
         db.flush()
+    else:
+        transfer.order_id = order.id if order else transfer.order_id
+        transfer.correlation_id = correlation_id
+        transfer.attempts = 0
+        transfer.next_attempt_at = None
+        transfer.last_http_status = None
     transfer.status = result.status
     transfer.last_error = result.error_type
     level = logging.ERROR if result.error_type else logging.INFO

@@ -5,7 +5,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.models import Base, ImageTransfer, Order, Unit
-from app.pipeline import CircuitState, SendResult, _record_send_results
+from app.pipeline import (
+    CircuitState,
+    CompactResult,
+    SendResult,
+    _record_compact_result,
+    _record_send_results,
+)
 
 
 class TransferTrackingTest(unittest.TestCase):
@@ -80,6 +86,58 @@ class TransferTrackingTest(unittest.TestCase):
             self.assertEqual(transfer.attempts, 1)
             self.assertEqual(transfer.last_http_status, 503)
             self.assertIsNotNone(transfer.next_attempt_at)
+
+    def test_retrieved_image_reuses_transfer_with_new_correlation(self):
+        with self.Session() as db:
+            unit = Unit(
+                name="unit",
+                input_dir="/in",
+                sent_dir="/sent",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                dest_aet="RETRIEVE",
+                store_port=444,
+                receive_dir="/receive",
+                send_dir="/send",
+                error_dir="/error",
+                token="token",
+            )
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                filename="order.txt",
+                acc="accession",
+                birth_date="20000101",
+                correlation_id="new-correlation",
+                study_uid="1.2.3",
+            )
+            db.add(order)
+            transfer = ImageTransfer(
+                unit_id=unit.id,
+                order_id=order.id,
+                filename="image.dcm",
+                correlation_id="old-correlation",
+                study_uid="1.2.3",
+                status="uploaded",
+                attempts=2,
+            )
+            db.add(transfer)
+            db.commit()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult("image", "image.dcm", "1.2.3", "compressed"),
+            )
+            db.commit()
+
+            db.refresh(transfer)
+            self.assertEqual(transfer.status, "compressed")
+            self.assertEqual(transfer.correlation_id, "new-correlation")
+            self.assertEqual(transfer.attempts, 0)
 
 
 if __name__ == "__main__":

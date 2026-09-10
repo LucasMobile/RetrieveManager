@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import case, delete, func, or_, select, text
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -35,10 +35,10 @@ from app.models import (
     User,
 )
 from app.netutil import port_listening
-from app.observability import configure_logging, log_event
+from app.observability import configure_logging, log_event, new_correlation_id
 from app.pager import paginate, query_keep
 from app.pipeline import folder_counts
-from app.rules import get_settings
+from app.rules import get_settings, schedule_from_now
 from app.security import (
     clear_login_failures,
     hash_password,
@@ -57,6 +57,7 @@ ORDERS_PAGE = 40
 EVENTS_PAGE = 10
 UNITS_PAGE = 20
 DASH_PAGE = 8
+ACTIVE_ORDER_STATUSES = frozenset({"retrieving", "retrieving_second", "receiving"})
 log = logging.getLogger("web")
 
 configure_logging()
@@ -870,6 +871,25 @@ def orders_list(
             )
         )
     total = db.scalar(select(func.count()).select_from(filt.subquery())) or 0
+    filtered_orders = filt.subquery()
+    order_status_counts = dict(
+        db.execute(
+            select(filtered_orders.c.status, func.count())
+            .group_by(filtered_orders.c.status)
+            .order_by(filtered_orders.c.status)
+        ).all()
+    )
+    order_summary = {
+        "total": total,
+        "waiting": sum(
+            int(order_status_counts.get(key, 0))
+            for key in ("watching", "wait_retrieve", "wait_second")
+        ),
+        "running": sum(
+            int(order_status_counts.get(key, 0)) for key in ACTIVE_ORDER_STATUSES
+        ),
+        "done": int(order_status_counts.get("done", 0)),
+    }
     pager = paginate(total, page, ORDERS_PAGE)
     stmt = (
         filt.options(selectinload(Order.unit))
@@ -897,6 +917,7 @@ def orders_list(
             status=status,
             q=q,
             pager=pager,
+            order_summary=order_summary,
             qs=qs,
         ),
     )
@@ -934,6 +955,7 @@ def order_detail(
             .order_by(ImageTransfer.status)
         )
     )
+    transfer_counts = dict(transfer_stats)
     return templates.TemplateResponse(
         request=request,
         name="order_detail.html",
@@ -946,6 +968,7 @@ def order_detail(
             status_label=STATUSES.get(order.status, order.status),
             badge=badge_for(order.status),
             transfer_stats=transfer_stats,
+            transfer_counts=transfer_counts,
             pager=pager,
             qs="",
         ),
@@ -960,18 +983,51 @@ def order_retry(
     user: User = Depends(require_user),
 ):
     order = db.get(Order, order_id)
-    if order and order.status == "error":
-        if order.study_uid:
-            order.status = "wait_retrieve"
-            order.retrieve_at = datetime.now()
-        else:
-            order.status = "watching"
-            order.last_find_at = None
-        order.last_error = ""
+    if order and order.status not in ACTIVE_ORDER_STATUSES:
+        _reset_order_for_reprocess(db, order)
         db.commit()
-        flash(request, "Pedido recolocado na fila.")
+        log_event(
+            log,
+            logging.INFO,
+            "order.reprocess",
+            resource=f"order:{order.id}",
+            status="success",
+            order_id=order.id,
+            unit_id=order.unit_id,
+            user_id=user.id,
+        )
+        flash(request, "Pedido reiniciado para novo retrieve e envio.")
+    elif order:
+        flash(
+            request, "Aguarde o processamento atual terminar para reprocessar.", "err"
+        )
     return RedirectResponse(
         request.headers.get("referer") or "/orders", status_code=303
+    )
+
+
+def _reset_order_for_reprocess(db: Session, order: Order) -> None:
+    order.correlation_id = new_correlation_id()
+    order.attempts = 0
+    order.done_at = None
+    order.heartbeat_at = None
+    order.last_error = ""
+    if order.study_uid:
+        order.status = "wait_retrieve"
+        order.retrieve_at = datetime.now()
+        _, _, order.second_retrieve_at = schedule_from_now(db, order.modality)
+    else:
+        order.status = "watching"
+        order.last_find_at = None
+        order.retrieve_at = None
+        order.second_retrieve_at = None
+        order.found_at = None
+    db.add(
+        OrderEvent(
+            order_id=order.id,
+            level="info",
+            message="Reprocessamento manual solicitado",
+        )
     )
 
 
@@ -990,6 +1046,81 @@ def order_cancel(
     return RedirectResponse(
         request.headers.get("referer") or "/orders", status_code=303
     )
+
+
+def _archive_order_request(order: Order, unit: Unit) -> None:
+    source = Path(unit.input_dir) / Path(order.filename).name
+    if not source.is_file():
+        return
+    destination_dir = Path(unit.sent_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / source.name
+    if source.resolve() == destination.resolve():
+        return
+    if destination.exists():
+        destination = destination.with_name(
+            f"{destination.stem}.deleted-{order.id}{destination.suffix}"
+        )
+    shutil.move(str(source), str(destination))
+
+
+def _delete_order_record(db: Session, order: Order) -> None:
+    db.execute(
+        update(ImageTransfer)
+        .where(ImageTransfer.order_id == order.id)
+        .values(order_id=None)
+    )
+    db.execute(delete(OrderEvent).where(OrderEvent.order_id == order.id))
+    db.delete(order)
+
+
+@app.post("/orders/{order_id}/delete")
+def order_delete(
+    order_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    order = db.get(Order, order_id)
+    if order is None:
+        flash(request, "Pedido não encontrado.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    if order.status in ACTIVE_ORDER_STATUSES:
+        flash(request, "Aguarde o processamento atual terminar para excluir.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    unit = db.get(Unit, order.unit_id)
+    try:
+        if unit is not None:
+            _archive_order_request(order, unit)
+        unit_id = order.unit_id
+        _delete_order_record(db, order)
+        db.commit()
+    except OSError as exc:
+        db.rollback()
+        log_event(
+            log,
+            logging.ERROR,
+            "order.delete",
+            resource=f"order:{order_id}",
+            status="failure",
+            error=exc,
+            order_id=order_id,
+            user_id=user.id,
+        )
+        flash(request, "Não foi possível arquivar o pedido antes da exclusão.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    log_event(
+        log,
+        logging.INFO,
+        "order.delete",
+        resource=f"order:{order_id}",
+        status="success",
+        order_id=order_id,
+        unit_id=unit_id,
+        user_id=user.id,
+    )
+    flash(request, "Pedido excluído. Os arquivos clínicos foram preservados.")
+    return RedirectResponse("/orders", status_code=303)
 
 
 @app.get("/settings", response_class=HTMLResponse)
