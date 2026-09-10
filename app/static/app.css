@@ -376,6 +376,9 @@ input[type="checkbox"] { width: 1.125rem; min-height: 1.125rem; accent-color: va
 .orders-table-card__header p { margin: .15rem 0 0; color: var(--color-neutral-600); font-size: .6875rem; }
 .orders-table-card__meta { display: flex; flex-wrap: wrap; gap: .375rem; }
 .orders-table-card__meta span { padding: .2rem .45rem; border: 1px solid var(--color-neutral-100); border-radius: var(--radius-sm); background: #fafcfc; color: var(--color-neutral-600); font-size: .625rem; }
+.orders-refresh { display: inline-flex; min-height: 1.625rem; align-items: center; gap: .35rem; padding: .2rem .5rem; border: 1px solid var(--color-neutral-200); border-radius: var(--radius-sm); background: var(--color-white); color: var(--color-primary-700); font-size: .625rem; font-weight: 680; text-decoration: none; }
+.orders-refresh:hover { border-color: var(--color-neutral-300); background: var(--color-primary-50); color: var(--color-primary-700); }
+.orders-refresh .icon { width: .75rem; height: .75rem; }
 .orders-table th:last-child { text-align: right; }
 .order-date, .order-identity, .order-next { display: grid; line-height: 1.35; }
 .order-date span, .order-next small { color: var(--color-neutral-600); font-size: .6875rem; }
@@ -420,7 +423,7 @@ input[type="checkbox"] { width: 1.125rem; min-height: 1.125rem; accent-color: va
 .flow-progress strong { display: block; margin-top: .3rem; overflow: hidden; font-size: .6875rem; text-overflow: ellipsis; white-space: nowrap; }
 .flow-progress .is-done { background: var(--color-success-100); }
 .flow-progress .is-done span, .flow-progress .is-done strong { color: var(--color-success-700); }
-.order-timeline { margin: 0 1.25rem var(--space-5); }
+.timeline.order-timeline { margin: 0 1.25rem var(--space-5); }
 .timeline-panel > .pager { border-top: 1px solid var(--color-neutral-100); }
 
 .description-list { display: grid; grid-template-columns: minmax(8rem, .65fr) minmax(0, 1.35fr); margin: 0; }

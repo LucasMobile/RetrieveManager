@@ -51,7 +51,10 @@
   <section class="surface orders-table-card" aria-labelledby="orders-table-title">
     <div class="orders-table-card__header">
       <div><h2 id="orders-table-title">Pedidos encontrados</h2><p>Ordenados dos mais recentes para os mais antigos.</p></div>
-      <div class="orders-table-card__meta"><span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span><span>Atualizado agora</span></div>
+      <div class="orders-table-card__meta">
+        <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+        <a class="orders-refresh" href="/orders?{{ qs }}{% if qs %}&{% endif %}page={{ pager.page }}" title="Atualizar pedidos" aria-label="Atualizar tabela de pedidos">{{ icon("retry") }} Atualizar</a>
+      </div>
     </div>
     {% if not orders %}
     <div class="empty-state">
