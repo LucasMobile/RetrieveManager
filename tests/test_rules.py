@@ -1,9 +1,11 @@
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+from app.main import rules_retrieve_delete
 from app.models import Base, ModalityRule
 from app.rules import retrieve_rule_for, schedule_from_now
 
@@ -64,6 +66,26 @@ class RulesTest(unittest.TestCase):
             self.assertAlmostEqual(
                 (first - datetime.now()).total_seconds() / 60, 10, delta=0.2
             )
+
+    def test_delete_specific_rule_and_protect_default(self):
+        request = SimpleNamespace(session={})
+        user = SimpleNamespace(id=1)
+        with self.Session() as db:
+            ct = db.scalar(select(ModalityRule).where(ModalityRule.modality == "CT"))
+            default = db.scalar(
+                select(ModalityRule).where(ModalityRule.modality == "*")
+            )
+            assert ct is not None
+            assert default is not None
+
+            response = rules_retrieve_delete(ct.id, request, db, user)
+            self.assertEqual(response.status_code, 303)
+            self.assertIsNone(db.get(ModalityRule, ct.id))
+
+            response = rules_retrieve_delete(default.id, request, db, user)
+            self.assertEqual(response.status_code, 303)
+            self.assertIsNotNone(db.get(ModalityRule, default.id))
+            self.assertEqual(request.session["flash"]["kind"], "err")
 
 
 if __name__ == "__main__":

@@ -193,4 +193,33 @@
       echoButton.classList.remove("is-loading");
     }
   });
+
+  document.querySelectorAll("[data-second-rule]").forEach((rule) => {
+    const toggle = rule.querySelector("[data-second-toggle]");
+    const value = rule.querySelector("[data-second-value]");
+    const field = rule.querySelector("[data-second-field]");
+    const input = rule.querySelector("[data-second-input]");
+    const label = rule.querySelector("[data-second-label]");
+    const description = rule.querySelector("[data-second-description]");
+    const attempt = toggle?.closest(".retrieve-attempt");
+    if (!toggle || !value || !field || !input || !label || !description) return;
+
+    const setSecondRetrieve = (active) => {
+      toggle.setAttribute("aria-checked", String(active));
+      toggle.setAttribute(
+        "aria-label",
+        `${active ? "Desativar" : "Ativar"} segunda tentativa`,
+      );
+      value.value = active ? "1" : "0";
+      input.disabled = !active;
+      field.classList.toggle("is-disabled", !active);
+      attempt?.classList.toggle("is-off", !active);
+      label.textContent = active ? "Ativada" : "Desativada";
+      description.textContent = active ? "Nova busca automática" : "Uma única busca";
+    };
+
+    toggle.addEventListener("click", () => {
+      setSecondRetrieve(toggle.getAttribute("aria-checked") !== "true");
+    });
+  });
 })();

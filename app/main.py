@@ -757,10 +757,21 @@ def rules_retrieve(
     request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
 ):
     rules = list(db.scalars(select(ModalityRule).order_by(ModalityRule.modality)))
+    default_rule = next((rule for rule in rules if rule.modality == "*"), None)
     return templates.TemplateResponse(
         request=request,
         name="rules_retrieve.html",
-        context=ctx(request, db, "retrieve", rules=rules),
+        context=ctx(
+            request,
+            db,
+            "retrieve",
+            rules=rules,
+            summary={
+                "total": len(rules),
+                "second_enabled": sum(rule.second_retrieve for rule in rules),
+                "default_wait": default_rule.wait_minutes if default_rule else None,
+            },
+        ),
     )
 
 
@@ -818,13 +829,45 @@ def rules_retrieve_update(
             rule.modality = safe_modality
         rule.wait_minutes = wait_minutes
         rule.second_retrieve = second_retrieve == "1"
-        rule.second_wait_minutes = second_wait_minutes
+        if rule.second_retrieve:
+            rule.second_wait_minutes = second_wait_minutes
         try:
             db.commit()
             flash(request, "Regra salva.")
         except IntegrityError:
             db.rollback()
             flash(request, "Modalidade já existe.", "err")
+    return RedirectResponse("/rules/retrieve", status_code=303)
+
+
+@app.post("/rules/retrieve/{rule_id}/delete")
+def rules_retrieve_delete(
+    rule_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    rule = db.get(ModalityRule, rule_id)
+    if rule is None:
+        flash(request, "Regra não encontrada.", "err")
+        return RedirectResponse("/rules/retrieve", status_code=303)
+    if rule.modality == "*":
+        flash(request, "A regra padrão não pode ser excluída.", "err")
+        return RedirectResponse("/rules/retrieve", status_code=303)
+
+    modality = rule.modality
+    db.delete(rule)
+    db.commit()
+    log_event(
+        log,
+        logging.INFO,
+        "retrieve_rule.delete",
+        resource=f"retrieve-rule:{rule_id}",
+        status="success",
+        user_id=user.id,
+        modality=modality,
+    )
+    flash(request, f"Regra de {modality} excluída.")
     return RedirectResponse("/rules/retrieve", status_code=303)
 
 
