@@ -63,7 +63,6 @@ h1, h2, h3 { color: var(--color-neutral-950); line-height: 1.2; }
 code, .mono { font-family: var(--font-mono); font-size: .875em; }
 code { padding: .12em .35em; border: 1px solid var(--color-neutral-200); border-radius: var(--radius-sm); background: var(--color-neutral-50); }
 .icon { display: block; width: 1.25rem; height: 1.25rem; flex: 0 0 auto; overflow: visible; }
-.icon > * { vector-effect: non-scaling-stroke; }
 .visually-hidden {
   position: absolute !important; width: 1px !important; height: 1px !important;
   padding: 0 !important; margin: -1px !important; overflow: hidden !important;

@@ -24,9 +24,9 @@ class IconSystemTest(unittest.TestCase):
         css_source = (ROOT / "app" / "static" / "app.css").read_text(encoding="utf-8")
 
         self.assertIn('width="24" height="24" viewBox="0 0 24 24"', icon_source)
-        self.assertIn('stroke-width="2"', icon_source)
+        self.assertIn('stroke-width="1.75"', icon_source)
         self.assertIn('shape-rendering="geometricPrecision"', icon_source)
-        self.assertIn(".icon > * { vector-effect: non-scaling-stroke; }", css_source)
+        self.assertNotIn("vector-effect: non-scaling-stroke", css_source)
 
 
 if __name__ == "__main__":
