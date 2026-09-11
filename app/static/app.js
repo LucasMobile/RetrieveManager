@@ -32,11 +32,18 @@
 
   document.querySelectorAll("[data-password-toggle]").forEach((button) => {
     const input = document.getElementById(button.dataset.passwordToggle);
+    const showIcon = button.querySelector("[data-password-show]");
+    const hideIcon = button.querySelector("[data-password-hide]");
     if (!input) return;
     button.addEventListener("click", () => {
       const reveal = input.type === "password";
       input.type = reveal ? "text" : "password";
-      button.textContent = reveal ? "Ocultar" : "Mostrar";
+      if (showIcon) showIcon.hidden = reveal;
+      if (hideIcon) hideIcon.hidden = !reveal;
+      const action = reveal ? "Ocultar" : "Mostrar";
+      const passwordLabel = button.dataset.passwordLabel || "senha";
+      button.setAttribute("aria-label", `${action} ${passwordLabel}`);
+      button.setAttribute("title", `${action} senha`);
       button.setAttribute("aria-pressed", String(reveal));
     });
   });
