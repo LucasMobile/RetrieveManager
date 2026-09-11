@@ -1,12 +1,13 @@
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.main import rules_retrieve_delete
-from app.models import Base, ModalityRule
+from app.main import rules_compress_delete, rules_retrieve_delete
+from app.models import Base, CompressRule, ModalityRule
 from app.rules import retrieve_rule_for, schedule_from_now
 
 
@@ -36,6 +37,8 @@ class RulesTest(unittest.TestCase):
                         second_retrieve=False,
                         second_wait_minutes=90,
                     ),
+                    CompressRule(modality="CT", jpeg_flag="+e1"),
+                    CompressRule(modality="*", jpeg_flag="+e1"),
                 ]
             )
             db.commit()
@@ -86,6 +89,39 @@ class RulesTest(unittest.TestCase):
             self.assertEqual(response.status_code, 303)
             self.assertIsNotNone(db.get(ModalityRule, default.id))
             self.assertEqual(request.session["flash"]["kind"], "err")
+
+    def test_delete_specific_compression_rule_and_protect_default(self):
+        request = SimpleNamespace(session={})
+        user = SimpleNamespace(id=1)
+        with self.Session() as db:
+            ct = db.scalar(select(CompressRule).where(CompressRule.modality == "CT"))
+            default = db.scalar(
+                select(CompressRule).where(CompressRule.modality == "*")
+            )
+            assert ct is not None
+            assert default is not None
+
+            with patch("app.main.log_event") as log_event_mock:
+                response = rules_compress_delete(ct.id, request, db, user)
+
+            self.assertEqual(response.status_code, 303)
+            self.assertIsNone(db.get(CompressRule, ct.id))
+            log_event_mock.assert_called_once()
+            self.assertEqual(
+                log_event_mock.call_args.args[2], "compression_rule.delete"
+            )
+            self.assertEqual(log_event_mock.call_args.kwargs["modality"], "CT")
+
+            with patch("app.main.log_event") as log_event_mock:
+                response = rules_compress_delete(default.id, request, db, user)
+            self.assertEqual(response.status_code, 303)
+            self.assertIsNotNone(db.get(CompressRule, default.id))
+            self.assertEqual(request.session["flash"]["kind"], "err")
+            self.assertEqual(log_event_mock.call_args.kwargs["status"], "failure")
+            self.assertEqual(
+                log_event_mock.call_args.kwargs["error_type"],
+                "ProtectedDefaultRule",
+            )
 
 
 if __name__ == "__main__":

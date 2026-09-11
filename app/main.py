@@ -877,10 +877,23 @@ def rules_compress(
 ):
     compress = list(db.scalars(select(CompressRule).order_by(CompressRule.modality)))
     drops = list(db.scalars(select(DropModality).order_by(DropModality.code)))
+    default_rule = next((rule for rule in compress if rule.modality == "*"), None)
+    compression_summary = {
+        "profiles": len(compress),
+        "default_flag": default_rule.jpeg_flag if default_rule else "—",
+        "drops": len(drops),
+    }
     return templates.TemplateResponse(
         request=request,
         name="rules_compress.html",
-        context=ctx(request, db, "compress", compress=compress, drops=drops),
+        context=ctx(
+            request,
+            db,
+            "compress",
+            compress=compress,
+            drops=drops,
+            compression_summary=compression_summary,
+        ),
     )
 
 
@@ -937,6 +950,58 @@ def rules_compress_update(
     return RedirectResponse("/rules/compress", status_code=303)
 
 
+@app.post("/rules/compress/{rule_id}/delete")
+def rules_compress_delete(
+    rule_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    rule = db.get(CompressRule, rule_id)
+    if rule is None:
+        log_event(
+            log,
+            logging.WARNING,
+            "compression_rule.delete",
+            resource=f"compression-rule:{rule_id}",
+            status="failure",
+            user_id=user.id,
+            error_type="NotFound",
+        )
+        flash(request, "Regra de compactação não encontrada.", "err")
+        return RedirectResponse("/rules/compress", status_code=303)
+    if rule.modality == "*":
+        log_event(
+            log,
+            logging.WARNING,
+            "compression_rule.delete",
+            resource=f"compression-rule:{rule_id}",
+            status="failure",
+            user_id=user.id,
+            modality=rule.modality,
+            error_type="ProtectedDefaultRule",
+        )
+        flash(request, "A regra padrão de compactação não pode ser excluída.", "err")
+        return RedirectResponse("/rules/compress", status_code=303)
+
+    modality = rule.modality
+    jpeg_flag = rule.jpeg_flag
+    db.delete(rule)
+    db.commit()
+    log_event(
+        log,
+        logging.INFO,
+        "compression_rule.delete",
+        resource=f"compression-rule:{rule_id}",
+        status="success",
+        user_id=user.id,
+        modality=modality,
+        jpeg_flag=jpeg_flag,
+    )
+    flash(request, f"Regra de compactação de {modality} excluída.")
+    return RedirectResponse("/rules/compress", status_code=303)
+
+
 @app.post("/rules/drop")
 def rules_drop_add(
     request: Request,
@@ -955,10 +1020,10 @@ def rules_drop_add(
     db.add(DropModality(code=safe_code))
     try:
         db.commit()
-        flash(request, "Código de descarte adicionado.")
+        flash(request, "Modalidade adicionada ao descarte.")
     except IntegrityError:
         db.rollback()
-        flash(request, "Código já existe.", "err")
+        flash(request, "Modalidade já existe no descarte.", "err")
     return RedirectResponse("/rules/compress", status_code=303)
 
 
@@ -973,7 +1038,7 @@ def rules_drop_delete(
     if row:
         db.delete(row)
         db.commit()
-        flash(request, "Código removido da lista de descarte.")
+        flash(request, "Modalidade removida da lista de descarte.")
     return RedirectResponse("/rules/compress", status_code=303)
 
 

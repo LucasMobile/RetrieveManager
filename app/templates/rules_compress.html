@@ -7,75 +7,156 @@
     <div class="page-header__copy">
       <p class="eyebrow">Configurações</p>
       <h1>Compactação e descarte</h1>
-      <p class="page-header__description">Controle o perfil JPEG por modalidade e quais imagens devem ser descartadas no recebimento.</p>
+      <p class="page-header__description">Controle o perfil JPEG aplicado a cada modalidade e defina quais imagens devem ser descartadas no recebimento.</p>
     </div>
   </header>
 
-  <div class="section-grid section-grid--2">
-    <section class="card" aria-labelledby="compression-title">
-      <div class="card__header">
+  <section class="card card--flush compression-summary" aria-label="Resumo da configuração">
+    <div class="compression-summary__item">
+      <span class="compression-summary__icon">{{ icon("compress") }}</span>
+      <span class="compression-summary__copy"><strong>{{ compression_summary.profiles }}</strong><span>perfis de compactação ativos</span></span>
+    </div>
+    <div class="compression-summary__item">
+      <span class="compression-summary__icon">{{ icon("rules") }}</span>
+      <span class="compression-summary__copy"><strong>{{ compression_summary.default_flag }}</strong><span>perfil JPEG padrão</span></span>
+    </div>
+    <div class="compression-summary__item">
+      <span class="compression-summary__icon">{{ icon("trash") }}</span>
+      <span class="compression-summary__copy"><strong>{{ compression_summary.drops }}</strong><span>modalidades descartadas</span></span>
+    </div>
+  </section>
+
+  <div class="compression-config-grid">
+    <section class="card card--flush compression-panel" aria-labelledby="compression-title">
+      <header class="compression-panel__header">
         <div>
-          <h2 id="compression-title">Perfil JPEG</h2>
-          <p>A regra <code>*</code> é aplicada quando não há perfil específico.</p>
+          <h2 id="compression-title">Tipos de Compactação</h2>
+          <p>A regra <strong>*</strong> é aplicada quando não existe um perfil específico.</p>
         </div>
+        <span class="compression-panel__icon">{{ icon("compress") }}</span>
+      </header>
+
+      {% for rule in compress %}
+      <form id="compression-rule-{{ rule.id }}" method="post" action="/rules/compress/{{ rule.id }}"></form>
+      {% if rule.modality != '*' %}
+      <form id="compression-delete-{{ rule.id }}" method="post" action="/rules/compress/{{ rule.id }}/delete" data-confirm="Excluir a regra de compactação de {{ rule.modality }}? A modalidade passará a utilizar a regra padrão." data-confirm-label="Excluir regra"></form>
+      {% endif %}
+      {% endfor %}
+
+      <div class="compression-table-wrap">
+        <table class="compression-table">
+          <thead>
+            <tr>
+              <th scope="col">Modalidade</th>
+              <th scope="col">Perfil de compactação</th>
+              <th scope="col">Ações</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for rule in compress %}
+            <tr>
+              <td>
+                <div class="compression-modality">
+                  <span class="compression-modality__mark" aria-hidden="true">{{ rule.modality }}</span>
+                  <span class="compression-modality__copy">
+                    {% if rule.modality == '*' %}
+                    <strong>Demais</strong>
+                    <input type="hidden" name="modality" value="*" form="compression-rule-{{ rule.id }}">
+                    {% else %}
+                    <label class="visually-hidden" for="compression-modality-{{ rule.id }}">Modalidade</label>
+                    <input class="compression-modality__input" id="compression-modality-{{ rule.id }}" name="modality" value="{{ rule.modality }}" maxlength="8" required form="compression-rule-{{ rule.id }}">
+                    {% endif %}
+                    <small>{{ "Regra padrão" if rule.modality == "*" else "Regra específica" }}</small>
+                  </span>
+                </div>
+              </td>
+              <td>
+                <label class="visually-hidden" for="compression-profile-{{ rule.id }}">Perfil de compactação de {{ rule.modality }}</label>
+                <select class="compression-profile-select" id="compression-profile-{{ rule.id }}" name="jpeg_flag" form="compression-rule-{{ rule.id }}">
+                  <option value="+e1" {% if rule.jpeg_flag == '+e1' %}selected{% endif %}>+e1 · Lossless SV1</option>
+                  <option value="+eb" {% if rule.jpeg_flag == '+eb' %}selected{% endif %}>+eb · Baseline lossy</option>
+                  <option value="+ee" {% if rule.jpeg_flag == '+ee' %}selected{% endif %}>+ee · Extended</option>
+                </select>
+              </td>
+              <td>
+                <div class="compression-actions">
+                  <button class="action-icon" type="submit" form="compression-rule-{{ rule.id }}" data-tooltip="Salvar regra" aria-label="Salvar regra de {{ rule.modality }}">{{ icon("save") }}</button>
+                  {% if rule.modality != '*' %}
+                  <button class="action-icon action-icon--danger" type="submit" form="compression-delete-{{ rule.id }}" data-tooltip="Excluir regra" aria-label="Excluir regra de {{ rule.modality }}">{{ icon("trash") }}</button>
+                  {% else %}
+                  <button class="action-icon is-disabled" type="button" data-tooltip="Regra padrão protegida" aria-label="A regra padrão não pode ser excluída" aria-disabled="true">{{ icon("trash") }}</button>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td class="compression-table__empty" colspan="3">Nenhum perfil de compactação configurado.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
 
-      <div class="rule-list">
-        <div class="rule-list__header rule-grid--compress" aria-hidden="true"><span>Modalidade</span><span>Perfil</span><span>Ação</span></div>
-        {% for r in compress %}
-        <form method="post" action="/rules/compress/{{ r.id }}" class="rule-row rule-grid--compress">
-          <div class="rule-field">
-            <label for="compress-modality-{{ r.id }}">Modalidade</label>
-            <input id="compress-modality-{{ r.id }}" name="modality" value="{{ r.modality }}" maxlength="8" {% if r.modality == '*' %}readonly{% endif %} required>
+      <div class="compression-create">
+        <h3>Adicionar perfil</h3>
+        <form method="post" action="/rules/compress" class="compression-create__form">
+          <div class="field">
+            <label for="compression-new-modality">Modalidade</label>
+            <input id="compression-new-modality" name="modality" placeholder="Ex.: XA" maxlength="8" required>
           </div>
-          <div class="rule-field">
-            <label for="jpeg-flag-{{ r.id }}">Perfil JPEG</label>
-            <select id="jpeg-flag-{{ r.id }}" name="jpeg_flag">
-              <option value="+e1" {% if r.jpeg_flag == '+e1' %}selected{% endif %}>+e1 · Lossless SV1</option>
-              <option value="+eb" {% if r.jpeg_flag == '+eb' %}selected{% endif %}>+eb · Baseline lossy</option>
-              <option value="+ee" {% if r.jpeg_flag == '+ee' %}selected{% endif %}>+ee · Extended</option>
+          <div class="field">
+            <label for="compression-new-profile">Perfil JPEG</label>
+            <select id="compression-new-profile" name="jpeg_flag">
+              <option value="+e1">+e1 · Lossless SV1</option>
+              <option value="+eb">+eb · Baseline lossy</option>
+              <option value="+ee">+ee · Extended</option>
             </select>
           </div>
-          <button class="btn btn--secondary btn--sm" type="submit">Salvar</button>
+          <button class="btn btn--primary" type="submit">{{ icon("plus") }} Adicionar</button>
         </form>
-        {% endfor %}
       </div>
 
-      <form method="post" action="/rules/compress" class="inline-create">
-        <div class="field"><label for="compress-new-modality">Modalidade</label><input id="compress-new-modality" name="modality" placeholder="Ex.: CT" maxlength="8" required></div>
-        <div class="field"><label for="compress-new-flag">Perfil JPEG</label><select id="compress-new-flag" name="jpeg_flag"><option value="+e1">+e1 · Lossless SV1</option><option value="+eb">+eb · Baseline lossy</option><option value="+ee">+ee · Extended</option></select></div>
-        <button class="btn btn--primary" type="submit">{{ icon("plus") }} Adicionar</button>
-      </form>
+      <footer class="compression-panel__footer">{{ icon("info") }} As alterações passam a valer nos próximos arquivos processados.</footer>
     </section>
 
-    <section class="card" aria-labelledby="drop-title">
-      <div class="card__header">
+    <section class="card card--flush compression-panel" aria-labelledby="drop-title">
+      <header class="compression-panel__header">
         <div>
           <h2 id="drop-title">Descarte no recebimento</h2>
-          <p>Compara o código com a modalidade ou com os dois primeiros caracteres do arquivo.</p>
+          <p>Modalidades removidas antes da compactação e do envio.</p>
         </div>
+        <span class="compression-panel__icon compression-panel__icon--warning">{{ icon("trash") }}</span>
+      </header>
+
+      <div class="compression-warning" role="note">
+        {{ icon("alert") }}
+        <span>O descarte compara a modalidade DICOM com os dois primeiros caracteres do nome do arquivo.</span>
       </div>
 
-      {% if drops %}
-      <div class="rule-list">
-        <div class="rule-list__header rule-grid--drop" aria-hidden="true"><span>Código</span><span>Ação</span></div>
-        {% for d in drops %}
-        <div class="rule-row rule-grid--drop">
-          <span class="chip">{{ d.code }}</span>
-          <form class="inline-form" method="post" action="/rules/drop/{{ d.id }}/delete" data-confirm="Remover {{ d.code }} da lista de descarte? Novos arquivos dessa modalidade deixarão de ser descartados." data-confirm-label="Remover código">
-            <button class="btn btn--danger btn--sm" type="submit">{{ icon("trash") }} Remover</button>
+      <div class="compression-drop-list">
+        <div class="compression-drop-list__header" aria-hidden="true"><span>Modalidade</span><span>Ação</span></div>
+        {% for drop in drops %}
+        <div class="compression-drop-row">
+          <div class="compression-drop-modality"><span>{{ drop.code }}</span><small>Descartar no recebimento</small></div>
+          <form class="inline-form" method="post" action="/rules/drop/{{ drop.id }}/delete" data-confirm="Remover {{ drop.code }} da lista de descarte? Novos arquivos dessa modalidade deixarão de ser descartados." data-confirm-label="Remover modalidade">
+            <button class="action-icon action-icon--danger" type="submit" data-tooltip="Remover modalidade" aria-label="Remover {{ drop.code }} do descarte">{{ icon("trash") }}</button>
           </form>
         </div>
+        {% else %}
+        <p class="compression-drop-list__empty">Nenhuma modalidade configurada para descarte.</p>
         {% endfor %}
       </div>
-      {% else %}
-      <p class="muted small">Nenhum código configurado para descarte.</p>
-      {% endif %}
 
-      <form method="post" action="/rules/drop" class="inline-create inline-create--drop">
-        <div class="field"><label for="drop-code">Novo código</label><input id="drop-code" name="code" placeholder="Ex.: US" maxlength="8" required></div>
-        <button class="btn btn--secondary" type="submit">{{ icon("plus") }} Adicionar código</button>
-      </form>
+      <div class="compression-drop-create">
+        <h3>Adicionar ao descarte</h3>
+        <form method="post" action="/rules/drop" class="compression-drop-create__form">
+          <div class="field">
+            <label for="drop-modality">Modalidade</label>
+            <input id="drop-modality" name="code" placeholder="Ex.: US" maxlength="8" required>
+          </div>
+          <button class="btn btn--secondary" type="submit">{{ icon("plus") }} Adicionar</button>
+        </form>
+        <p>A regra curinga <strong>*</strong> não é aceita para descarte.</p>
+      </div>
     </section>
   </div>
 </div>
