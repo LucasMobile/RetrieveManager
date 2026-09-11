@@ -181,12 +181,9 @@
         signal: controller.signal,
       });
       const result = await response.json();
-      setEchoStatus(result.message || "Não foi possível concluir o teste.", result.ok ? "success" : "error");
+      setEchoStatus(result.ok ? "C-ECHO OK" : "FALHA C-ECHO", result.ok ? "success" : "error");
     } catch (error) {
-      const message = error.name === "AbortError"
-        ? "O teste excedeu o tempo limite."
-        : "Falha de comunicação ao executar o teste.";
-      setEchoStatus(message, "error");
+      setEchoStatus("FALHA C-ECHO", "error");
     } finally {
       window.clearTimeout(timeout);
       echoButton.disabled = false;

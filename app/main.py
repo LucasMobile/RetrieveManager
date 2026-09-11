@@ -641,7 +641,7 @@ async def units_test_echo(
         return_code=code,
         user_id=user.id,
     )
-    return JSONResponse({"ok": True, "message": "PACS respondeu com sucesso."})
+    return JSONResponse({"ok": True, "message": "C-ECHO OK"})
 
 
 @app.get("/units/{unit_id}", response_class=HTMLResponse)
