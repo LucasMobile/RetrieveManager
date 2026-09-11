@@ -24,8 +24,8 @@ class OrderActionsTest(unittest.TestCase):
     def _unit() -> Unit:
         return Unit(
             name="unit",
-            input_dir="/in",
-            sent_dir="/sent",
+            orders_api_url="https://integracao.example/v1/pedidos",
+            orders_api_token="integration-token",
             pacs_aet="PACS",
             pacs_ip="127.0.0.1",
             pacs_port=2104,
@@ -44,7 +44,7 @@ class OrderActionsTest(unittest.TestCase):
             db.flush()
             order = Order(
                 unit_id=unit.id,
-                filename="order.txt",
+                source_id="order-id",
                 acc="123",
                 birth_date="20000101",
                 status="done",
@@ -103,7 +103,7 @@ class OrderActionsTest(unittest.TestCase):
             db.flush()
             order = Order(
                 unit_id=unit.id,
-                filename="order.txt",
+                source_id="order-id",
                 acc="123",
                 birth_date="20000101",
                 modality="CT",

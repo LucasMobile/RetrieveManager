@@ -23,8 +23,9 @@ class ValidationTest(unittest.TestCase):
             "pacs_port": "2104",
             "calling_aet": "RETRIEVE",
             "store_port": "444",
-            "input_dir": root,
-            "sent_dir": root,
+            "orders_api_url": "https://integracao.example/v1/pedidos",
+            "orders_api_token": "integration-token",
+            "orders_api_station_id": "48",
             "receive_dir": root,
             "send_dir": root,
             "error_dir": root,
@@ -39,6 +40,7 @@ class ValidationTest(unittest.TestCase):
         result = validate_unit_form(form)
         self.assertEqual(result["pacs_port"], 2104)
         self.assertEqual(result["name"], "Hospital A")
+        self.assertEqual(result["orders_api_station_id"], "48")
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):

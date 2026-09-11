@@ -27,8 +27,8 @@ class TransferTrackingTest(unittest.TestCase):
         with self.Session() as db:
             unit = Unit(
                 name="unit",
-                input_dir="/in",
-                sent_dir="/sent",
+                orders_api_url="https://integracao.example/v1/pedidos",
+                orders_api_token="integration-token",
                 pacs_aet="PACS",
                 pacs_ip="127.0.0.1",
                 pacs_port=2104,
@@ -43,7 +43,7 @@ class TransferTrackingTest(unittest.TestCase):
             db.flush()
             order = Order(
                 unit_id=unit.id,
-                filename="order.txt",
+                source_id="order-id",
                 acc="accession",
                 birth_date="20000101",
                 correlation_id="corr-1",
@@ -90,8 +90,8 @@ class TransferTrackingTest(unittest.TestCase):
         with self.Session() as db:
             unit = Unit(
                 name="unit",
-                input_dir="/in",
-                sent_dir="/sent",
+                orders_api_url="https://integracao.example/v1/pedidos",
+                orders_api_token="integration-token",
                 pacs_aet="PACS",
                 pacs_ip="127.0.0.1",
                 pacs_port=2104,
@@ -106,7 +106,7 @@ class TransferTrackingTest(unittest.TestCase):
             db.flush()
             order = Order(
                 unit_id=unit.id,
-                filename="order.txt",
+                source_id="order-id",
                 acc="accession",
                 birth_date="20000101",
                 correlation_id="new-correlation",

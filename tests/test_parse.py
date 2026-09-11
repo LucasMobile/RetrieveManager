@@ -1,22 +1,9 @@
 import unittest
 
-from app.parse import normalize_modality, parse_findscu_output, parse_order_file
+from app.parse import normalize_modality, parse_findscu_output
 
 
-class ParseOrderTest(unittest.TestCase):
-    def test_example_file(self):
-        parsed = parse_order_file("31841656:9202604600211333:19820226:20260902:60")
-        assert parsed is not None
-        self.assertEqual(parsed.pat_id, "31841656")
-        self.assertEqual(parsed.acc, "9202604600211333")
-        self.assertEqual(parsed.birth_date, "19820226")
-        self.assertEqual(parsed.exam_date, "20260902")
-
-    def test_requires_acc_and_birth(self):
-        self.assertIsNone(parse_order_file(":acc:19820226:20260902:60"))
-        self.assertIsNone(parse_order_file("id::19820226:20260902:60"))
-        self.assertIsNone(parse_order_file("id:acc::20260902:60"))
-
+class ParseDicomOutputTest(unittest.TestCase):
     def test_normalize_last_known_wins(self):
         self.assertEqual(normalize_modality("CT\\MR"), "CT")
         self.assertEqual(normalize_modality("US"), "US")

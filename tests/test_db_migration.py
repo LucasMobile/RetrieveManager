@@ -43,6 +43,9 @@ class DatabaseMigrationTest(unittest.TestCase):
                 column["name"] for column in inspect(engine).get_columns("units")
             }
             self.assertNotIn("dest_aet", columns)
+            self.assertIn("orders_api_url", columns)
+            self.assertIn("orders_api_token", columns)
+            self.assertIn("orders_api_station_id", columns)
             with engine.connect() as connection:
                 self.assertEqual(
                     connection.scalar(text("SELECT name FROM units")),

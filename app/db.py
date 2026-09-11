@@ -102,6 +102,20 @@ def _migrate_schema() -> None:
         if "dest_aet" in unit_columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE units DROP COLUMN dest_aet"))
+        unit_columns = {
+            column["name"] for column in inspect(engine).get_columns("units")
+        }
+        unit_additions = {
+            "orders_api_url": "VARCHAR(500) NOT NULL DEFAULT ''",
+            "orders_api_token": "VARCHAR(2048) NOT NULL DEFAULT ''",
+            "orders_api_station_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+        }
+        with engine.begin() as connection:
+            for name, definition in unit_additions.items():
+                if name not in unit_columns:
+                    connection.execute(
+                        text(f"ALTER TABLE units ADD COLUMN {name} {definition}")
+                    )
     if "orders" not in table_names:
         return
     columns = {column["name"] for column in inspector.get_columns("orders")}
@@ -112,6 +126,24 @@ def _migrate_schema() -> None:
                     "ALTER TABLE orders ADD COLUMN correlation_id "
                     "VARCHAR(64) NOT NULL DEFAULT ''"
                 )
+            )
+    columns = {column["name"] for column in inspect(engine).get_columns("orders")}
+    order_additions = {
+        "source_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "api_read_status": "VARCHAR(16) NOT NULL DEFAULT 'confirmed'",
+        "api_read_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "api_read_last_error": "VARCHAR(500) NOT NULL DEFAULT ''",
+        "api_read_at": "DATETIME",
+    }
+    with engine.begin() as connection:
+        for name, definition in order_additions.items():
+            if name not in columns:
+                connection.execute(
+                    text(f"ALTER TABLE orders ADD COLUMN {name} {definition}")
+                )
+        if "source_id" not in columns and "filename" in columns:
+            connection.execute(
+                text("UPDATE orders SET source_id = filename WHERE source_id = ''")
             )
     with engine.begin() as connection:
         connection.execute(

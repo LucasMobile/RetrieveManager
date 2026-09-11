@@ -29,8 +29,9 @@
       <nav>
         <a href="#identity-title"><span>01</span><strong>Identificação</strong></a>
         <a href="#pacs-title"><span>02</span><strong>Conexão PACS</strong></a>
-        <a href="#storage-title"><span>03</span><strong>Store e pastas</strong></a>
-        <a href="#limits-title"><span>04</span><strong>Processamento</strong></a>
+        <a href="#orders-api-title"><span>03</span><strong>Pedidos PLERES</strong></a>
+        <a href="#storage-title"><span>04</span><strong>Store e pastas</strong></a>
+        <a href="#limits-title"><span>05</span><strong>Processamento</strong></a>
       </nav>
       <div class="unit-form-nav__note">
         <strong>Antes de salvar</strong>
@@ -110,9 +111,35 @@
           </div>
         </section>
 
-        <section class="form-section" aria-labelledby="storage-title">
+        <section class="form-section" aria-labelledby="orders-api-title">
           <div class="form-section__header">
             <span class="form-section__number">03</span>
+            <div><h2 id="orders-api-title">Leitura de pedidos — PLERES</h2><p>Origem usada para consultar e confirmar os pedidos da unidade.</p></div>
+          </div>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--2">
+              <div class="field field--full">
+                <label for="orders-api-url">URL da API Pedido PLERES</label>
+                <input id="orders-api-url" class="mono" name="orders_api_url" type="url" maxlength="500" value="{{ unit.orders_api_url if unit else '' }}" autocapitalize="none" spellcheck="false" required>
+                <span class="field__hint">A consulta será executada a cada 30 segundos.</span>
+              </div>
+              <div class="field">
+                <label for="orders-api-token">Token de Integração</label>
+                <input id="orders-api-token" name="orders_api_token" type="password" maxlength="2048" value="" autocomplete="off" {% if not unit %}required{% endif %}>
+                <span class="field__hint">Enviado no header “token”.{% if unit %} Deixe em branco para manter o token atual.{% endif %}</span>
+              </div>
+              <div class="field">
+                <label for="orders-api-station-id">ID Posto</label>
+                <input id="orders-api-station-id" class="mono" name="orders_api_station_id" maxlength="64" value="{{ unit.orders_api_station_id if unit else '' }}" autocomplete="off">
+                <span class="field__hint">Opcional. Quando informado, filtra localmente pelo campo idPosto.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="form-section" aria-labelledby="storage-title">
+          <div class="form-section__header">
+            <span class="form-section__number">04</span>
             <div><h2 id="storage-title">Store SCP e diretórios</h2><p>Recebimento dos arquivos DICOM e organização das etapas locais.</p></div>
           </div>
           <div class="form-section__body">
@@ -126,14 +153,6 @@
                 <label for="unit-token">Token da unidade</label>
                 <input id="unit-token" name="token" type="password" maxlength="64" value="" autocomplete="off" {% if not unit %}required{% endif %}>
                 <span class="field__hint">Tag DICOM 0008,1040.{% if unit %} Deixe em branco para manter o token atual.{% endif %}</span>
-              </div>
-              <div class="field">
-                <label for="input-dir">Pasta de pedidos</label>
-                <input id="input-dir" class="mono" name="input_dir" value="{{ unit.input_dir if unit else '' }}" spellcheck="false" required>
-              </div>
-              <div class="field">
-                <label for="sent-dir">Pedidos processados</label>
-                <input id="sent-dir" class="mono" name="sent_dir" value="{{ unit.sent_dir if unit else '' }}" spellcheck="false" required>
               </div>
               <div class="field">
                 <label for="receive-dir">Recebimento DICOM</label>
@@ -154,7 +173,7 @@
 
         <section class="form-section" aria-labelledby="limits-title">
           <div class="form-section__header">
-            <span class="form-section__number">04</span>
+            <span class="form-section__number">05</span>
             <div><h2 id="limits-title">Limites de processamento</h2><p>Timeouts, paralelismo e frequência de busca desta unidade.</p></div>
           </div>
           <div class="form-section__body">

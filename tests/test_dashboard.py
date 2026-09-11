@@ -26,8 +26,8 @@ class DashboardTest(unittest.TestCase):
         return Unit(
             name=name,
             enabled=enabled,
-            input_dir=path,
-            sent_dir=path,
+            orders_api_url="https://integracao.example/v1/pedidos",
+            orders_api_token="integration-token",
             pacs_aet="PACS",
             pacs_ip="127.0.0.1",
             pacs_port=2104,
@@ -49,21 +49,21 @@ class DashboardTest(unittest.TestCase):
                 [
                     Order(
                         unit_id=active.id,
-                        filename="watching.txt",
+                        source_id="watching",
                         acc="1",
                         birth_date="20000101",
                         status="watching",
                     ),
                     Order(
                         unit_id=active.id,
-                        filename="queue.txt",
+                        source_id="queue",
                         acc="2",
                         birth_date="20000101",
                         status="wait_retrieve",
                     ),
                     Order(
                         unit_id=active.id,
-                        filename="error.txt",
+                        source_id="error",
                         acc="3",
                         birth_date="20000101",
                         status="error",

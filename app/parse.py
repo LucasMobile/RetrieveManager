@@ -1,31 +1,4 @@
-from dataclasses import dataclass
-
 from app.config import KNOWN_MODALITIES
-
-
-@dataclass
-class OrderFile:
-    pat_id: str
-    acc: str
-    birth_date: str
-    exam_date: str
-
-
-def parse_order_file(text: str) -> OrderFile | None:
-    """pat_id:acc:nasc:date_exam:tempo — acc e nasc obrigatórios."""
-    line = (text or "").strip().splitlines()
-    if not line:
-        return None
-    parts = line[0].strip().split(":")
-    if len(parts) < 4:
-        return None
-    pat_id = parts[0].strip()
-    acc = parts[1].strip()
-    birth_date = parts[2].strip()
-    exam_date = parts[3].strip()
-    if not pat_id or not acc or not birth_date:
-        return None
-    return OrderFile(pat_id, acc, birth_date, exam_date)
 
 
 def normalize_modality(

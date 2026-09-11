@@ -6,12 +6,14 @@ Cada hospital vira uma **unidade** cadastrada na tela. A lista começa vazia.
 
 ## O que ele faz
 
-1. Lê o arquivo de pedido `pat_id:acc:nasc:date_exam:tempo`
-2. C-FIND no PACS (Accession + data de nascimento)
-3. Espera 15 min (CT/MR) ou 10 min (resto) e faz C-MOVE
-4. CT/MR têm um 2º C-MOVE ~90 min depois
-5. Sobe `storescp` na porta/AET da unidade
-6. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para `https://idr.mobilemed.com.br/api/router/send-image`
+1. Consulta a API Pedido PLERES de cada unidade a cada 30 segundos
+2. Filtra pedidos ainda não lidos e, quando configurado, pelo ID Posto
+3. Grava cada pedido na fila local e confirma `mirthReaded=true` na API
+4. Faz C-FIND no PACS (Accession + data de nascimento)
+5. Espera 15 min (CT/MR) ou 10 min (resto) e faz C-MOVE
+6. CT/MR têm um 2º C-MOVE ~90 min depois
+7. Sobe `storescp` na porta/AET da unidade
+8. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para `https://idr.mobilemed.com.br/api/router/send-image`
 
 `storescp` do host antigo, `compacta_retrieve.py` e `envio_ret.py` **não precisam mais rodar**. Compacta/envio da nuvem que já existiam fora deste fluxo continuam independentes só se você quiser — este programa cobre a cadeia de retrieve.
 
@@ -157,13 +159,23 @@ Sem os binários DCMTK no PATH o worker registra erro no pedido e a tela continu
 
 Campos principais:
 
-- Pastas de pedidos, sent, recebimento, envio e erro
+- API Pedido PLERES: URL e Token de Integração obrigatórios, ID Posto opcional
+- Pastas de recebimento DICOM, envio e erro
 - PACS: AET, IP, porta
 - Calling AET e Dest AET
 - Porta do storescp (única no servidor)
 - Token (identificação na nuvem)
 
 Depois de salvar, cadastre o Dest AET + porta **no PACS**.
+
+O worker envia o Token de Integração no header `token`. O GET deve retornar um
+array JSON e os campos `patientId`, `accessionNumber`, `patientBirthdate` e
+`examDate` são obrigatórios. As datas PLERES no formato
+`MM/DD/YYYY HH:MM:SS` são convertidas para `YYYYMMDD` antes do C-FIND.
+
+Pedidos com `mirthReaded=true` são ignorados. O `PUT` de confirmação só ocorre
+depois do commit no banco local; se falhar, fica pendente e é repetido sem criar
+outro pedido para o mesmo accession.
 
 ## Regras padrão (editáveis na tela)
 

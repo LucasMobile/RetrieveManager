@@ -52,10 +52,9 @@
         <div class="metric"><strong class="metric__value">{{ u.counts.running }}</strong><span class="metric__label">Em processo</span><small>Retrieve ou envio</small></div>
         <div class="metric"><strong class="metric__value">{{ u.counts.error }}</strong><span class="metric__label">Erros em 24h</span><small>{% if u.counts.error %}Requer atenção{% else %}Sem ocorrências{% endif %}</small></div>
       </div>
-      <aside class="unit-card__pipeline" aria-label="Arquivos por pasta">
-        <div class="unit-card__pipeline-title"><strong>Arquivos por etapa</strong><span>Pastas</span></div>
+      <aside class="unit-card__pipeline" aria-label="Arquivos DICOM por pasta">
+        <div class="unit-card__pipeline-title"><strong>Arquivos DICOM por etapa</strong><span>Pastas</span></div>
         <div class="unit-card__folders">
-          <span class="folder-count">Pedidos <strong>{{ u.folders.input }}</strong></span>
           <span class="folder-count">Recebimento <strong>{{ u.folders.receive }}</strong></span>
           <span class="folder-count">Envio <strong>{{ u.folders.send }}</strong></span>
           <span class="folder-count">Erro <strong>{{ u.folders.error }}</strong></span>

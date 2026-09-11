@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
@@ -22,6 +22,7 @@ from app.config import (
     FIND_BATCH_SIZE,
     HTTP_CONNECT_TIMEOUT_SECONDS,
     HTTP_TOTAL_TIMEOUT_SECONDS,
+    ORDERS_API_POLL_SECONDS,
     SEND_BATCH_SIZE,
     SEND_RETRY_BASE_SECONDS,
     SEND_RETRY_MAX_SECONDS,
@@ -36,7 +37,14 @@ from app.dicom_tools import (
 from app.events import add_event
 from app.models import CompressRule, ImageTransfer, Order, Unit
 from app.observability import log_context, log_event, new_correlation_id
-from app.parse import parse_findscu_output, parse_order_file
+from app.orders_api import (
+    InvalidApiOrder,
+    OrdersApiError,
+    acknowledge_orders,
+    fetch_orders,
+    parse_api_order,
+)
+from app.parse import parse_findscu_output
 from app.rules import drop_codes, get_settings, schedule_from_now
 
 log = logging.getLogger("worker")
@@ -69,6 +77,7 @@ class CircuitState:
 
 
 _cloud_circuits: dict[str, CircuitState] = {}
+_last_orders_api_poll: dict[int, float] = {}
 
 
 def _ensure_order_correlation(order: Order) -> str:
@@ -110,102 +119,190 @@ def recover_stale_locks(db: Session) -> None:
 
 
 def ingest_unit(db: Session, unit: Unit) -> int:
-    folder = Path(unit.input_dir)
-    if not folder.is_dir():
+    now = monotonic()
+    last_poll = _last_orders_api_poll.get(unit.id)
+    if last_poll is not None and now - last_poll < ORDERS_API_POLL_SECONDS:
         return 0
+    _last_orders_api_poll[unit.id] = now
+
+    if not unit.orders_api_url or not unit.orders_api_token:
+        log_event(
+            log,
+            logging.WARNING,
+            "orders.api.configuration",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error_type="MissingConfiguration",
+            unit_id=unit.id,
+        )
+        return 0
+
+    payload: list[dict] = []
+    try:
+        payload = asyncio.run(fetch_orders(unit.orders_api_url, unit.orders_api_token))
+        log_event(
+            log,
+            logging.INFO,
+            "orders.api.get",
+            resource=f"unit:{unit.id}",
+            status="success",
+            unit_id=unit.id,
+            record_count=len(payload),
+        )
+    except OrdersApiError as exc:
+        log_event(
+            log,
+            logging.ERROR,
+            "orders.api.get",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error=exc,
+            unit_id=unit.id,
+        )
+
     created = 0
-    for path in folder.iterdir():
-        try:
-            if (
-                not path.is_file()
-                or path.name.startswith(".")
-                or path.stat().st_size == 0
-            ):
-                continue
-            if path.stat().st_size > 4096:
-                _quarantine_order_file(path, unit, "OrderFileTooLarge")
-                continue
-        except OSError as exc:
+    seen: set[str] = set()
+    station_id = (unit.orders_api_station_id or "").strip()
+    for item in payload:
+        if not isinstance(item, dict):
             log_event(
                 log,
-                logging.ERROR,
-                "order.file.inspect",
+                logging.WARNING,
+                "order.api.ingest",
                 resource=f"unit:{unit.id}",
-                status="failure",
-                error=exc,
+                status="rejected",
+                error_type="InvalidApiOrder",
                 unit_id=unit.id,
             )
             continue
+        if item.get("mirthReaded") is True:
+            continue
+        if station_id and str(item.get("idPosto") or "").strip() != station_id:
+            continue
+        try:
+            parsed = parse_api_order(item)
+        except InvalidApiOrder as exc:
+            log_event(
+                log,
+                logging.WARNING,
+                "order.api.ingest",
+                resource=f"unit:{unit.id}",
+                status="rejected",
+                error=exc,
+                error_type="InvalidApiOrder",
+                unit_id=unit.id,
+            )
+            continue
+        if parsed.accession_number in seen:
+            continue
+        seen.add(parsed.accession_number)
+
         exists = db.scalar(
-            select(Order).where(Order.unit_id == unit.id, Order.filename == path.name)
+            select(Order).where(
+                Order.unit_id == unit.id,
+                Order.acc == parsed.accession_number,
+            )
         )
         if exists:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            log_event(
-                log,
-                logging.ERROR,
-                "order.file.read",
-                resource=f"unit:{unit.id}",
-                status="failure",
-                error=exc,
-                unit_id=unit.id,
-            )
-            continue
-        parsed = parse_order_file(text)
-        if parsed is None:
-            _quarantine_order_file(path, unit, "InvalidOrderFile")
+            # A API ainda informou mirthReaded != true; torne o ACK idempotente.
+            exists.api_read_status = "pending"
+            exists.api_read_last_error = ""
             continue
         correlation_id = new_correlation_id()
         order = Order(
             unit_id=unit.id,
-            filename=path.name,
-            pat_id=parsed.pat_id,
-            acc=parsed.acc,
-            birth_date=parsed.birth_date,
+            source_id=parsed.source_id,
+            filename=parsed.accession_number,
+            pat_id=parsed.patient_id,
+            acc=parsed.accession_number,
+            birth_date=parsed.patient_birthdate,
             exam_date=parsed.exam_date,
             status="watching",
             correlation_id=correlation_id,
+            api_read_status="pending",
         )
         db.add(order)
         db.flush()
-        add_event(db, order, f"Pedido lido: acc={parsed.acc} nasc={parsed.birth_date}")
+        add_event(
+            db,
+            order,
+            f"Pedido recebido da API PLERES: acc={parsed.accession_number}",
+        )
         with log_context(correlation_id):
             log_event(
                 log,
                 logging.INFO,
-                "order.ingest",
+                "order.api.ingest",
                 resource=f"order:{order.id}",
                 status="success",
                 order_id=order.id,
                 unit_id=unit.id,
             )
         created += 1
-    if created:
+    if created or seen:
         db.commit()
+    _acknowledge_pending_orders(db, unit)
     return created
 
 
-def _quarantine_order_file(path: Path, unit: Unit, error_type: str) -> None:
-    destination_dir = Path(unit.error_dir) / "orders"
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / path.name
-    if destination.exists():
-        destination = destination.with_name(
-            f"{destination.name}.rejected-{new_correlation_id()}"
+def _acknowledge_pending_orders(db: Session, unit: Unit) -> None:
+    pending = list(
+        db.scalars(
+            select(Order)
+            .where(
+                Order.unit_id == unit.id,
+                Order.api_read_status == "pending",
+            )
+            .order_by(Order.id)
+            .limit(250)
         )
-    shutil.move(str(path), str(destination))
-    log_event(
-        log,
-        logging.WARNING,
-        "order.ingest",
-        resource=f"unit:{unit.id}",
-        status="rejected",
-        error_type=error_type,
-        unit_id=unit.id,
     )
+    if not pending:
+        return
+    by_accession = {order.acc: order for order in pending}
+    results = asyncio.run(
+        acknowledge_orders(
+            unit.orders_api_url,
+            unit.orders_api_token,
+            list(by_accession),
+        )
+    )
+    for result in results:
+        order = by_accession[result.accession_number]
+        order.api_read_attempts += 1
+        if result.success:
+            order.api_read_status = "confirmed"
+            order.api_read_last_error = ""
+            order.api_read_at = datetime.now()
+            add_event(db, order, "Pedido confirmado como lido na API PLERES")
+            level = logging.INFO
+            status = "success"
+        else:
+            order.api_read_status = "pending"
+            order.api_read_last_error = result.error[:500]
+            if order.api_read_attempts == 1:
+                add_event(
+                    db,
+                    order,
+                    "Falha ao confirmar leitura na API PLERES; "
+                    "nova tentativa será feita",
+                    level="warn",
+                )
+            level = logging.WARNING
+            status = "retry"
+        with log_context(_ensure_order_correlation(order)):
+            log_event(
+                log,
+                level,
+                "orders.api.ack",
+                resource=f"order:{order.id}",
+                status=status,
+                order_id=order.id,
+                unit_id=unit.id,
+                attempt=order.api_read_attempts,
+                error_type="OrdersApiError" if not result.success else None,
+            )
+    db.commit()
 
 
 def find_pending(db: Session, unit: Unit) -> None:
@@ -312,7 +409,6 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             f"1º retrieve em {retrieve_at:%H:%M}",
             safe_output,
         )
-        _move_to_sent(unit, order.filename)
         db.commit()
         log_event(
             log,
@@ -486,15 +582,6 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
             retrieve_number=2 if second else 1,
             command_status=code,
         )
-
-
-def _move_to_sent(unit: Unit, filename: str) -> None:
-    src = Path(unit.input_dir) / filename
-    dest_dir = Path(unit.sent_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / filename
-    if src.exists():
-        shutil.move(str(src), str(dest))
 
 
 def compact_unit(db: Session, unit: Unit) -> None:
@@ -891,7 +978,6 @@ def folder_counts(unit: Unit) -> dict[str, int]:
             return 0
 
     return {
-        "input": count(unit.input_dir),
         "receive": count(unit.receive_dir),
         "send": count(unit.send_dir),
         "error": count(unit.error_dir),

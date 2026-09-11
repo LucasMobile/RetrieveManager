@@ -7,7 +7,7 @@
     <div class="page-header__copy">
       <p class="eyebrow">Cadastro</p>
       <h1>Unidades</h1>
-      <p class="page-header__description">Gerencie as conexões PACS, portas de recebimento e diretórios de cada unidade.</p>
+      <p class="page-header__description">Gerencie a API de pedidos, as conexões PACS e o recebimento de cada unidade.</p>
     </div>
     <div class="page-header__actions">
       <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
@@ -57,7 +57,7 @@
             <th scope="col">Estado</th>
             <th scope="col">Conexão PACS</th>
             <th scope="col">Store SCP</th>
-            <th scope="col">Diretório de pedidos</th>
+            <th scope="col">Pedidos PLERES</th>
             <th scope="col">Ações</th>
           </tr>
         </thead>
@@ -85,8 +85,8 @@
               </span>
             </td>
             <td>
-              <span class="table-primary mono units-table__path">{{ u.input_dir }}</span>
-              <span class="table-secondary">{% if u.enabled %}Monitoramento de entrada{% else %}Monitoramento suspenso{% endif %}</span>
+              <span class="table-primary mono units-table__path">{{ u.orders_api_url }}</span>
+              <span class="table-secondary">{% if u.orders_api_station_id %}ID Posto {{ u.orders_api_station_id }}{% else %}Todos os postos liberados pelo token{% endif %}</span>
             </td>
             <td>
               <div class="table-actions units-table__actions">

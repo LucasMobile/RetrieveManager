@@ -80,8 +80,9 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
             maximum=65535,
             default=444,
         ),
-        "input_dir": validate_data_path(form.get("input_dir", ""), "Pasta de pedidos"),
-        "sent_dir": validate_data_path(form.get("sent_dir", ""), "Pasta sent"),
+        "orders_api_url": validate_orders_api_url(form.get("orders_api_url", "")),
+        "orders_api_token": form.get("orders_api_token", "").strip(),
+        "orders_api_station_id": form.get("orders_api_station_id", "").strip(),
         "receive_dir": validate_data_path(
             form.get("receive_dir", ""), "Pasta de recebimento"
         ),
@@ -131,6 +132,22 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
             default=16,
         ),
     }
+
+
+def validate_orders_api_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    if not 1 <= len(url) <= 500:
+        raise ValueError("URL da API Pedido PLERES deve ter entre 1 e 500 caracteres")
+    parsed = urlparse(url)
+    allowed_schemes = {"https"} if IS_PRODUCTION else {"http", "https"}
+    if parsed.scheme not in allowed_schemes or not parsed.hostname:
+        scheme = "HTTPS" if IS_PRODUCTION else "HTTP ou HTTPS"
+        raise ValueError(f"URL da API Pedido PLERES inválida; use {scheme}")
+    if parsed.username or parsed.password:
+        raise ValueError("URL da API Pedido PLERES não pode conter credenciais")
+    if parsed.query or parsed.fragment:
+        raise ValueError("URL da API Pedido PLERES não deve conter query ou fragmento")
+    return url
 
 
 def validate_pacs_connection(form: dict[str, str]) -> dict[str, str | int]:

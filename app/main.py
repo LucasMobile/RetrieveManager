@@ -534,8 +534,13 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
     obj.pacs_port = int(form["pacs_port"])
     obj.calling_aet = str(form["calling_aet"])
     obj.store_port = int(form["store_port"])
-    obj.input_dir = str(form["input_dir"])
-    obj.sent_dir = str(form["sent_dir"])
+    obj.orders_api_url = str(form["orders_api_url"])
+    orders_api_token = str(form.get("orders_api_token") or "")
+    if orders_api_token:
+        obj.orders_api_token = orders_api_token
+    elif unit is None:
+        obj.orders_api_token = ""
+    obj.orders_api_station_id = str(form.get("orders_api_station_id") or "")
     obj.receive_dir = str(form["receive_dir"])
     obj.send_dir = str(form["send_dir"])
     obj.error_dir = str(form["error_dir"])
@@ -578,6 +583,15 @@ async def units_create(
         return RedirectResponse("/units/new", status_code=303)
     if len(str(form["token"])) > 64:
         flash(request, "Token da unidade excede 64 caracteres.", "err")
+        return RedirectResponse("/units/new", status_code=303)
+    if not form.get("orders_api_token"):
+        flash(request, "Token de Integração é obrigatório.", "err")
+        return RedirectResponse("/units/new", status_code=303)
+    if len(str(form["orders_api_token"])) > 2048:
+        flash(request, "Token de Integração excede 2048 caracteres.", "err")
+        return RedirectResponse("/units/new", status_code=303)
+    if len(str(form.get("orders_api_station_id") or "")) > 64:
+        flash(request, "ID Posto excede 64 caracteres.", "err")
         return RedirectResponse("/units/new", status_code=303)
     unit = _unit_from_form(form, None)
     db.add(unit)
@@ -697,6 +711,12 @@ async def units_update(
         return RedirectResponse(f"/units/{unit_id}", status_code=303)
     if len(str(form.get("token") or "")) > 64:
         flash(request, "Token da unidade excede 64 caracteres.", "err")
+        return RedirectResponse(f"/units/{unit_id}", status_code=303)
+    if len(str(form.get("orders_api_token") or "")) > 2048:
+        flash(request, "Token de Integração excede 2048 caracteres.", "err")
+        return RedirectResponse(f"/units/{unit_id}", status_code=303)
+    if len(str(form.get("orders_api_station_id") or "")) > 64:
+        flash(request, "ID Posto excede 64 caracteres.", "err")
         return RedirectResponse(f"/units/{unit_id}", status_code=303)
     if _port_taken(db, int(form["store_port"]), unit_id):
         flash(request, "Essa porta de store já está em uso.", "err")
@@ -1081,7 +1101,9 @@ def orders_list(
         like = f"%{q.strip()}%"
         filt = filt.where(
             or_(
-                Order.acc.like(like), Order.pat_id.like(like), Order.filename.like(like)
+                Order.acc.like(like),
+                Order.pat_id.like(like),
+                Order.source_id.like(like),
             )
         )
     total = db.scalar(select(func.count()).select_from(filt.subquery())) or 0
@@ -1262,22 +1284,6 @@ def order_cancel(
     )
 
 
-def _archive_order_request(order: Order, unit: Unit) -> None:
-    source = Path(unit.input_dir) / Path(order.filename).name
-    if not source.is_file():
-        return
-    destination_dir = Path(unit.sent_dir)
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / source.name
-    if source.resolve() == destination.resolve():
-        return
-    if destination.exists():
-        destination = destination.with_name(
-            f"{destination.stem}.deleted-{order.id}{destination.suffix}"
-        )
-    shutil.move(str(source), str(destination))
-
-
 def _delete_order_record(db: Session, order: Order) -> None:
     db.execute(
         update(ImageTransfer)
@@ -1302,27 +1308,9 @@ def order_delete(
     if order.status in ACTIVE_ORDER_STATUSES:
         flash(request, "Aguarde o processamento atual terminar para excluir.", "err")
         return RedirectResponse("/orders", status_code=303)
-    unit = db.get(Unit, order.unit_id)
-    try:
-        if unit is not None:
-            _archive_order_request(order, unit)
-        unit_id = order.unit_id
-        _delete_order_record(db, order)
-        db.commit()
-    except OSError as exc:
-        db.rollback()
-        log_event(
-            log,
-            logging.ERROR,
-            "order.delete",
-            resource=f"order:{order_id}",
-            status="failure",
-            error=exc,
-            order_id=order_id,
-            user_id=user.id,
-        )
-        flash(request, "Não foi possível arquivar o pedido antes da exclusão.", "err")
-        return RedirectResponse("/orders", status_code=303)
+    unit_id = order.unit_id
+    _delete_order_record(db, order)
+    db.commit()
     log_event(
         log,
         logging.INFO,

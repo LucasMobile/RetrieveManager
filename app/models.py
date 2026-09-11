@@ -41,8 +41,14 @@ class Unit(Base):
     name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    input_dir: Mapped[str] = mapped_column(String(500), nullable=False)
-    sent_dir: Mapped[str] = mapped_column(String(500), nullable=False)
+    orders_api_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    orders_api_token: Mapped[str] = mapped_column(String(2048), nullable=False)
+    orders_api_station_id: Mapped[str] = mapped_column(String(64), default="")
+
+    # Mantidos apenas para que bancos SQLite de desenvolvimento já criados
+    # possam iniciar; não participam mais do cadastro nem do processamento.
+    input_dir: Mapped[str] = mapped_column(String(500), default="")
+    sent_dir: Mapped[str] = mapped_column(String(500), default="")
 
     pacs_aet: Mapped[str] = mapped_column(String(64), nullable=False)
     pacs_ip: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -102,7 +108,7 @@ class DropModality(Base):
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
-        UniqueConstraint("unit_id", "filename", name="uq_order_unit_filename"),
+        UniqueConstraint("unit_id", "acc", name="uq_order_unit_accession"),
         Index("ix_orders_unit_status_retrieve", "unit_id", "status", "retrieve_at"),
         Index("ix_orders_unit_status_find", "unit_id", "status", "last_find_at"),
         Index(
@@ -115,12 +121,18 @@ class Order(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
-    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), default="")
+    # Compatibilidade física com o SQLite de desenvolvimento anterior.
+    filename: Mapped[str] = mapped_column(String(255), default="")
     pat_id: Mapped[str] = mapped_column(String(64), default="")
     acc: Mapped[str] = mapped_column(String(64), nullable=False)
     birth_date: Mapped[str] = mapped_column(String(16), nullable=False)
     exam_date: Mapped[str] = mapped_column(String(16), default="")
     correlation_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    api_read_status: Mapped[str] = mapped_column(String(16), default="pending")
+    api_read_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    api_read_last_error: Mapped[str] = mapped_column(String(500), default="")
+    api_read_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
     status: Mapped[str] = mapped_column(String(32), default="watching", index=True)
     study_uid: Mapped[str] = mapped_column(String(128), default="")

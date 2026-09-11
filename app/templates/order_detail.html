@@ -12,7 +12,7 @@
         <h1>Pedido {{ order.acc }}</h1>
         <span class="status-badge {{ badge }}">{{ status_label }}</span>
       </div>
-      <p class="page-header__description mono">Arquivo {{ order.filename }}</p>
+      <p class="page-header__description mono">Origem API{% if order.source_id %} · {{ order.source_id }}{% endif %}</p>
     </div>
     <div class="page-header__actions">
       {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') %}
@@ -46,6 +46,8 @@
           <div><dt>Correlation ID</dt><dd class="mono">{{ order.correlation_id }}</dd></div>
           <div><dt>Patient ID</dt><dd>{{ order.pat_id or 'Não informado' }}</dd></div>
           <div><dt>Accession</dt><dd class="mono">{{ order.acc }}</dd></div>
+          <div><dt>ID na API</dt><dd class="mono">{{ order.source_id or 'Não informado' }}</dd></div>
+          <div><dt>Leitura PLERES</dt><dd>{% if order.api_read_status == 'confirmed' %}Confirmada{% else %}Confirmação pendente{% endif %}{% if order.api_read_attempts %} · {{ order.api_read_attempts }} tentativa{% if order.api_read_attempts != 1 %}s{% endif %}{% endif %}</dd></div>
           <div><dt>Nascimento</dt><dd>{{ order.birth_date or 'Não informado' }}</dd></div>
           <div><dt>Data do exame</dt><dd>{{ order.exam_date or 'Não informado' }}</dd></div>
           <div><dt>Modalidade</dt><dd><span class="modality-mark">{{ order.modality or '—' }}</span></dd></div>
