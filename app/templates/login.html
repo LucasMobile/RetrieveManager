@@ -6,32 +6,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#102d3c">
   <title>Entrar · Retrieve Manager</title>
-  <link rel="stylesheet" href="/static/app.css?v=4">
-  <script src="/static/app.js?v=4" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=16">
+  <script src="/static/app.js?v=8" defer></script>
 </head>
 <body class="login-page">
 <a class="skip-link" href="#login-form">Pular para o formulário</a>
 <main class="login-shell">
-  <section class="login-context" aria-label="Sobre o sistema">
-    <div class="brand">
-      <span class="brand__mark">{{ icon("activity") }}</span>
-      <span class="brand__copy">
-        <strong>Retrieve Manager</strong>
-        <span>Operação de imagens</span>
-      </span>
-    </div>
-    <div class="login-context__copy">
-      <h1>Fluxos PACS sob controle.</h1>
-      <p>Acompanhe recebimento, processamento e envio de imagens em uma única operação.</p>
-    </div>
-    <span class="login-context__status">Acesso restrito a usuários autorizados</span>
-  </section>
+  <div class="login-visual" aria-hidden="true">
+    <img src="/static/login-background.webp?v=1" alt="" width="2500" height="3125">
+  </div>
 
-  <section class="login-main">
+  <section class="login-main" aria-labelledby="login-title">
     <div class="login-panel">
-      <p class="login-panel__eyebrow">Área administrativa</p>
-      <h2>Entrar</h2>
-      <p class="login-panel__description">Use suas credenciais para acessar a operação.</p>
+      <h1 class="visually-hidden" id="login-title">Acessar o Retrieve Manager</h1>
+      <img class="login-panel__logo" src="/static/mobilemed-login.png?v=1" alt="Mobilemed" width="384" height="161">
 
       {% if error %}
       <div class="login-alert" role="alert">
@@ -48,11 +36,16 @@
           <label for="password">Senha</label>
           <div class="field__control">
             <input id="password" name="password" type="password" autocomplete="current-password" required>
-            <button class="field__action" type="button" data-password-toggle="password" aria-pressed="false">Mostrar</button>
+            <button class="field__action field__action--icon" type="button" data-password-toggle="password" data-password-label="senha" aria-label="Mostrar senha" title="Mostrar senha" aria-pressed="false">
+              <span data-password-show>{{ icon("eye") }}</span>
+              <span data-password-hide hidden>{{ icon("eye-off") }}</span>
+            </button>
           </div>
         </div>
         <button class="btn btn--primary" type="submit">Entrar</button>
       </form>
+
+      <p class="login-panel__status"><span aria-hidden="true"></span>Acesso restrito a usuários autorizados</p>
     </div>
   </section>
 </main>
