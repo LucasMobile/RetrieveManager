@@ -37,9 +37,11 @@
       </header>
 
       {% for rule in compress %}
-      <form id="compression-rule-{{ rule.id }}" method="post" action="/rules/compress/{{ rule.id }}"></form>
+      <form id="compression-rule-{{ rule.id }}" method="post" action="/rules/compress/{{ rule.id }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"></form>
       {% if rule.modality != '*' %}
-      <form id="compression-delete-{{ rule.id }}" method="post" action="/rules/compress/{{ rule.id }}/delete" data-confirm="Excluir a regra de compactação de {{ rule.modality }}? A modalidade passará a utilizar a regra padrão." data-confirm-label="Excluir regra"></form>
+      <form id="compression-delete-{{ rule.id }}" method="post" action="/rules/compress/{{ rule.id }}/delete" data-confirm="Excluir a regra de compactação de {{ rule.modality }}? A modalidade passará a utilizar a regra padrão." data-confirm-label="Excluir regra">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"></form>
       {% endif %}
       {% endfor %}
 
@@ -99,6 +101,7 @@
       <div class="compression-create">
         <h3>Adicionar perfil</h3>
         <form method="post" action="/rules/compress" class="compression-create__form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
           <div class="field">
             <label for="compression-new-modality">Modalidade</label>
             <input id="compression-new-modality" name="modality" placeholder="Ex.: XA" maxlength="8" required>
@@ -138,6 +141,7 @@
         <div class="compression-drop-row">
           <div class="compression-drop-modality"><span>{{ drop.code }}</span><small>Descartar no recebimento</small></div>
           <form class="inline-form" method="post" action="/rules/drop/{{ drop.id }}/delete" data-confirm="Remover {{ drop.code }} da lista de descarte? Novos arquivos dessa modalidade deixarão de ser descartados." data-confirm-label="Remover modalidade">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
             <button class="action-icon action-icon--danger" type="submit" data-tooltip="Remover modalidade" aria-label="Remover {{ drop.code }} do descarte">{{ icon("trash") }}</button>
           </form>
         </div>
@@ -149,6 +153,7 @@
       <div class="compression-drop-create">
         <h3>Adicionar ao descarte</h3>
         <form method="post" action="/rules/drop" class="compression-drop-create__form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
           <div class="field">
             <label for="drop-modality">Modalidade</label>
             <input id="drop-modality" name="code" placeholder="Ex.: US" maxlength="8" required>

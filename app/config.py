@@ -64,9 +64,37 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 SECRET_KEY = _read_secret("SECRET_KEY", "dev-secret-change-me")
 ADMIN_USER = os.getenv("RETRIEVE_ADMIN_USER", "admin").strip()
 ADMIN_PASSWORD = _read_secret("RETRIEVE_ADMIN_PASSWORD", "admin")
-SESSION_HTTPS_ONLY = _env_bool("SESSION_HTTPS_ONLY", False)
+ALLOW_HTTP_FOR_TESTS = _env_bool("ALLOW_HTTP_FOR_TESTS", False)
+SESSION_HTTPS_ONLY = _env_bool(
+    "SESSION_HTTPS_ONLY", IS_PRODUCTION and not ALLOW_HTTP_FOR_TESTS
+)
+PUBLIC_ORIGIN = os.getenv("PUBLIC_ORIGIN", "").strip().rstrip("/")
+if PUBLIC_ORIGIN:
+    parsed_origin = urlparse(PUBLIC_ORIGIN)
+    if (
+        parsed_origin.scheme not in {"http", "https"}
+        or not parsed_origin.hostname
+        or parsed_origin.username
+        or parsed_origin.password
+        or parsed_origin.path
+        or parsed_origin.query
+        or parsed_origin.fragment
+    ):
+        raise RuntimeError("PUBLIC_ORIGIN deve conter somente esquema, host e porta")
+    try:
+        _public_port = parsed_origin.port
+        if _public_port == 0:
+            raise ValueError("port zero")
+    except ValueError as exc:
+        raise RuntimeError("PUBLIC_ORIGIN contém uma porta inválida") from exc
 
 if IS_PRODUCTION:
+    if not ALLOW_HTTP_FOR_TESTS and not SESSION_HTTPS_ONLY:
+        raise RuntimeError("SESSION_HTTPS_ONLY deve ser true em produção")
+    if not ALLOW_HTTP_FOR_TESTS and (
+        not PUBLIC_ORIGIN or urlparse(PUBLIC_ORIGIN).scheme != "https"
+    ):
+        raise RuntimeError("PUBLIC_ORIGIN deve ser uma origem HTTPS em produção")
     if len(SECRET_KEY) < 32 or SECRET_KEY == "dev-secret-change-me":
         raise RuntimeError("SECRET_KEY deve ter pelo menos 32 caracteres em produção")
     admin_password_bytes = len(ADMIN_PASSWORD.encode("utf-8"))

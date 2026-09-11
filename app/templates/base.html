@@ -9,7 +9,7 @@
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>{% block title %}Retrieve Manager{% endblock %}</title>
   <link rel="stylesheet" href="/static/app.css?v=18">
-  <script src="/static/app.js?v=8" defer></script>
+  <script src="/static/app.js?v=9" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Pular para o conteúdo</a>
@@ -58,6 +58,7 @@
         <span>Administrador</span>
       </div>
       <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="icon-button icon-button--inverse" type="submit" aria-label="Sair da conta" title="Sair">
           {{ icon("log-out") }}
         </button>

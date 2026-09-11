@@ -69,6 +69,7 @@
         <a class="btn btn--quiet btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
         <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
         <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
           <button class="btn btn--secondary btn--sm" type="submit">{{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}</button>
         </form>
       </div>

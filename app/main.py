@@ -7,10 +7,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Form, Request
+from fastapi import Depends, FastAPI, Form, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -26,7 +26,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.config import BASE_DIR, SECRET_KEY, SESSION_HTTPS_ONLY
 from app.db import get_db, init_db
 from app.dicom_tools import ToolMissing, c_echo
-from app.middleware import request_middleware
+from app.middleware import apply_security_headers, request_middleware
 from app.models import (
     STATUSES,
     CompressRule,
@@ -45,9 +45,11 @@ from app.pipeline import folder_counts
 from app.rules import get_settings, schedule_from_now
 from app.security import (
     clear_login_failures,
+    csrf_token,
     hash_password,
     login_allowed,
     record_login_failure,
+    verify_csrf,
     verify_password,
 )
 from app.validation import (
@@ -74,7 +76,9 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Retrieve Manager", lifespan=lifespan)
+app = FastAPI(
+    title="Retrieve Manager", lifespan=lifespan, dependencies=[Depends(verify_csrf)]
+)
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -88,6 +92,7 @@ app.mount(
     "/static", StaticFiles(directory=str(BASE_DIR / "app" / "static")), name="static"
 )
 templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
+templates.env.globals["csrf_token"] = csrf_token
 
 
 def _flash(request: Request) -> dict | None:
@@ -200,16 +205,25 @@ async def _request_validation_error(request: Request, exc: RequestValidationErro
             "Um ou mais campos não puderam ser validados. "
             "Revise os valores e tente novamente."
         ),
-        action_href=request.headers.get("referer") or request.url.path,
-        action_label="Revisar formulário",
+        action_href={
+            "/settings/password": "/settings",
+            "/settings": "/settings",
+            "/rules/retrieve": "/rules/retrieve",
+            "/rules/compress": "/rules/compress",
+            "/rules/drop": "/rules/compress",
+            "/login": "/login",
+        }.get(request.url.path, "/"),
+        action_label="Voltar",
     )
 
 
 @app.exception_handler(Exception)
 async def _unexpected_error(request: Request, _exc: Exception):
     if not _wants_html(request):
-        return JSONResponse({"detail": "erro interno"}, status_code=500)
-    return _error_page(
+        return apply_security_headers(
+            request, JSONResponse({"detail": "erro interno"}, status_code=500)
+        )
+    response = _error_page(
         request,
         status_code=500,
         title="Algo não saiu como esperado",
@@ -220,6 +234,7 @@ async def _unexpected_error(request: Request, _exc: Exception):
         action_href=request.url.path,
         action_label="Tentar novamente",
     )
+    return apply_security_headers(request, response)
 
 
 def ctx(request: Request, db: Session, nav: str, **extra: Any) -> dict:
@@ -311,7 +326,9 @@ def login(
             status_code=401,
         )
     clear_login_failures(client_id)
+    request.session.clear()
     request.session["user_id"] = user.id
+    csrf_token(request)
     log_event(
         log,
         logging.INFO,
@@ -781,7 +798,7 @@ def rules_retrieve_add(
     request: Request,
     modality: str = Form(...),
     wait_minutes: int = Form(..., ge=0, le=1440),
-    second_retrieve: str = Form("0"),
+    second_retrieve: Literal["0", "1"] = Form("0"),
     second_wait_minutes: int = Form(90, ge=0, le=2880),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
@@ -814,7 +831,7 @@ def rules_retrieve_update(
     request: Request,
     modality: str = Form(...),
     wait_minutes: int = Form(..., ge=0, le=1440),
-    second_retrieve: str = Form("0"),
+    second_retrieve: Literal["0", "1"] = Form("0"),
     second_wait_minutes: int = Form(90, ge=0, le=2880),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
@@ -1047,12 +1064,14 @@ def rules_drop_delete(
 def orders_list(
     request: Request,
     unit_id: int | None = None,
-    status: str = "",
-    q: str = "",
+    status: str = Query("", max_length=32),
+    q: str = Query("", max_length=200),
     page: int = 1,
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
+    if status and status not in STATUSES:
+        raise StarletteHTTPException(422, "Status inválido")
     filt = select(Order)
     if unit_id:
         filt = filt.where(Order.unit_id == unit_id)
@@ -1344,9 +1363,9 @@ def settings_page(
 @app.post("/settings")
 def settings_save(
     request: Request,
-    cloud_url: str = Form(...),
+    cloud_url: str = Form(..., min_length=1, max_length=500),
     drop_study_prefix: str = Form("SLRX"),
-    file_settle_seconds: int = Form(3),
+    file_settle_seconds: int = Form(3, ge=0, le=3600),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
@@ -1362,7 +1381,7 @@ def settings_save(
         return RedirectResponse("/settings", status_code=303)
     settings.cloud_url = safe_cloud_url
     settings.drop_study_prefix = prefix
-    settings.file_settle_seconds = max(0, min(file_settle_seconds, 3600))
+    settings.file_settle_seconds = file_settle_seconds
     db.commit()
     flash(request, "Configuração da nuvem salva.")
     return RedirectResponse("/settings", status_code=303)

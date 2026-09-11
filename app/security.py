@@ -1,8 +1,10 @@
+import secrets
 from collections import defaultdict, deque
 from threading import Lock
 from time import monotonic
 
 import bcrypt
+from fastapi import HTTPException, Request
 
 _LOGIN_WINDOW_SECONDS = 300
 _LOGIN_MAX_FAILURES = 10
@@ -38,3 +40,26 @@ def record_login_failure(client_id: str) -> None:
 def clear_login_failures(client_id: str) -> None:
     with _login_lock:
         _login_failures.pop(client_id, None)
+
+
+def csrf_token(request: Request) -> str:
+    token = request.session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return token
+
+
+async def verify_csrf(request: Request) -> None:
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    expected = request.session.get("csrf_token")
+    supplied = request.headers.get("x-csrf-token")
+    if supplied is None:
+        supplied = (await request.form()).get("csrf_token")
+    if (
+        not isinstance(expected, str)
+        or not isinstance(supplied, str)
+        or not secrets.compare_digest(expected.encode(), supplied.encode())
+    ):
+        raise HTTPException(403, "Token CSRF inválido; recarregue a página.")

@@ -33,7 +33,8 @@
     </div>
 
     {% for r in rules %}
-    <form id="retrieve-rule-{{ r.id }}" method="post" action="/rules/retrieve/{{ r.id }}"></form>
+    <form id="retrieve-rule-{{ r.id }}" method="post" action="/rules/retrieve/{{ r.id }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"></form>
     {% endfor %}
 
     <div class="table-wrap">
@@ -75,6 +76,7 @@
                 <button class="action-icon" type="submit" form="retrieve-rule-{{ r.id }}" data-tooltip="Salvar regra" aria-label="Salvar regra de {{ r.modality }}">{{ icon("save") }}</button>
                 {% if r.modality != '*' %}
                 <form class="inline-form" method="post" action="/rules/retrieve/{{ r.id }}/delete" data-confirm="Excluir a regra de {{ r.modality }}? A modalidade passará a utilizar a regra padrão." data-confirm-label="Excluir regra">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
                   <button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir regra" aria-label="Excluir regra de {{ r.modality }}">{{ icon("trash") }}</button>
                 </form>
                 {% else %}
@@ -96,6 +98,7 @@
       <span class="status-badge status-badge--active">Nova regra</span>
     </div>
     <form method="post" action="/rules/retrieve" class="retrieve-new-form" data-second-rule>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <div class="field"><label for="new-modality">Modalidade</label><input id="new-modality" name="modality" placeholder="Ex.: XA" maxlength="8" required><span class="field__hint">Código DICOM.</span></div>
       <div class="field"><label for="new-wait">1º Retrieve</label><div class="retrieve-time-input"><input id="new-wait" name="wait_minutes" type="number" min="0" max="1440" value="10" required><span>min</span></div></div>
       <div class="field">

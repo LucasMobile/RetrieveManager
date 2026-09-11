@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import RequestResponseEndpoint
 
+from app.config import PUBLIC_ORIGIN
 from app.observability import log_context, log_event, new_correlation_id
 
 log = logging.getLogger("web.request")
@@ -30,8 +31,24 @@ def _same_origin(request: Request) -> bool:
     source = request.headers.get("origin") or request.headers.get("referer")
     if not source:
         return True  # Non-browser clients do not always send either header.
-    source_url = urlparse(source)
-    return source_url.netloc.lower() == request.headers.get("host", "").lower()
+    target = PUBLIC_ORIGIN or str(request.base_url)
+    try:
+
+        def origin(value: str) -> tuple[str, str | None, int]:
+            parsed = urlparse(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("invalid origin")
+            if parsed.username or parsed.password:
+                raise ValueError("credentials in origin")
+            return (
+                parsed.scheme,
+                parsed.hostname.lower(),
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+            )
+
+        return origin(source) == origin(target)
+    except ValueError:
+        return False
 
 
 async def request_middleware(
@@ -84,25 +101,25 @@ async def request_middleware(
             http_method=request.method,
             http_status=response.status_code,
         )
-        response.headers["X-Request-ID"] = correlation_id
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=()"
+        return apply_security_headers(request, response)
+
+
+def apply_security_headers(request: Request, response: Response) -> Response:
+    response.headers["X-Request-ID"] = getattr(request.state, "correlation_id", "")
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if not request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    if request.url.scheme == "https" or PUBLIC_ORIGIN.startswith("https://"):
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
         )
-        if not resource.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-store"
-        if (
-            request.url.scheme == "https"
-            or request.headers.get("x-forwarded-proto", "").lower() == "https"
-        ):
-            response.headers["Strict-Transport-Security"] = (
-                "max-age=31536000; includeSubDomains"
-            )
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; style-src 'self'; script-src 'self'; "
-            "img-src 'self' data:; "
-            "connect-src 'self'; frame-ancestors 'none'; form-action 'self'"
-        )
-        return response
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self'; script-src 'self'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; frame-ancestors 'none'; form-action 'self'; "
+        "base-uri 'none'; object-src 'none'"
+    )
+    return response

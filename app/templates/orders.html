@@ -39,7 +39,7 @@
       </div>
       <div class="field orders-filter__search">
         <label for="filter-query">Pedido ou paciente</label>
-        <div class="input-with-icon">{{ icon("search") }}<input id="filter-query" name="q" value="{{ q }}" placeholder="Accession, Patient ID ou arquivo"></div>
+        <div class="input-with-icon">{{ icon("search") }}<input id="filter-query" name="q" maxlength="200" value="{{ q }}" placeholder="Accession, Patient ID ou arquivo"></div>
       </div>
       <div class="filter-actions">
         <button class="btn btn--primary" type="submit">{{ icon("search") }} Filtrar</button>
@@ -87,8 +87,10 @@
               <div class="table-actions order-actions">
                 <a class="action-icon" href="/orders/{{ o.id }}" data-tooltip="Visualizar" title="Visualizar" aria-label="Visualizar pedido">{{ icon("eye") }}</a>
                 {% if o.status not in ('retrieving', 'retrieving_second', 'receiving') %}
-                <form class="inline-form" method="post" action="/orders/{{ o.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido"><button class="action-icon" type="submit" data-tooltip="Reprocessar" title="Reprocessar" aria-label="Reprocessar pedido">{{ icon("retry") }}</button></form>
-                <form class="inline-form" method="post" action="/orders/{{ o.id }}/delete" data-confirm="Excluir este pedido? O histórico será removido, mas os arquivos clínicos serão preservados." data-confirm-label="Excluir pedido"><button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir" title="Excluir" aria-label="Excluir pedido">{{ icon("trash") }}</button></form>
+                <form class="inline-form" method="post" action="/orders/{{ o.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon" type="submit" data-tooltip="Reprocessar" title="Reprocessar" aria-label="Reprocessar pedido">{{ icon("retry") }}</button></form>
+                <form class="inline-form" method="post" action="/orders/{{ o.id }}/delete" data-confirm="Excluir este pedido? O histórico será removido, mas os arquivos clínicos serão preservados." data-confirm-label="Excluir pedido">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir" title="Excluir" aria-label="Excluir pedido">{{ icon("trash") }}</button></form>
                 {% else %}
                 <span class="action-icon is-disabled" data-tooltip="Reprocessar indisponível durante o processamento" aria-label="Reprocessar indisponível">{{ icon("retry") }}</span>
                 <span class="action-icon is-disabled" data-tooltip="Excluir indisponível durante o processamento" aria-label="Excluir indisponível">{{ icon("trash") }}</span>

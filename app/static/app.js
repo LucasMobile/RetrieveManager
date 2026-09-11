@@ -48,6 +48,16 @@
     });
   });
 
+  const newPassword = document.querySelector("#new-password");
+  const validatePassword = () => {
+    const bytes = new TextEncoder().encode(newPassword.value).length;
+    newPassword.setCustomValidity(
+      bytes >= 12 && bytes <= 72 ? "" : "A senha deve ter entre 12 e 72 bytes.",
+    );
+  };
+  newPassword?.addEventListener("input", validatePassword);
+  newPassword?.addEventListener("change", validatePassword);
+
   const markSubmitting = (form) => {
     if (form.dataset.submitting === "true") return;
     form.dataset.submitting = "true";
@@ -184,7 +194,10 @@
       const response = await fetch(echoPanel.dataset.url, {
         method: "POST",
         body: payload,
-        headers: { Accept: "application/json" },
+        headers: {
+          Accept: "application/json",
+          "X-CSRF-Token": unitForm.elements.namedItem("csrf_token").value,
+        },
         signal: controller.signal,
       });
       const result = await response.json();

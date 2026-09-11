@@ -92,9 +92,11 @@
               <div class="table-actions units-table__actions">
                 <a class="action-icon" href="/units/{{ u.id }}" data-tooltip="Editar unidade" aria-label="Editar unidade">{{ icon("edit") }}</a>
                 <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
                   <button class="action-icon" type="submit" data-tooltip="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}" aria-label="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}">{{ icon("pause" if u.enabled else "play") }}</button>
                 </form>
                 <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Excluir a unidade {{ u.name }}? Todos os pedidos e eventos do histórico também serão removidos. Esta ação não pode ser desfeita." data-confirm-label="Excluir unidade">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
                   <button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir unidade" aria-label="Excluir unidade">{{ icon("trash") }}</button>
                 </form>
               </div>

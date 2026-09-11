@@ -49,6 +49,7 @@
       </header>
 
       <form method="post" action="/settings">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="settings-card__body">
           <div class="settings-form-group">
             <div class="settings-form-group__heading">
@@ -108,6 +109,7 @@
       </header>
 
       <form method="post" action="/settings/password">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="settings-card__body">
           <div class="form-stack">
             <div class="field">
@@ -123,7 +125,7 @@
             <div class="field">
               <label for="new-password">Nova senha</label>
               <div class="field__control">
-                <input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" aria-describedby="new-password-hint" required>
+                <input id="new-password" name="new_password" type="password" autocomplete="new-password" aria-describedby="new-password-hint" required>
                 <button class="field__action field__action--icon" type="button" data-password-toggle="new-password" data-password-label="nova senha" aria-label="Mostrar nova senha" title="Mostrar senha" aria-pressed="false">
                   <span data-password-show>{{ icon("eye") }}</span>
                   <span data-password-hide hidden>{{ icon("eye-off") }}</span>

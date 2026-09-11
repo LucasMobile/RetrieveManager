@@ -17,14 +17,17 @@
     <div class="page-header__actions">
       {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="btn btn--primary" type="submit">{{ icon("retry") }} Reprocessar</button>
       </form>
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/delete" data-confirm="Excluir este pedido? O histórico será removido, mas os arquivos clínicos serão preservados." data-confirm-label="Excluir pedido">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="btn btn--danger" type="submit">{{ icon("trash") }} Excluir</button>
       </form>
       {% endif %}
       {% if order.status not in ('done', 'cancelled') %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/cancel" data-confirm="Cancelar este pedido? O processamento atual será interrompido." data-confirm-label="Cancelar pedido">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="btn btn--secondary" type="submit">Cancelar</button>
       </form>
       {% endif %}

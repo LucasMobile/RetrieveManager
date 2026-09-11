@@ -67,6 +67,8 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
     name = form.get("name", "").strip()
     if not 1 <= len(name) <= 120:
         raise ValueError("Nome da unidade deve ter entre 1 e 120 caracteres")
+    if form.get("enabled", "1") not in {"0", "1"}:
+        raise ValueError("Estado da unidade inválido")
     return {
         "name": name,
         "enabled": form.get("enabled", "1") == "1",
@@ -149,6 +151,8 @@ def validate_pacs_connection(form: dict[str, str]) -> dict[str, str | int]:
 
 def validate_cloud_url(value: str) -> str:
     url = value.strip()
+    if not 1 <= len(url) <= 500:
+        raise ValueError("URL da nuvem deve ter entre 1 e 500 caracteres")
     parsed = urlparse(url)
     allowed_schemes = {"https"} if IS_PRODUCTION else {"http", "https"}
     if parsed.scheme not in allowed_schemes or not parsed.hostname:

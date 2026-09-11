@@ -9,7 +9,7 @@
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>Entrar · Retrieve Manager</title>
   <link rel="stylesheet" href="/static/app.css?v=18">
-  <script src="/static/app.js?v=8" defer></script>
+  <script src="/static/app.js?v=9" defer></script>
 </head>
 <body class="login-page">
 <a class="skip-link" href="#login-form">Pular para o formulário</a>
@@ -30,9 +30,10 @@
       {% endif %}
 
       <form class="form-stack" id="login-form" method="post" action="/login">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="field">
           <label for="username">Usuário</label>
-          <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+          <input id="username" name="username" maxlength="80" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
         </div>
         <div class="field">
           <label for="password">Senha</label>

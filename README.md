@@ -51,7 +51,10 @@ O aviso `buildx isn't installed` é só aviso; `COMPOSE_BAKE=false` desliga o Ba
 
 Se o `apt` e o `pip` também não saírem à internet, o build ainda trava no próximo passo. Aí o DCMTK pode ir em `vendor/dcmtk-3.7.0-linux-x86_64.tar.bz2` (ver `vendor/README.md`); o Python e os pacotes pip precisam da imagem/base já carregada.
 
-Abra `http://SERVIDOR:8080`
+Configure um proxy reverso HTTPS para o serviço web na porta 8080 e defina
+`PUBLIC_ORIGIN=https://seu-dominio` no `.env`. Preserve o header `Host` no proxy.
+Abra a URL HTTPS configurada; a porta 8080 deve ficar acessível apenas ao proxy.
+Para testes sem domínio, use a configuração HTTP por IP descrita abaixo.
 
 Login inicial (se o banco estiver vazio):
 
@@ -83,9 +86,35 @@ somente leitura e capabilities removidas. A tradução Docker de 444 para 10444
 evita conceder privilégio de bind ao worker. Em bind mounts, ajuste previamente o
 proprietário ou ACL de `/mobilemed` e `/opt/idr`.
 
-Se o painel estiver atrás de HTTPS, configure `SESSION_HTTPS_ONLY=true`. Em
-acesso HTTP direto mantenha `false`, caso contrário o navegador não enviará o
-cookie de sessão.
+Por padrão em produção, `SESSION_HTTPS_ONLY=true` e `PUBLIC_ORIGIN` com HTTPS são
+obrigatórios; configurações inseguras impedem a inicialização. Para desenvolvimento
+HTTP local, use `APP_ENV=development`, `SESSION_HTTPS_ONLY=false` e remova
+`PUBLIC_ORIGIN` ou configure a origem local exata.
+
+### Testes via HTTP pelo IP da máquina
+
+No `.env`, configure:
+
+```dotenv
+ALLOW_HTTP_FOR_TESTS=true
+SESSION_HTTPS_ONLY=false
+PUBLIC_ORIGIN=
+```
+
+Recrie os serviços com `docker compose up -d --build` e abra
+`http://IP-DA-MAQUINA:8080` (ou a porta definida em `APP_PORT`). A opção funciona
+também no Docker Compose com `APP_ENV=production`. Com `PUBLIC_ORIGIN` vazio,
+a validação compara a origem da requisição com o IP e a porta usados no acesso.
+Se preferir fixar um endereço, use `PUBLIC_ORIGIN=http://192.168.1.100:8080`,
+substituindo pelo IP real. CSRF, validações e exigência de senhas fortes continuam
+ativos. HTTP transmite a sessão sem criptografia; use essa opção no ambiente de testes.
+
+Ao habilitar HTTPS, volte para `ALLOW_HTTP_FOR_TESTS=false`,
+`SESSION_HTTPS_ONLY=true` e configure `PUBLIC_ORIGIN=https://seu-dominio`.
+
+Todos os POSTs exigem token CSRF da sessão, enviado no campo `csrf_token` ou
+no header `X-CSRF-Token`. Clientes devem obter o formulário primeiro e preservar
+o cookie de sessão. Recarregue formulários abertos antes desta atualização.
 
 Saúde e logs:
 
@@ -109,6 +138,17 @@ Worker (outro terminal):
 
 ```powershell
 .\.venv\Scripts\python -m app.worker
+```
+
+Testes (incluindo sessões, CSRF e headers HTTP, com banco isolado):
+
+```powershell
+.\.venv\Scripts\pip install -r requirements-dev.txt
+$env:APP_ENV = "development"
+$env:SESSION_HTTPS_ONLY = "false"
+$env:PUBLIC_ORIGIN = ""
+$env:DATABASE_URL = "sqlite:///:memory:"
+.\.venv\Scripts\python -m unittest discover -s tests -q
 ```
 
 Sem os binários DCMTK no PATH o worker registra erro no pedido e a tela continua utilizável para cadastro. Em produção use o Docker, que já traz o DCMTK 3.7.0.
