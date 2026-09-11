@@ -157,6 +157,7 @@ def ingest_unit(db: Session, unit: Unit) -> int:
             resource=f"unit:{unit.id}",
             status="failure",
             error=exc,
+            error_detail=str(exc),
             unit_id=unit.id,
         )
 
@@ -301,6 +302,7 @@ def _acknowledge_pending_orders(db: Session, unit: Unit) -> None:
                 unit_id=unit.id,
                 attempt=order.api_read_attempts,
                 error_type="OrdersApiError" if not result.success else None,
+                error_detail=result.error if not result.success else None,
             )
     db.commit()
 

@@ -1,3 +1,4 @@
+import logging
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -5,7 +6,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.models import Base, Order, Unit
-from app.orders_api import AckResult, InvalidApiOrder, parse_api_order
+from app.orders_api import AckResult, InvalidApiOrder, OrdersApiError, parse_api_order
 from app.pipeline import _last_orders_api_poll, ingest_unit
 
 
@@ -153,6 +154,32 @@ class OrdersApiIngestionTest(unittest.TestCase):
             self.assertEqual(db.scalar(select(Order)).api_read_status, "confirmed")
             self.assertEqual(db.scalar(select(Order)).api_read_attempts, 2)
             self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+
+    def test_get_failure_logs_the_safe_error_detail(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.commit()
+            with (
+                patch(
+                    "app.pipeline.fetch_orders",
+                    new=AsyncMock(side_effect=OrdersApiError("HTTP 401")),
+                ),
+                patch(
+                    "app.pipeline.acknowledge_orders",
+                    new=AsyncMock(return_value=[]),
+                ),
+                patch("app.pipeline.log_event") as logged,
+            ):
+                self.assertEqual(ingest_unit(db, unit), 0)
+
+            failure = next(
+                call
+                for call in logged.call_args_list
+                if call.args[:3]
+                == (logging.getLogger("worker"), logging.ERROR, "orders.api.get")
+            )
+            self.assertEqual(failure.kwargs["error_detail"], "HTTP 401")
 
 
 if __name__ == "__main__":
