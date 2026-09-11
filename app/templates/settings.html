@@ -2,66 +2,143 @@
 {% from "icons.html" import icon %}
 {% block title %}Nuvem e acesso · Retrieve Manager{% endblock %}
 {% block body %}
-<div class="page-stack">
+<div class="page-stack settings-page">
   <header class="page-header">
     <div class="page-header__copy">
       <p class="eyebrow">Configurações</p>
       <h1>Nuvem e acesso</h1>
-      <p class="page-header__description">Defina o destino dos arquivos e mantenha a credencial administrativa atualizada.</p>
+      <p class="page-header__description">Gerencie o destino dos arquivos, os parâmetros de envio e a credencial administrativa.</p>
     </div>
   </header>
 
-  <div class="section-grid section-grid--2">
-    <section class="card" aria-labelledby="cloud-settings-title">
-      <div class="card__header">
-        <div><h2 id="cloud-settings-title">Envio para a nuvem</h2><p>A mesma URL atende todas as unidades; o token DICOM identifica a origem.</p></div>
-        <span class="card__icon">{{ icon("cloud") }}</span>
-      </div>
-      <form class="form-stack" method="post" action="/settings">
-        <div class="field">
-          <label for="cloud-url">URL de destino</label>
-          <input id="cloud-url" name="cloud_url" type="url" maxlength="500" value="{{ settings.cloud_url }}" placeholder="https://api.exemplo.com/imagens" spellcheck="false" required>
-          <span class="field__hint">Endpoint que recebe os arquivos por POST.</span>
+  <section class="card card--flush settings-summary" aria-label="Resumo das configurações">
+    <div class="settings-summary__item">
+      <span class="settings-summary__icon">{{ icon("cloud") }}</span>
+      <span class="settings-summary__copy">
+        <strong class="settings-summary__host" title="{{ settings_summary.cloud_host }}">{{ settings_summary.cloud_host }}</strong>
+        <span>destino atual da integração</span>
+      </span>
+    </div>
+    <div class="settings-summary__item">
+      <span class="settings-summary__icon">{{ icon("x-circle") }}</span>
+      <span class="settings-summary__copy">
+        <strong>{{ settings_summary.drop_prefix }}</strong>
+        <span>prefixo de Study ID para descarte</span>
+      </span>
+    </div>
+    <div class="settings-summary__item">
+      <span class="settings-summary__icon">{{ icon("clock") }}</span>
+      <span class="settings-summary__copy">
+        <strong>{{ settings_summary.settle_seconds }} s</strong>
+        <span>espera antes do processamento</span>
+      </span>
+    </div>
+  </section>
+
+  <div class="settings-layout">
+    <section class="surface settings-card settings-card--cloud" aria-labelledby="cloud-settings-title">
+      <header class="settings-card__header">
+        <div class="settings-card__heading">
+          <span class="settings-card__icon">{{ icon("cloud") }}</span>
+          <div>
+            <h2 id="cloud-settings-title">Envio para a nuvem</h2>
+            <p>Defina o endpoint compartilhado e os parâmetros usados antes de cada envio.</p>
+          </div>
         </div>
-        <div class="field">
-          <label for="drop-prefix">Prefixo de Study ID para descarte</label>
-          <input id="drop-prefix" name="drop_study_prefix" maxlength="32" value="{{ settings.drop_study_prefix }}" placeholder="Ex.: SLRX">
+        <span class="status-badge status-badge--success">Integração configurada</span>
+      </header>
+
+      <form method="post" action="/settings">
+        <div class="settings-card__body">
+          <div class="settings-form-group">
+            <div class="settings-form-group__heading">
+              <h3>Destino da integração</h3>
+              <p>A mesma URL atende todas as unidades; o token DICOM identifica a origem.</p>
+            </div>
+            <div class="field">
+              <label for="cloud-url">URL de destino</label>
+              <input id="cloud-url" name="cloud_url" type="url" maxlength="500" value="{{ settings.cloud_url }}" placeholder="https://api.exemplo.com/imagens" spellcheck="false" autocomplete="url" aria-describedby="cloud-url-hint" required>
+              <span class="field__hint" id="cloud-url-hint">Endpoint HTTPS que recebe os arquivos por POST.</span>
+            </div>
+          </div>
+
+          <div class="settings-form-group">
+            <div class="settings-form-group__heading">
+              <h3>Preparação dos arquivos</h3>
+              <p>Controle o descarte por Study ID e o intervalo de segurança antes da compactação.</p>
+            </div>
+            <div class="settings-fields-grid">
+              <div class="field">
+                <label for="drop-prefix">Prefixo de Study ID para descarte</label>
+                <input id="drop-prefix" name="drop_study_prefix" maxlength="32" value="{{ settings.drop_study_prefix }}" placeholder="Ex.: SLRX" spellcheck="false" aria-describedby="drop-prefix-hint">
+                <span class="field__hint" id="drop-prefix-hint">Pedidos com esse prefixo não são enviados.</span>
+              </div>
+              <div class="field">
+                <label for="settle-seconds">Espera antes de compactar e enviar</label>
+                <div class="settings-unit-input">
+                  <input id="settle-seconds" name="file_settle_seconds" type="number" min="0" max="3600" value="{{ settings.file_settle_seconds }}" aria-describedby="settle-seconds-hint">
+                  <span aria-hidden="true">s</span>
+                </div>
+                <span class="field__hint" id="settle-seconds-hint">Garante que a gravação do arquivo terminou.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-note">
+            {{ icon("info") }}
+            <span>As alterações serão aplicadas aos próximos arquivos processados pelo worker.</span>
+          </div>
         </div>
-        <div class="field">
-          <label for="settle-seconds">Espera antes de compactar e enviar</label>
-          <input id="settle-seconds" name="file_settle_seconds" type="number" min="0" max="3600" value="{{ settings.file_settle_seconds }}">
-          <span class="field__hint">Tempo em segundos para garantir que a gravação do arquivo terminou.</span>
-        </div>
-        <div class="button-group">
-          <button class="btn btn--primary" type="submit">Salvar envio</button>
-        </div>
+        <footer class="settings-card__footer">
+          <span>Revise o endpoint antes de salvar.</span>
+          <button class="btn btn--primary" type="submit">{{ icon("save") }} Salvar configurações</button>
+        </footer>
       </form>
     </section>
 
-    <section class="card" aria-labelledby="password-title">
-      <div class="card__header">
-        <div><h2 id="password-title">Senha administrativa</h2><p>Atualize a senha usada para acessar este painel.</p></div>
-        <span class="card__icon">{{ icon("lock") }}</span>
-      </div>
-      <form class="form-stack" method="post" action="/settings/password">
-        <div class="field">
-          <label for="current-password">Senha atual</label>
-          <div class="field__control">
-            <input id="current-password" name="current" type="password" autocomplete="current-password" required>
-            <button class="field__action" type="button" data-password-toggle="current-password" aria-pressed="false">Mostrar</button>
+    <section class="surface settings-card settings-card--access" aria-labelledby="password-title">
+      <header class="settings-card__header settings-card__header--stacked">
+        <div class="settings-card__heading">
+          <span class="settings-card__icon">{{ icon("lock") }}</span>
+          <div>
+            <h2 id="password-title">Senha administrativa</h2>
+            <p>Atualize a credencial usada para acessar este painel.</p>
           </div>
         </div>
-        <div class="field">
-          <label for="new-password">Nova senha</label>
-          <div class="field__control">
-            <input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" required>
-            <button class="field__action" type="button" data-password-toggle="new-password" aria-pressed="false">Mostrar</button>
+        <span class="status-badge status-badge--active">Acesso protegido</span>
+      </header>
+
+      <form method="post" action="/settings/password">
+        <div class="settings-card__body">
+          <div class="form-stack">
+            <div class="field">
+              <label for="current-password">Senha atual</label>
+              <div class="field__control">
+                <input id="current-password" name="current" type="password" autocomplete="current-password" required>
+                <button class="field__action" type="button" data-password-toggle="current-password" aria-pressed="false">Mostrar</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="new-password">Nova senha</label>
+              <div class="field__control">
+                <input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" aria-describedby="new-password-hint" required>
+                <button class="field__action" type="button" data-password-toggle="new-password" aria-pressed="false">Mostrar</button>
+              </div>
+              <span class="field__hint" id="new-password-hint">Use entre 12 e 72 bytes.</span>
+            </div>
           </div>
-          <span class="field__hint">Use entre 12 e 72 bytes.</span>
+
+          <div class="settings-security-note">
+            {{ icon("lock") }}
+            <div>
+              <strong>Credencial protegida</strong>
+              <span>As senhas não são exibidas nem registradas nos logs da aplicação.</span>
+            </div>
+          </div>
         </div>
-        <div class="button-group">
-          <button class="btn btn--secondary" type="submit">Atualizar senha</button>
-        </div>
+        <footer class="settings-card__footer settings-card__footer--access">
+          <button class="btn btn--secondary" type="submit">{{ icon("key") }} Atualizar senha</button>
+        </footer>
       </form>
     </section>
   </div>

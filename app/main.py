@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Form, Request
 from fastapi.encoders import jsonable_encoder
@@ -1322,10 +1323,21 @@ def settings_page(
     request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
 ):
     settings = get_settings(db)
+    settings_summary = {
+        "cloud_host": urlparse(settings.cloud_url).hostname or "Não configurado",
+        "drop_prefix": settings.drop_study_prefix or "—",
+        "settle_seconds": settings.file_settle_seconds,
+    }
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
-        context=ctx(request, db, "settings", settings=settings),
+        context=ctx(
+            request,
+            db,
+            "settings",
+            settings=settings,
+            settings_summary=settings_summary,
+        ),
     )
 
 
