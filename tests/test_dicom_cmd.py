@@ -7,6 +7,7 @@ from app.dicom_tools import (
     echoscu_cmd,
     findscu_cmd,
     movescu_cmd,
+    prior_movescu_cmd,
     redact_dicom_output,
     storescp_cmd,
 )
@@ -31,6 +32,7 @@ class DicomCmdTest(unittest.TestCase):
         self.assertIn("srvpacsFIR", cmd)
         self.assertIn("0008,0050=9202604600211333", cmd)
         self.assertIn("0010,0030=19820226", cmd)
+        self.assertIn("0018,0015=", cmd)
         self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
         self.assertNotIn("--bind", cmd)
 
@@ -68,6 +70,27 @@ class DicomCmdTest(unittest.TestCase):
         self.assertIn("mob", cmd)
         self.assertIn("-aec", cmd)
         self.assertIn("srvpacsFIR", cmd)
+
+    def test_prior_move_uses_series_filters(self):
+        cmd = prior_movescu_cmd(
+            "/opt/dcmtk/bin/movescu",
+            "mob",
+            "srvpacsFIR",
+            "10.20.0.31",
+            2104,
+            "ABDOMEN",
+            "MR",
+            "30211738",
+            "19691027",
+            "20230911-20260910",
+        )
+        self.assertIn("0008,0052=SERIES", cmd)
+        self.assertIn("0018,0015=ABDOMEN", cmd)
+        self.assertIn("0008,0060=MR", cmd)
+        self.assertIn("0010,0020=30211738*", cmd)
+        self.assertIn("0010,0030=19691027", cmd)
+        self.assertIn("0008,0020=20230911-20260910", cmd)
+        self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
 
     def test_storescp_and_jpeg_unchanged(self):
         scp = storescp_cmd("/opt/dcmtk/bin/storescp", "mob", 444, "/data/in")

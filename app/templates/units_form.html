@@ -30,8 +30,9 @@
         <a href="#identity-title"><span>01</span><strong>Identificação</strong></a>
         <a href="#pacs-title"><span>02</span><strong>Conexão PACS</strong></a>
         <a href="#orders-api-title"><span>03</span><strong>Pedidos PLERES</strong></a>
-        <a href="#storage-title"><span>04</span><strong>Store e pastas</strong></a>
-        <a href="#limits-title"><span>05</span><strong>Processamento</strong></a>
+        <a href="#prior-title"><span>04</span><strong>Exames anteriores</strong></a>
+        <a href="#storage-title"><span>05</span><strong>Store e pastas</strong></a>
+        <a href="#limits-title"><span>06</span><strong>Processamento</strong></a>
       </nav>
       <div class="unit-form-nav__note">
         <strong>Antes de salvar</strong>
@@ -137,9 +138,30 @@
           </div>
         </section>
 
-        <section class="form-section" aria-labelledby="storage-title">
+        <section class="form-section" aria-labelledby="prior-title">
           <div class="form-section__header">
             <span class="form-section__number">04</span>
+            <div><h2 id="prior-title">Exames anteriores</h2><p>Retrieve imediato do histórico de três anos do paciente.</p></div>
+          </div>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--2">
+              <div class="field">
+                <label for="retrieve-prior-enabled">Retrieve de exames anteriores</label>
+                <label><input id="retrieve-prior-enabled" name="retrieve_prior_enabled" type="checkbox" value="1" {% if unit and unit.retrieve_prior_enabled %}checked{% endif %}> Ativar histórico do paciente</label>
+                <span class="field__hint">Quando ativo, entra imediatamente na mesma fila dos C-MOVEs atuais.</span>
+              </div>
+              <div class="field">
+                <label for="move-timeout-prior">Timeout do retrieve histórico</label>
+                <input id="move-timeout-prior" name="move_timeout_prior" type="number" min="60" max="14400" value="{{ unit.move_timeout_prior if unit else 1800 }}">
+                <span class="field__hint">Em segundos. O padrão de 1800 equivale a 30 minutos.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="form-section" aria-labelledby="storage-title">
+          <div class="form-section__header">
+            <span class="form-section__number">05</span>
             <div><h2 id="storage-title">Store SCP e diretórios</h2><p>Recebimento dos arquivos DICOM e organização das etapas locais.</p></div>
           </div>
           <div class="form-section__body">
@@ -173,7 +195,7 @@
 
         <section class="form-section" aria-labelledby="limits-title">
           <div class="form-section__header">
-            <span class="form-section__number">05</span>
+            <span class="form-section__number">06</span>
             <div><h2 id="limits-title">Limites de processamento</h2><p>Timeouts, paralelismo e frequência de busca desta unidade.</p></div>
           </div>
           <div class="form-section__body">

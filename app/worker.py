@@ -32,10 +32,10 @@ def _stop(*_args) -> None:
     stop_event.set()
 
 
-def _move_job(order_id: int, second: bool) -> None:
+def _move_job(order_id: int, kind: str) -> None:
     with SessionLocal() as db:
         try:
-            run_claimed_move(db, order_id, second)
+            run_claimed_move(db, order_id, kind)
         except Exception as exc:
             log_event(
                 log,
@@ -105,8 +105,8 @@ def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
                 continue
             ingest_unit(db, unit)
             find_pending(db, unit)
-            for order_id, second in claim_due_moves(db, unit):
-                pool.submit(_move_job, order_id, second)
+            for order_id, kind in claim_due_moves(db, unit):
+                pool.submit(_move_job, order_id, kind)
             compact_unit(db, unit)
             send_unit(db, unit, settings.cloud_url, settings.file_settle_seconds)
 

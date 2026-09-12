@@ -16,12 +16,13 @@ def normalize_modality(
     return raw.replace("\\", " ").split()[0]
 
 
-def parse_findscu_output(output: str) -> tuple[str, str, str]:
-    """Retorna (study_uid, modalities_in_study, patient_name)."""
+def parse_findscu_output(output: str) -> tuple[str, str, str, str]:
+    """Return study UID, modalities, patient name and Body Part Examined."""
     study_uid = _first_bracket(output, "StudyInstanceUID")
     modalities = _first_bracket(output, "ModalitiesInStudy")
     name = _first_bracket(output, "PatientName")
-    return study_uid, modalities, name
+    body_part = _first_bracket(output, "BodyPartExamined")
+    return study_uid, modalities, name, body_part
 
 
 def _first_bracket(text: str, tag_name: str) -> str:

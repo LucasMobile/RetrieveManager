@@ -31,6 +31,8 @@ from app.models import (
     STATUSES,
     CompressRule,
     DropModality,
+    HistoricalImageLink,
+    HistoricalStudy,
     ImageTransfer,
     ModalityRule,
     Order,
@@ -65,6 +67,15 @@ EVENTS_PAGE = 10
 UNITS_PAGE = 20
 DASH_PAGE = 8
 ACTIVE_ORDER_STATUSES = frozenset({"retrieving", "retrieving_second", "receiving"})
+ACTIVE_PRIOR_STATUSES = frozenset({"queued", "retry_wait", "retrieving"})
+PRIOR_STATUS_LABELS = {
+    "disabled": "Desativado",
+    "queued": "Na fila",
+    "retrieving": "Em andamento",
+    "retry_wait": "Aguardando nova tentativa",
+    "done": "Concluído",
+    "error": "Erro",
+}
 log = logging.getLogger("web")
 
 configure_logging()
@@ -382,19 +393,32 @@ def _dashboard_units(
                 func.sum(case((Order.status == "watching", 1), else_=0)),
                 func.sum(
                     case(
-                        (Order.status.in_(("wait_retrieve", "wait_second")), 1), else_=0
-                    )
-                ),
-                func.sum(
-                    case(
-                        (Order.status.in_(("retrieving", "retrieving_second")), 1),
+                        (
+                            Order.status.in_(("wait_retrieve", "wait_second"))
+                            | Order.prior_status.in_(("queued", "retry_wait")),
+                            1,
+                        ),
                         else_=0,
                     )
                 ),
                 func.sum(
                     case(
                         (
-                            (Order.status == "error") & (Order.updated_at >= day),
+                            Order.status.in_(("retrieving", "retrieving_second"))
+                            | (Order.prior_status == "retrieving"),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            (
+                                (Order.status == "error")
+                                | (Order.prior_status == "error")
+                            )
+                            & (Order.updated_at >= day),
                             1,
                         ),
                         else_=0,
@@ -412,33 +436,52 @@ def _dashboard_units(
                 int(row[4] or 0),
             )
     day = datetime.now() - timedelta(hours=24)
-    active_statuses = (
-        "watching",
-        "wait_retrieve",
-        "wait_second",
-        "retrieving",
-        "retrieving_second",
-    )
-    status_counts = dict(
-        db.execute(
-            select(Order.status, func.count())
-            .where(
-                Order.status.in_(active_statuses)
-                | ((Order.status == "error") & (Order.updated_at >= day))
-            )
-            .group_by(Order.status)
-        ).all()
-    )
+    summary_counts = db.execute(
+        select(
+            func.sum(case((Order.status == "watching", 1), else_=0)),
+            func.sum(
+                case(
+                    (
+                        Order.status.in_(("wait_retrieve", "wait_second"))
+                        | Order.prior_status.in_(("queued", "retry_wait")),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (
+                        Order.status.in_(("retrieving", "retrieving_second"))
+                        | (Order.prior_status == "retrieving"),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (
+                        (
+                            (Order.status == "error")
+                            | (Order.prior_status == "error")
+                        )
+                        & (Order.updated_at >= day),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+        )
+    ).one()
     summary = {
         "enabled": int(
             db.scalar(select(func.count()).select_from(Unit).where(Unit.enabled)) or 0
         ),
-        "watching": int(status_counts.get("watching", 0)),
-        "queue": int(status_counts.get("wait_retrieve", 0))
-        + int(status_counts.get("wait_second", 0)),
-        "running": int(status_counts.get("retrieving", 0))
-        + int(status_counts.get("retrieving_second", 0)),
-        "error": int(status_counts.get("error", 0)),
+        "watching": int(summary_counts[0] or 0),
+        "queue": int(summary_counts[1] or 0),
+        "running": int(summary_counts[2] or 0),
+        "error": int(summary_counts[3] or 0),
     }
     views = [_unit_view(unit, stats.get(unit.id, (0, 0, 0, 0))) for unit in units]
     return views, pager, summary
@@ -541,6 +584,8 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
     elif unit is None:
         obj.orders_api_token = ""
     obj.orders_api_station_id = str(form.get("orders_api_station_id") or "")
+    obj.retrieve_prior_enabled = bool(form["retrieve_prior_enabled"])
+    obj.move_timeout_prior = int(form["move_timeout_prior"])
     obj.receive_dir = str(form["receive_dir"])
     obj.send_dir = str(form["send_dir"])
     obj.error_dir = str(form["error_dir"])
@@ -1108,23 +1153,49 @@ def orders_list(
         )
     total = db.scalar(select(func.count()).select_from(filt.subquery())) or 0
     filtered_orders = filt.subquery()
-    order_status_counts = dict(
-        db.execute(
-            select(filtered_orders.c.status, func.count())
-            .group_by(filtered_orders.c.status)
-            .order_by(filtered_orders.c.status)
-        ).all()
-    )
+    order_status_counts = db.execute(
+        select(
+            func.sum(
+                case(
+                    (
+                        filtered_orders.c.status.in_(
+                            ("watching", "wait_retrieve", "wait_second")
+                        )
+                        | filtered_orders.c.prior_status.in_(
+                            ("queued", "retry_wait")
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (
+                        filtered_orders.c.status.in_(ACTIVE_ORDER_STATUSES)
+                        | (filtered_orders.c.prior_status == "retrieving"),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (
+                        (filtered_orders.c.status == "done")
+                        & ~filtered_orders.c.prior_status.in_(ACTIVE_PRIOR_STATUSES),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+        ).select_from(filtered_orders)
+    ).one()
     order_summary = {
         "total": total,
-        "waiting": sum(
-            int(order_status_counts.get(key, 0))
-            for key in ("watching", "wait_retrieve", "wait_second")
-        ),
-        "running": sum(
-            int(order_status_counts.get(key, 0)) for key in ACTIVE_ORDER_STATUSES
-        ),
-        "done": int(order_status_counts.get("done", 0)),
+        "waiting": int(order_status_counts[0] or 0),
+        "running": int(order_status_counts[1] or 0),
+        "done": int(order_status_counts[2] or 0),
     }
     pager = paginate(total, page, ORDERS_PAGE)
     stmt = (
@@ -1137,6 +1208,9 @@ def orders_list(
     for o in rows:
         o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
         o.badge = badge_for(o.status)  # type: ignore[attr-defined]
+        o.prior_status_label = PRIOR_STATUS_LABELS.get(  # type: ignore[attr-defined]
+            o.prior_status, o.prior_status
+        )
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
     qs = query_keep(unit_id=unit_id, status=status, q=q)
     return templates.TemplateResponse(
@@ -1192,6 +1266,43 @@ def order_detail(
         )
     )
     transfer_counts = dict(transfer_stats)
+    historical_studies = list(
+        db.scalars(
+            select(HistoricalStudy)
+            .where(HistoricalStudy.order_id == order_id)
+            .order_by(HistoricalStudy.study_date.desc(), HistoricalStudy.id)
+        )
+    )
+    historical_counts: dict[int, dict[str, int]] = {
+        study.id: {} for study in historical_studies
+    }
+    if historical_counts:
+        count_rows = db.execute(
+            select(
+                HistoricalImageLink.historical_study_id,
+                ImageTransfer.status,
+                func.count(),
+            )
+            .join(
+                ImageTransfer,
+                ImageTransfer.id == HistoricalImageLink.transfer_id,
+            )
+            .where(
+                HistoricalImageLink.historical_study_id.in_(historical_counts)
+            )
+            .group_by(
+                HistoricalImageLink.historical_study_id,
+                ImageTransfer.status,
+            )
+        )
+        for study_id, transfer_status, count in count_rows:
+            historical_counts[int(study_id)][str(transfer_status)] = int(count)
+    historical_total_images = 0
+    for study in historical_studies:
+        counts = historical_counts[study.id]
+        study.image_counts = counts  # type: ignore[attr-defined]
+        study.image_total = sum(counts.values())  # type: ignore[attr-defined]
+        historical_total_images += study.image_total  # type: ignore[attr-defined]
     return templates.TemplateResponse(
         request=request,
         name="order_detail.html",
@@ -1205,6 +1316,11 @@ def order_detail(
             badge=badge_for(order.status),
             transfer_stats=transfer_stats,
             transfer_counts=transfer_counts,
+            historical_studies=historical_studies,
+            historical_total_images=historical_total_images,
+            prior_status_label=PRIOR_STATUS_LABELS.get(
+                order.prior_status, order.prior_status
+            ),
             pager=pager,
             qs="",
         ),
@@ -1219,7 +1335,11 @@ def order_retry(
     user: User = Depends(require_user),
 ):
     order = db.get(Order, order_id)
-    if order and order.status not in ACTIVE_ORDER_STATUSES:
+    if (
+        order
+        and order.status not in ACTIVE_ORDER_STATUSES
+        and order.prior_status not in ACTIVE_PRIOR_STATUSES
+    ):
         _reset_order_for_reprocess(db, order)
         db.commit()
         log_event(
@@ -1240,6 +1360,55 @@ def order_retry(
     return RedirectResponse(
         request.headers.get("referer") or "/orders", status_code=303
     )
+
+
+@app.post("/orders/{order_id}/retry-prior")
+def order_retry_prior(
+    order_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    order = db.get(Order, order_id)
+    if order is None:
+        flash(request, "Pedido não encontrado.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    if order.prior_status == "disabled":
+        flash(request, "O retrieve histórico não está habilitado neste pedido.", "err")
+    elif order.prior_status in ACTIVE_PRIOR_STATUSES:
+        flash(request, "O retrieve histórico já está ativo.", "err")
+    elif order.status in ACTIVE_ORDER_STATUSES:
+        flash(request, "Aguarde o processamento atual terminar.", "err")
+    else:
+        for study in list(order.historical_studies):
+            db.delete(study)
+        order.prior_status = "queued"
+        order.prior_due_at = datetime.now()
+        order.prior_started_at = None
+        order.prior_completed_at = None
+        order.prior_heartbeat_at = None
+        order.prior_attempts = 0
+        order.prior_last_error = ""
+        db.add(
+            OrderEvent(
+                order_id=order.id,
+                level="info",
+                message="Reprocessamento manual do histórico solicitado",
+            )
+        )
+        db.commit()
+        log_event(
+            log,
+            logging.INFO,
+            "order.prior.reprocess",
+            resource=f"order:{order.id}",
+            status="success",
+            order_id=order.id,
+            unit_id=order.unit_id,
+            user_id=user.id,
+        )
+        flash(request, "Retrieve histórico colocado novamente na fila.")
+    return RedirectResponse(f"/orders/{order_id}", status_code=303)
 
 
 def _reset_order_for_reprocess(db: Session, order: Order) -> None:
@@ -1305,7 +1474,10 @@ def order_delete(
     if order is None:
         flash(request, "Pedido não encontrado.", "err")
         return RedirectResponse("/orders", status_code=303)
-    if order.status in ACTIVE_ORDER_STATUSES:
+    if (
+        order.status in ACTIVE_ORDER_STATUSES
+        or order.prior_status in ACTIVE_PRIOR_STATUSES
+    ):
         flash(request, "Aguarde o processamento atual terminar para excluir.", "err")
         return RedirectResponse("/orders", status_code=303)
     unit_id = order.unit_id

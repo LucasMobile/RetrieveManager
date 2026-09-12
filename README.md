@@ -10,10 +10,11 @@ Cada hospital vira uma **unidade** cadastrada na tela. A lista começa vazia.
 2. Filtra pedidos ainda não lidos e, quando configurado, pelo ID Posto
 3. Grava cada pedido na fila local e confirma `mirthReaded=true` na API
 4. Faz C-FIND no PACS (Accession + data de nascimento)
-5. Espera 15 min (CT/MR) ou 10 min (resto) e faz C-MOVE
-6. CT/MR têm um 2º C-MOVE ~90 min depois
-7. Sobe `storescp` na porta/AET da unidade
-8. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para `https://idr.mobilemed.com.br/api/router/send-image`
+5. Opcionalmente busca os exames dos últimos três anos do mesmo paciente e modalidade
+6. Espera 15 min (CT/MR) ou 10 min (resto) e faz o C-MOVE do exame atual pelo Study UID
+7. CT/MR têm um 2º C-MOVE ~90 min depois
+8. Sobe `storescp` na porta/AET da unidade
+9. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para `https://idr.mobilemed.com.br/api/router/send-image`
 
 `storescp` do host antigo, `compacta_retrieve.py` e `envio_ret.py` **não precisam mais rodar**. Compacta/envio da nuvem que já existiam fora deste fluxo continuam independentes só se você quiser — este programa cobre a cadeia de retrieve.
 
@@ -165,6 +166,7 @@ Campos principais:
 - Calling AET e Dest AET
 - Porta do storescp (única no servidor)
 - Token (identificação na nuvem)
+- Retrieve de exames anteriores (opcional) e timeout, com padrão de 30 minutos
 
 Depois de salvar, cadastre o Dest AET + porta **no PACS**.
 
@@ -176,6 +178,15 @@ array JSON e os campos `patientId`, `accessionNumber`, `patientBirthdate` e
 Pedidos com `mirthReaded=true` são ignorados. O `PUT` de confirmação só ocorre
 depois do commit no banco local; se falhar, fica pendente e é repetido sem criar
 outro pedido para o mesmo accession.
+
+Quando o retrieve de exames anteriores está ativo, o C-FIND também obtém
+`BodyPartExamined (0018,0015)`. Assim que encontra o exame atual, o worker agenda
+um C-MOVE em nível de série usando paciente, nascimento, modalidade, body part e
+o intervalo entre três anos atrás e ontem. O Patient ID é consultado com `*` no
+final e body part vazio é permitido. Esse movimento compartilha o limite de
+paralelismo da unidade e termina (ou esgota três tentativas) antes do primeiro
+retrieve do exame atual. O exame atual continua sendo recuperado pelo Study UID;
+seus tempos e eventual segundo retrieve não se aplicam aos exames anteriores.
 
 ## Regras padrão (editáveis na tela)
 

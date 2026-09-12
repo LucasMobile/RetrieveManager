@@ -7,7 +7,7 @@ import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic, perf_counter
 
@@ -31,11 +31,19 @@ from app.dicom_tools import (
     ToolMissing,
     c_find,
     c_move,
+    c_move_prior,
     dcmcjpeg,
     redact_dicom_output,
 )
 from app.events import add_event
-from app.models import CompressRule, ImageTransfer, Order, Unit
+from app.models import (
+    CompressRule,
+    HistoricalImageLink,
+    HistoricalStudy,
+    ImageTransfer,
+    Order,
+    Unit,
+)
 from app.observability import log_context, log_event, new_correlation_id
 from app.orders_api import (
     InvalidApiOrder,
@@ -49,6 +57,7 @@ from app.rules import drop_codes, get_settings, schedule_from_now
 
 log = logging.getLogger("worker")
 STALE_LOCK = timedelta(minutes=20)
+PRIOR_RETRY_DELAYS = (60, 300)
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,14 @@ class CompactResult:
     study_uid: str
     status: str
     error_type: str = ""
+    patient_id: str = ""
+    birth_date: str = ""
+    study_date: str = ""
+    accession: str = ""
+    modality: str = ""
+    body_part: str = ""
+    description: str = ""
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -87,7 +104,8 @@ def _ensure_order_correlation(order: Order) -> str:
 
 
 def recover_stale_locks(db: Session) -> None:
-    cutoff = datetime.now() - STALE_LOCK
+    now = datetime.now()
+    cutoff = now - STALE_LOCK
     rows = list(
         db.scalars(
             select(Order).where(
@@ -116,6 +134,45 @@ def recover_stale_locks(db: Session) -> None:
             )
     if rows:
         db.commit()
+    # O C-MOVE histórico pode legitimamente durar mais que o lock padrão.
+    # Como o subprocesso é bloqueante, o heartbeat não avança durante a execução;
+    # respeite o timeout configurado na unidade antes de considerar o job órfão.
+    prior_candidates = list(
+        db.scalars(select(Order).where(Order.prior_status == "retrieving"))
+    )
+    prior_rows = [
+        order
+        for order in prior_candidates
+        if order.prior_heartbeat_at is None
+        or order.prior_heartbeat_at
+        < now
+        - max(
+            STALE_LOCK,
+            timedelta(seconds=max(order.unit.move_timeout_prior, 60) + 120),
+        )
+    ]
+    for order in prior_rows:
+        order.prior_status = "queued"
+        order.prior_due_at = now
+        order.prior_last_error = "lock órfão do histórico recuperado"
+        add_event(
+            db,
+            order,
+            "Lock órfão do retrieve histórico recuperado após queda do worker",
+            level="warn",
+        )
+    if prior_rows:
+        db.commit()
+
+
+def prior_date_range(today: date | None = None) -> tuple[str, str]:
+    current = today or date.today()
+    try:
+        start = current.replace(year=current.year - 3)
+    except ValueError:
+        start = current.replace(year=current.year - 3, day=28)
+    end = current - timedelta(days=1)
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
 
 def ingest_unit(db: Session, unit: Unit) -> int:
@@ -371,7 +428,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             )
             return
 
-        study_uid, modalities, patient_name = parse_findscu_output(output)
+        study_uid, modalities, patient_name, body_part = parse_findscu_output(output)
         order.attempts += 1
         safe_output = redact_dicom_output(output)
         if not study_uid:
@@ -399,11 +456,25 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
         order.study_uid = study_uid
         order.modality = modality
         order.patient_name = patient_name
+        order.body_part = body_part
         order.retrieve_at = retrieve_at
         order.second_retrieve_at = second_at
         order.found_at = now
         order.status = "wait_retrieve"
         order.last_error = ""
+        if unit.retrieve_prior_enabled:
+            prior_from, prior_to = prior_date_range(now.date())
+            order.prior_status = "queued"
+            order.prior_date_from = prior_from
+            order.prior_date_to = prior_to
+            order.prior_due_at = now
+            order.prior_started_at = None
+            order.prior_completed_at = None
+            order.prior_heartbeat_at = None
+            order.prior_attempts = 0
+            order.prior_last_error = ""
+        else:
+            order.prior_status = "disabled"
         add_event(
             db,
             order,
@@ -411,6 +482,13 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             f"1º retrieve em {retrieve_at:%H:%M}",
             safe_output,
         )
+        if unit.retrieve_prior_enabled:
+            add_event(
+                db,
+                order,
+                "Retrieve histórico enfileirado para execução imediata: "
+                f"{order.prior_date_from}-{order.prior_date_to}",
+            )
         db.commit()
         log_event(
             log,
@@ -425,9 +503,9 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
         )
 
 
-def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, bool]]:
+def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
     now = datetime.now()
-    inflight = (
+    current_inflight = (
         db.scalar(
             select(func.count()).where(
                 Order.unit_id == unit.id,
@@ -436,8 +514,17 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, bool]]:
         )
         or 0
     )
-    slots = max(1, unit.max_parallel_moves) - inflight
-    claimed: list[tuple[int, bool]] = []
+    prior_inflight = (
+        db.scalar(
+            select(func.count()).where(
+                Order.unit_id == unit.id,
+                Order.prior_status == "retrieving",
+            )
+        )
+        or 0
+    )
+    slots = max(1, unit.max_parallel_moves) - current_inflight - prior_inflight
+    claimed: list[tuple[int, str]] = []
     if slots <= 0:
         return claimed
 
@@ -447,52 +534,159 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, bool]]:
             .where(
                 Order.unit_id == unit.id,
                 Order.status == "wait_retrieve",
+                Order.prior_status.notin_(("queued", "retry_wait", "retrieving")),
                 Order.retrieve_at.is_not(None),
                 Order.retrieve_at <= now,
             )
             .order_by(Order.retrieve_at)
-            .limit(slots)
         )
     )
-    for order in first:
-        order.status = "retrieving"
-        order.heartbeat_at = now
-        claimed.append((order.id, False))
-        slots -= 1
-    if slots <= 0:
-        db.commit()
-        return claimed
-
     second = list(
         db.scalars(
             select(Order)
             .where(
                 Order.unit_id == unit.id,
                 Order.status == "wait_second",
+                Order.prior_status.notin_(("queued", "retry_wait", "retrieving")),
                 Order.second_retrieve_at.is_not(None),
                 Order.second_retrieve_at <= now,
             )
             .order_by(Order.second_retrieve_at)
-            .limit(slots)
         )
     )
-    for order in second:
-        order.status = "retrieving_second"
-        order.heartbeat_at = now
-        claimed.append((order.id, True))
+    prior = list(
+        db.scalars(
+            select(Order).where(
+                Order.unit_id == unit.id,
+                Order.prior_status.in_(("queued", "retry_wait")),
+                Order.prior_due_at.is_not(None),
+                Order.prior_due_at <= now,
+            )
+        )
+    )
+    candidates = [
+        (order.retrieve_at, 1, order.id, "first", order) for order in first
+    ] + [
+        (order.second_retrieve_at, 2, order.id, "second", order) for order in second
+    ] + [
+        (order.prior_due_at, 0, order.id, "prior", order) for order in prior
+    ]
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    for _due_at, _priority, _order_id, kind, order in candidates[:slots]:
+        if kind == "first":
+            order.status = "retrieving"
+            order.heartbeat_at = now
+        elif kind == "second":
+            order.status = "retrieving_second"
+            order.heartbeat_at = now
+        else:
+            order.prior_status = "retrieving"
+            order.prior_heartbeat_at = now
+        claimed.append((order.id, kind))
     if claimed:
         db.commit()
     return claimed
 
 
-def run_claimed_move(db: Session, order_id: int, second: bool) -> None:
+def run_claimed_move(db: Session, order_id: int, kind: str) -> None:
     order = db.get(Order, order_id)
     if order is None:
         return
     unit = db.get(Unit, order.unit_id)
     if unit is None:
         return
-    _run_move(db, unit, order, second)
+    if kind == "prior":
+        _run_prior_move(db, unit, order)
+    else:
+        _run_move(db, unit, order, kind == "second")
+
+
+def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
+    correlation_id = _ensure_order_correlation(order)
+    started_at = perf_counter()
+    now = datetime.now()
+    order.prior_status = "retrieving"
+    if order.prior_started_at is None:
+        order.prior_started_at = now
+    order.prior_heartbeat_at = now
+    order.prior_attempts += 1
+    db.commit()
+    with log_context(correlation_id):
+        log_event(
+            log,
+            logging.INFO,
+            "dicom.move.prior",
+            resource=f"order:{order.id}",
+            status="started",
+            order_id=order.id,
+            unit_id=unit.id,
+            attempt=order.prior_attempts,
+        )
+        try:
+            code, output = c_move_prior(
+                unit.calling_aet,
+                unit.pacs_aet,
+                unit.pacs_ip,
+                unit.pacs_port,
+                order.body_part,
+                order.modality,
+                order.pat_id,
+                order.birth_date,
+                f"{order.prior_date_from}-{order.prior_date_to}",
+                unit.move_timeout_prior,
+            )
+        except ToolMissing as exc:
+            code, output = 127, str(exc)
+        safe_output = redact_dicom_output(output)
+        finished_at = datetime.now()
+        order.prior_heartbeat_at = finished_at
+        if code == 0:
+            order.prior_status = "done"
+            order.prior_completed_at = finished_at
+            order.prior_last_error = ""
+            add_event(db, order, "C-MOVE histórico concluído", safe_output)
+            event_level = logging.INFO
+            event_status = "success"
+        elif order.prior_attempts < 3:
+            delay = PRIOR_RETRY_DELAYS[order.prior_attempts - 1]
+            order.prior_status = "retry_wait"
+            order.prior_due_at = finished_at + timedelta(seconds=delay)
+            order.prior_last_error = f"C-MOVE histórico exit {code}"
+            add_event(
+                db,
+                order,
+                f"C-MOVE histórico falhou (exit {code}); nova tentativa agendada",
+                safe_output,
+                "warn",
+            )
+            event_level = logging.WARNING
+            event_status = "retry"
+        else:
+            order.prior_status = "error"
+            order.prior_completed_at = finished_at
+            order.prior_last_error = f"C-MOVE histórico exit {code}"
+            add_event(
+                db,
+                order,
+                f"C-MOVE histórico falhou após 3 tentativas (exit {code})",
+                safe_output,
+                "error",
+            )
+            event_level = logging.ERROR
+            event_status = "failure"
+        db.commit()
+        log_event(
+            log,
+            event_level,
+            "dicom.move.prior",
+            resource=f"order:{order.id}",
+            status=event_status,
+            started_at=started_at,
+            order_id=order.id,
+            unit_id=unit.id,
+            attempt=order.prior_attempts,
+            command_status=code,
+        )
 
 
 def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
@@ -689,14 +883,26 @@ def _compact_one(
 
     modality = str(getattr(image, "Modality", "") or prefix).upper()
     study_uid = str(getattr(image, "StudyInstanceUID", "") or "")
+    identity = {
+        "patient_id": str(getattr(image, "PatientID", "") or ""),
+        "birth_date": str(getattr(image, "PatientBirthDate", "") or ""),
+        "study_date": str(getattr(image, "StudyDate", "") or ""),
+        "accession": str(getattr(image, "AccessionNumber", "") or ""),
+        "modality": modality,
+        "body_part": str(getattr(image, "BodyPartExamined", "") or ""),
+        "description": str(getattr(image, "StudyDescription", "") or ""),
+        "observed_at": datetime.fromtimestamp(Path(filepath).stat().st_mtime),
+    }
     if prefix in drops or modality in drops:
         os.remove(filepath)
-        return CompactResult(name, "", study_uid, "discarded_modality")
+        return CompactResult(
+            name, "", study_uid, "discarded_modality", **identity
+        )
 
     study_id = str(getattr(image, "StudyID", "") or "")
     if study_prefix and re.match(rf"^{re.escape(study_prefix)}\d+", study_id, re.I):
         os.remove(filepath)
-        return CompactResult(name, "", study_uid, "discarded_study")
+        return CompactResult(name, "", study_uid, "discarded_study", **identity)
 
     image.SpecificCharacterSet = "ISO_IR 100"
     image.InstitutionalDepartmentName = token
@@ -708,13 +914,31 @@ def _compact_one(
     except ToolMissing as exc:
         shutil.move(filepath, error)
         return CompactResult(
-            name, name, study_uid, "compression_error", type(exc).__name__
+            name,
+            name,
+            study_uid,
+            "compression_error",
+            type(exc).__name__,
+            **identity,
         )
     if code == 0:
         os.remove(filepath)
-        return CompactResult(name, os.path.basename(dest), study_uid, "compressed")
+        return CompactResult(
+            name,
+            os.path.basename(dest),
+            study_uid,
+            "compressed",
+            **identity,
+        )
     shutil.move(filepath, error)
-    return CompactResult(name, name, study_uid, "compression_error", "DcmcjpegError")
+    return CompactResult(
+        name,
+        name,
+        study_uid,
+        "compression_error",
+        "DcmcjpegError",
+        **identity,
+    )
 
 
 def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> None:
@@ -753,6 +977,7 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         transfer.last_http_status = None
     transfer.status = result.status
     transfer.last_error = result.error_type
+    _associate_historical_transfer(db, unit, result, transfer)
     level = logging.ERROR if result.error_type else logging.INFO
     with log_context(correlation_id):
         log_event(
@@ -766,6 +991,77 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
             order_id=order.id if order else None,
             unit_id=unit.id,
         )
+
+
+def _associate_historical_transfer(
+    db: Session,
+    unit: Unit,
+    result: CompactResult,
+    transfer: ImageTransfer,
+) -> None:
+    if not result.study_uid or result.observed_at is None:
+        return
+    candidates = list(
+        db.scalars(
+            select(Order).where(
+                Order.unit_id == unit.id,
+                Order.prior_status != "disabled",
+                Order.prior_started_at.is_not(None),
+                Order.prior_started_at <= result.observed_at,
+            )
+        )
+    )
+    for order in candidates:
+        if result.study_uid == order.study_uid:
+            continue
+        if order.prior_completed_at and result.observed_at > (
+            order.prior_completed_at + timedelta(minutes=1)
+        ):
+            continue
+        if not result.patient_id.startswith(order.pat_id):
+            continue
+        if result.birth_date and result.birth_date != order.birth_date:
+            continue
+        if result.modality.upper() != order.modality.upper():
+            continue
+        if order.body_part and result.body_part.upper() != order.body_part.upper():
+            continue
+        if result.study_date and not (
+            order.prior_date_from <= result.study_date <= order.prior_date_to
+        ):
+            continue
+        study = db.scalar(
+            select(HistoricalStudy).where(
+                HistoricalStudy.order_id == order.id,
+                HistoricalStudy.study_uid == result.study_uid,
+            )
+        )
+        if study is None:
+            study = HistoricalStudy(
+                order_id=order.id,
+                unit_id=unit.id,
+                study_uid=result.study_uid,
+                accession=result.accession,
+                study_date=result.study_date,
+                modality=result.modality,
+                body_part=result.body_part,
+                description=result.description,
+            )
+            db.add(study)
+            db.flush()
+        link = db.scalar(
+            select(HistoricalImageLink).where(
+                HistoricalImageLink.historical_study_id == study.id,
+                HistoricalImageLink.transfer_id == transfer.id,
+            )
+        )
+        if link is None:
+            db.add(
+                HistoricalImageLink(
+                    historical_study_id=study.id,
+                    transfer_id=transfer.id,
+                )
+            )
 
 
 def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:

@@ -15,7 +15,7 @@
       <p class="page-header__description mono">Origem API{% if order.source_id %} · {{ order.source_id }}{% endif %}</p>
     </div>
     <div class="page-header__actions">
-      {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') %}
+      {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') and order.prior_status not in ('queued', 'retry_wait', 'retrieving') %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="btn btn--primary" type="submit">{{ icon("retry") }} Reprocessar</button>
@@ -51,8 +51,52 @@
           <div><dt>Nascimento</dt><dd>{{ order.birth_date or 'Não informado' }}</dd></div>
           <div><dt>Data do exame</dt><dd>{{ order.exam_date or 'Não informado' }}</dd></div>
           <div><dt>Modalidade</dt><dd><span class="modality-mark">{{ order.modality or '—' }}</span></dd></div>
+          <div><dt>Body Part</dt><dd>{{ order.body_part or 'Não informado' }}</dd></div>
           <div><dt>Study UID</dt><dd class="mono">{{ order.study_uid or 'Não informado' }}</dd></div>
         </dl>
+      </section>
+
+      <section class="surface order-panel" aria-labelledby="prior-title">
+        <header class="order-panel__header">
+          <div><h2 id="prior-title">Exames anteriores</h2><p>Histórico de três anos solicitado ao PACS.</p></div>
+          <span class="chip">{{ prior_status_label }}</span>
+        </header>
+        {% if order.prior_status == 'disabled' %}
+        <p class="muted small">O retrieve histórico estava desativado para esta unidade.</p>
+        {% else %}
+        <dl class="order-data-list">
+          <div><dt>Período</dt><dd class="mono">{{ order.prior_date_from }}–{{ order.prior_date_to }}</dd></div>
+          <div><dt>Filtro</dt><dd>{{ order.modality or '—' }} · {{ order.body_part or 'Body Part vazio' }}</dd></div>
+          <div><dt>Paciente</dt><dd class="mono">{{ order.pat_id }}*</dd></div>
+          <div><dt>Tentativas</dt><dd>{{ order.prior_attempts }}</dd></div>
+          <div><dt>Exames encontrados</dt><dd>{{ historical_studies|length }}</dd></div>
+          <div><dt>Imagens associadas</dt><dd>{{ historical_total_images }}</dd></div>
+        </dl>
+        {% if order.prior_last_error %}<div class="order-error"><strong>Último erro do histórico</strong><span>{{ order.prior_last_error }}</span></div>{% endif %}
+        {% if order.prior_status in ('done', 'error') %}
+        <form method="post" action="/orders/{{ order.id }}/retry-prior" data-confirm="Executar novamente o retrieve de exames anteriores?" data-confirm-label="Reprocessar histórico">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+          <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar histórico</button>
+        </form>
+        {% endif %}
+        {% if historical_studies %}
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>Data</th><th>Accession / Study UID</th><th>Modalidade / Body Part</th><th>Imagens</th></tr></thead>
+            <tbody>
+              {% for study in historical_studies %}
+              <tr>
+                <td>{{ study.study_date or '—' }}</td>
+                <td><span class="table-primary mono">{{ study.accession or 'Sem accession' }}</span><span class="table-secondary mono">{{ study.study_uid }}</span>{% if study.description %}<span class="table-secondary">{{ study.description }}</span>{% endif %}</td>
+                <td><span class="modality-mark">{{ study.modality or '—' }}</span><span class="table-secondary">{{ study.body_part or 'Não informado' }}</span></td>
+                <td><span class="table-primary">{{ study.image_total }}</span><span class="table-secondary">Enviadas {{ study.image_counts.get('uploaded', 0) }} · Compactadas {{ study.image_counts.get('compressed', 0) }} · Erros {{ study.image_counts.get('compression_error', 0) + study.image_counts.get('upload_error', 0) }} · Descartadas {{ study.image_counts.get('discarded_modality', 0) + study.image_counts.get('discarded_study', 0) }}</span></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% endif %}
+        {% endif %}
       </section>
 
       <section class="surface order-panel" aria-labelledby="schedule-title">

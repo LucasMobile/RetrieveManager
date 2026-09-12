@@ -65,6 +65,8 @@ class Unit(Base):
 
     move_timeout_first: Mapped[int] = mapped_column(Integer, default=600)
     move_timeout_second: Mapped[int] = mapped_column(Integer, default=900)
+    retrieve_prior_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    move_timeout_prior: Mapped[int] = mapped_column(Integer, default=1800)
     max_parallel_moves: Mapped[int] = mapped_column(Integer, default=1)
     find_interval_seconds: Mapped[int] = mapped_column(Integer, default=30)
     compact_workers: Mapped[int] = mapped_column(Integer, default=8)
@@ -117,6 +119,12 @@ class Order(Base):
             "status",
             "second_retrieve_at",
         ),
+        Index(
+            "ix_orders_unit_prior_status_due",
+            "unit_id",
+            "prior_status",
+            "prior_due_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -138,6 +146,17 @@ class Order(Base):
     study_uid: Mapped[str] = mapped_column(String(128), default="")
     modality: Mapped[str] = mapped_column(String(32), default="")
     patient_name: Mapped[str] = mapped_column(String(255), default="")
+    body_part: Mapped[str] = mapped_column(String(64), default="")
+
+    prior_status: Mapped[str] = mapped_column(String(32), default="disabled")
+    prior_date_from: Mapped[str] = mapped_column(String(8), default="")
+    prior_date_to: Mapped[str] = mapped_column(String(8), default="")
+    prior_due_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    prior_started_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    prior_completed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    prior_heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    prior_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    prior_last_error: Mapped[str] = mapped_column(Text, default="")
 
     retrieve_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     second_retrieve_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
@@ -158,6 +177,9 @@ class Order(Base):
     events: Mapped[list["OrderEvent"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="OrderEvent.id"
     )
+    historical_studies: Mapped[list["HistoricalStudy"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan"
+    )
 
 
 class OrderEvent(Base):
@@ -171,6 +193,53 @@ class OrderEvent(Base):
     detail: Mapped[str] = mapped_column(Text, default="")
 
     order: Mapped[Order] = relationship(back_populates="events")
+
+
+class HistoricalStudy(Base):
+    __tablename__ = "historical_studies"
+    __table_args__ = (
+        UniqueConstraint("order_id", "study_uid", name="uq_historical_order_study"),
+        Index("ix_historical_study_order", "order_id", "study_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
+    study_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    accession: Mapped[str] = mapped_column(String(64), default="")
+    study_date: Mapped[str] = mapped_column(String(16), default="")
+    modality: Mapped[str] = mapped_column(String(32), default="")
+    body_part: Mapped[str] = mapped_column(String(64), default="")
+    description: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    order: Mapped[Order] = relationship(back_populates="historical_studies")
+    image_links: Mapped[list["HistoricalImageLink"]] = relationship(
+        back_populates="study", cascade="all, delete-orphan"
+    )
+
+
+class HistoricalImageLink(Base):
+    __tablename__ = "historical_image_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "historical_study_id",
+            "transfer_id",
+            name="uq_historical_study_transfer",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    historical_study_id: Mapped[int] = mapped_column(
+        ForeignKey("historical_studies.id"), nullable=False
+    )
+    transfer_id: Mapped[int] = mapped_column(
+        ForeignKey("image_transfers.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    study: Mapped[HistoricalStudy] = relationship(back_populates="image_links")
+    transfer: Mapped["ImageTransfer"] = relationship(back_populates="historical_links")
 
 
 class ImageTransfer(Base):
@@ -196,6 +265,9 @@ class ImageTransfer(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now
+    )
+    historical_links: Mapped[list[HistoricalImageLink]] = relationship(
+        back_populates="transfer", cascade="all, delete-orphan"
     )
 
 

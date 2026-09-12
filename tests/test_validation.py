@@ -26,6 +26,8 @@ class ValidationTest(unittest.TestCase):
             "orders_api_url": "https://integracao.example/v1/pedidos",
             "orders_api_token": "integration-token",
             "orders_api_station_id": "48",
+            "retrieve_prior_enabled": "1",
+            "move_timeout_prior": "1800",
             "receive_dir": root,
             "send_dir": root,
             "error_dir": root,
@@ -41,6 +43,8 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(result["pacs_port"], 2104)
         self.assertEqual(result["name"], "Hospital A")
         self.assertEqual(result["orders_api_station_id"], "48")
+        self.assertTrue(result["retrieve_prior_enabled"])
+        self.assertEqual(result["move_timeout_prior"], 1800)
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):

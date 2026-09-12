@@ -69,6 +69,8 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
         raise ValueError("Nome da unidade deve ter entre 1 e 120 caracteres")
     if form.get("enabled", "1") not in {"0", "1"}:
         raise ValueError("Estado da unidade inválido")
+    if form.get("retrieve_prior_enabled", "0") not in {"0", "1"}:
+        raise ValueError("Configuração de exames anteriores inválida")
     return {
         "name": name,
         "enabled": form.get("enabled", "1") == "1",
@@ -83,6 +85,14 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
         "orders_api_url": validate_orders_api_url(form.get("orders_api_url", "")),
         "orders_api_token": form.get("orders_api_token", "").strip(),
         "orders_api_station_id": form.get("orders_api_station_id", "").strip(),
+        "retrieve_prior_enabled": form.get("retrieve_prior_enabled", "0") == "1",
+        "move_timeout_prior": bounded_int(
+            form.get("move_timeout_prior"),
+            "Timeout do retrieve de exames anteriores",
+            minimum=60,
+            maximum=14400,
+            default=1800,
+        ),
         "receive_dir": validate_data_path(
             form.get("receive_dir", ""), "Pasta de recebimento"
         ),

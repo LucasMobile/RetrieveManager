@@ -46,6 +46,8 @@ class DatabaseMigrationTest(unittest.TestCase):
             self.assertIn("orders_api_url", columns)
             self.assertIn("orders_api_token", columns)
             self.assertIn("orders_api_station_id", columns)
+            self.assertIn("retrieve_prior_enabled", columns)
+            self.assertIn("move_timeout_prior", columns)
             with engine.connect() as connection:
                 self.assertEqual(
                     connection.scalar(text("SELECT name FROM units")),

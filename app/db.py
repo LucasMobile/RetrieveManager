@@ -109,6 +109,8 @@ def _migrate_schema() -> None:
             "orders_api_url": "VARCHAR(500) NOT NULL DEFAULT ''",
             "orders_api_token": "VARCHAR(2048) NOT NULL DEFAULT ''",
             "orders_api_station_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+            "retrieve_prior_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+            "move_timeout_prior": "INTEGER NOT NULL DEFAULT 1800",
         }
         with engine.begin() as connection:
             for name, definition in unit_additions.items():
@@ -134,6 +136,16 @@ def _migrate_schema() -> None:
         "api_read_attempts": "INTEGER NOT NULL DEFAULT 0",
         "api_read_last_error": "VARCHAR(500) NOT NULL DEFAULT ''",
         "api_read_at": "DATETIME",
+        "body_part": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "prior_status": "VARCHAR(32) NOT NULL DEFAULT 'disabled'",
+        "prior_date_from": "VARCHAR(8) NOT NULL DEFAULT ''",
+        "prior_date_to": "VARCHAR(8) NOT NULL DEFAULT ''",
+        "prior_due_at": "DATETIME",
+        "prior_started_at": "DATETIME",
+        "prior_completed_at": "DATETIME",
+        "prior_heartbeat_at": "DATETIME",
+        "prior_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "prior_last_error": "TEXT NOT NULL DEFAULT ''",
     }
     with engine.begin() as connection:
         for name, definition in order_additions.items():
@@ -168,6 +180,12 @@ def _migrate_schema() -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_orders_unit_status_second_retrieve "
                 "ON orders (unit_id, status, second_retrieve_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_orders_unit_prior_status_due "
+                "ON orders (unit_id, prior_status, prior_due_at)"
             )
         )
 

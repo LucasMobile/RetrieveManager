@@ -1,10 +1,18 @@
 import logging
 import unittest
+from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.models import Base, ImageTransfer, Order, Unit
+from app.models import (
+    Base,
+    HistoricalImageLink,
+    HistoricalStudy,
+    ImageTransfer,
+    Order,
+    Unit,
+)
 from app.pipeline import (
     CircuitState,
     CompactResult,
@@ -136,6 +144,72 @@ class TransferTrackingTest(unittest.TestCase):
             self.assertEqual(transfer.status, "compressed")
             self.assertEqual(transfer.correlation_id, "new-correlation")
             self.assertEqual(transfer.attempts, 0)
+
+    def test_historical_image_is_grouped_by_study_uid(self):
+        with self.Session() as db:
+            unit = Unit(
+                name="unit",
+                orders_api_url="https://integracao.example/v1/pedidos",
+                orders_api_token="integration-token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir="/receive",
+                send_dir="/send",
+                error_dir="/error",
+                token="token",
+                retrieve_prior_enabled=True,
+            )
+            db.add(unit)
+            db.flush()
+            observed_at = datetime.now()
+            order = Order(
+                unit_id=unit.id,
+                source_id="order-id",
+                acc="current",
+                pat_id="30211738",
+                birth_date="19691027",
+                study_uid="1.2.current",
+                modality="MR",
+                body_part="ABDOMEN",
+                prior_status="retrieving",
+                prior_date_from="20230911",
+                prior_date_to="20260910",
+                prior_started_at=observed_at - timedelta(seconds=5),
+            )
+            db.add(order)
+            db.commit()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "historical-file",
+                    "historical-file.dcm",
+                    "1.2.historical",
+                    "compressed",
+                    patient_id="30211738-A",
+                    birth_date="19691027",
+                    study_date="20250110",
+                    accession="old-accession",
+                    modality="MR",
+                    body_part="ABDOMEN",
+                    description="RM ABDOMEN",
+                    observed_at=observed_at,
+                ),
+            )
+            db.commit()
+
+            study = db.scalar(select(HistoricalStudy))
+            self.assertIsNotNone(study)
+            self.assertEqual(study.order_id, order.id)
+            self.assertEqual(study.study_uid, "1.2.historical")
+            self.assertEqual(study.accession, "old-accession")
+            link = db.scalar(select(HistoricalImageLink))
+            self.assertIsNotNone(link)
+            self.assertEqual(link.historical_study_id, study.id)
 
 
 if __name__ == "__main__":

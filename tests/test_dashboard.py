@@ -69,6 +69,31 @@ class DashboardTest(unittest.TestCase):
                         status="error",
                         updated_at=datetime.now() - timedelta(hours=1),
                     ),
+                    Order(
+                        unit_id=active.id,
+                        source_id="prior-queue",
+                        acc="4",
+                        birth_date="20000101",
+                        status="wait_retrieve",
+                        prior_status="queued",
+                    ),
+                    Order(
+                        unit_id=active.id,
+                        source_id="prior-running",
+                        acc="5",
+                        birth_date="20000101",
+                        status="wait_retrieve",
+                        prior_status="retrieving",
+                    ),
+                    Order(
+                        unit_id=active.id,
+                        source_id="prior-error",
+                        acc="6",
+                        birth_date="20000101",
+                        status="done",
+                        prior_status="error",
+                        updated_at=datetime.now() - timedelta(hours=1),
+                    ),
                 ]
             )
             db.commit()
@@ -79,9 +104,15 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(pager["total"], 2)
             self.assertEqual(summary["enabled"], 1)
             self.assertEqual(summary["watching"], 1)
-            self.assertEqual(summary["queue"], 1)
-            self.assertEqual(summary["running"], 0)
-            self.assertEqual(summary["error"], 1)
+            # Cada pedido é contado uma única vez por categoria, mesmo quando
+            # o status atual e o histórico apontam para a mesma fila.
+            self.assertEqual(summary["queue"], 3)
+            self.assertEqual(summary["running"], 1)
+            self.assertEqual(summary["error"], 2)
+            active_view = next(unit for unit in units if unit.name == "A")
+            self.assertEqual(active_view.counts["queue"], 3)
+            self.assertEqual(active_view.counts["running"], 1)
+            self.assertEqual(active_view.counts["error"], 2)
 
 
 if __name__ == "__main__":

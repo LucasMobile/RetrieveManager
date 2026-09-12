@@ -14,7 +14,7 @@ class ToolMissing(RuntimeError):
 
 _SENSITIVE_DICOM_FIELDS = re.compile(
     r"(PatientName|PatientID|PatientBirthDate|AccessionNumber|"
-    r"0010,0010|0010,0020|0010,0030|0008,0050)",
+    r"BodyPartExamined|0010,0010|0010,0020|0010,0030|0008,0050|0018,0015)",
     re.IGNORECASE,
 )
 
@@ -45,6 +45,8 @@ def findscu_cmd(
         "0008,0052=STUDY",
         "-k",
         "0008,0061=",
+        "-k",
+        "0018,0015=",
         "-k",
         "0010,0010=",
         "-k",
@@ -106,6 +108,46 @@ def movescu_cmd(
         "0008,0052=STUDY",
         "-k",
         f"0020,000D={study_uid}",
+        pacs_ip,
+        str(pacs_port),
+    ]
+
+
+def prior_movescu_cmd(
+    bin_path: str,
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    body_part: str,
+    modality: str,
+    patient_id: str,
+    birth_date: str,
+    date_range: str,
+) -> list[str]:
+    """Build the Series-level C-MOVE used for prior patient examinations."""
+    return [
+        bin_path,
+        "-v",
+        "-S",
+        "-pdu",
+        "65534",
+        "-aet",
+        calling_aet,
+        "-aec",
+        pacs_aet,
+        "-k",
+        "0008,0052=SERIES",
+        "-k",
+        f"0018,0015={body_part}",
+        "-k",
+        f"0008,0060={modality}",
+        "-k",
+        f"0010,0020={patient_id}*",
+        "-k",
+        f"0010,0030={birth_date}",
+        "-k",
+        f"0008,0020={date_range}",
         pacs_ip,
         str(pacs_port),
     ]
@@ -178,6 +220,36 @@ def c_move(
             pacs_ip,
             pacs_port,
             study_uid,
+        ),
+        timeout,
+    )
+
+
+def c_move_prior(
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    body_part: str,
+    modality: str,
+    patient_id: str,
+    birth_date: str,
+    date_range: str,
+    timeout: int,
+) -> tuple[int, str]:
+    bin_path = _require(MOVESCU, "movescu")
+    return _run(
+        prior_movescu_cmd(
+            bin_path,
+            calling_aet,
+            pacs_aet,
+            pacs_ip,
+            pacs_port,
+            body_part,
+            modality,
+            patient_id,
+            birth_date,
+            date_range,
         ),
         timeout,
     )

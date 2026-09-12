@@ -73,10 +73,13 @@
             <td><span class="order-date"><span>{{ o.created_at.strftime('%d/%m/%Y') }}</span><strong>{{ o.created_at.strftime('%H:%M') }}</strong></span></td>
             <td><span class="order-unit">{{ o.unit.name }}</span></td>
             <td><span class="order-identity"><a href="/orders/{{ o.id }}">{{ o.pat_id or 'Paciente não informado' }}</a><span>{{ o.acc }}</span></span></td>
-            <td><span class="modality-mark">{{ o.modality or '—' }}</span></td>
-            <td><span class="status-badge {{ o.badge }}">{{ o.status_label }}</span></td>
+            <td><span class="modality-mark">{{ o.modality or '—' }}</span><span class="table-secondary">{{ o.body_part or 'Body Part não informado' }}</span></td>
+            <td><span class="status-badge {{ o.badge }}">{{ o.status_label }}</span>{% if o.prior_status != 'disabled' %}<span class="table-secondary">Histórico: {{ o.prior_status_label }}</span>{% endif %}</td>
             <td><span class="order-next">
-              {% if o.retrieve_at and o.status == 'wait_retrieve' %}<strong>1º retrieve às {{ o.retrieve_at.strftime('%H:%M') }}</strong><small>Execução automática</small>
+              {% if o.prior_status == 'retrieving' %}<strong>Histórico em andamento</strong><small>{{ o.prior_date_from }}–{{ o.prior_date_to }}</small>
+              {% elif o.prior_status in ('queued', 'retry_wait') %}<strong>Histórico na fila</strong><small>{% if o.prior_status == 'retry_wait' %}Nova tentativa automática{% else %}Execução imediata{% endif %}</small>
+              {% elif o.prior_status == 'error' %}<strong class="text-danger">Erro no histórico</strong><small>Disponível para reprocessamento</small>
+              {% elif o.retrieve_at and o.status == 'wait_retrieve' %}<strong>1º retrieve às {{ o.retrieve_at.strftime('%H:%M') }}</strong><small>Execução automática</small>
               {% elif o.second_retrieve_at and o.status == 'wait_second' %}<strong>2º retrieve às {{ o.second_retrieve_at.strftime('%H:%M') }}</strong><small>Execução automática</small>
               {% elif o.last_error %}<strong class="text-danger">Reprocessamento necessário</strong><small>{{ o.last_error[:70] }}</small>
               {% elif o.status == 'done' %}<strong>Fluxo finalizado</strong><small>Sem ações pendentes</small>
@@ -86,7 +89,7 @@
             <td>
               <div class="table-actions order-actions">
                 <a class="action-icon" href="/orders/{{ o.id }}" data-tooltip="Visualizar" title="Visualizar" aria-label="Visualizar pedido">{{ icon("eye") }}</a>
-                {% if o.status not in ('retrieving', 'retrieving_second', 'receiving') %}
+                {% if o.status not in ('retrieving', 'retrieving_second', 'receiving') and o.prior_status not in ('queued', 'retry_wait', 'retrieving') %}
                 <form class="inline-form" method="post" action="/orders/{{ o.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon" type="submit" data-tooltip="Reprocessar" title="Reprocessar" aria-label="Reprocessar pedido">{{ icon("retry") }}</button></form>
                 <form class="inline-form" method="post" action="/orders/{{ o.id }}/delete" data-confirm="Excluir este pedido? O histórico será removido, mas os arquivos clínicos serão preservados." data-confirm-label="Excluir pedido">

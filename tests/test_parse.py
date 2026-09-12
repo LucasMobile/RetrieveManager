@@ -12,13 +12,15 @@ class ParseDicomOutputTest(unittest.TestCase):
     def test_findscu_brackets(self):
         out = """
 (0008,0061) CS [CT]                                      # ModalitiesInStudy
+(0018,0015) CS [ABDOMEN]                                 # BodyPartExamined
 (0010,0010) PN [SILVA^JOAO]                              # PatientName
 (0020,000d) UI [1.2.840.113619.2.55.3]                   # StudyInstanceUID
 """
-        uid, mods, name = parse_findscu_output(out)
+        uid, mods, name, body_part = parse_findscu_output(out)
         self.assertEqual(uid, "1.2.840.113619.2.55.3")
         self.assertEqual(mods, "CT")
         self.assertEqual(name, "SILVA^JOAO")
+        self.assertEqual(body_part, "ABDOMEN")
 
 
 if __name__ == "__main__":
