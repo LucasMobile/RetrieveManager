@@ -21,9 +21,10 @@ def reset_admin() -> None:
         user = db.scalar(select(User).where(User.username == ADMIN_USER))
         created = user is None
         if user is None:
-            user = User(username=ADMIN_USER, password_hash="")
+            user = User(username=ADMIN_USER, password_hash="", role="admin")
             db.add(user)
         user.password_hash = hash_password(ADMIN_PASSWORD)
+        user.role = "admin"
         db.flush()
         user_id = user.id
 

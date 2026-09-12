@@ -3,15 +3,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import DropModality, ModalityRule, Settings
+from app.models import DropModality, ModalityRule
 from app.parse import normalize_modality
-
-
-def get_settings(db: Session) -> Settings:
-    settings = db.get(Settings, 1)
-    if settings is None:
-        raise RuntimeError("settings não inicializadas")
-    return settings
 
 
 def retrieve_rule_for(db: Session, modality: str) -> ModalityRule:

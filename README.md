@@ -14,7 +14,7 @@ Cada hospital vira uma **unidade** cadastrada na tela. A lista começa vazia.
 6. Espera 15 min (CT/MR) ou 10 min (resto) e faz o C-MOVE do exame atual pelo Study UID
 7. CT/MR têm um 2º C-MOVE ~90 min depois
 8. Sobe `storescp` na porta/AET da unidade
-9. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para `https://idr.mobilemed.com.br/api/router/send-image`
+9. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para o endpoint de nuvem configurado na própria unidade
 
 `storescp` do host antigo, `compacta_retrieve.py` e `envio_ret.py` **não precisam mais rodar**. Compacta/envio da nuvem que já existiam fora deste fluxo continuam independentes só se você quiser — este programa cobre a cadeia de retrieve.
 
@@ -64,7 +64,7 @@ Login inicial (se o banco estiver vazio):
 - usuário: `admin` (ou `RETRIEVE_ADMIN_USER`)
 - senha: o valor obrigatório de `RETRIEVE_ADMIN_PASSWORD`
 
-Troque a senha em **Nuvem e login**.
+Troque a senha clicando na conta exibida no rodapé do menu lateral.
 
 `RETRIEVE_ADMIN_PASSWORD` inicializa o primeiro usuário, mas não sobrescreve uma
 senha já armazenada. Para redefinir o acesso usando os valores atuais do `.env`:
@@ -77,6 +77,16 @@ docker compose up -d web
 O comando não imprime a senha e usa o mesmo volume de dados do serviço web. Se a
 senha contiver `#`, `$`, espaços ou outros caracteres especiais, coloque o valor
 entre aspas simples no `.env`.
+
+O usuário inicial e o comando `reset-admin` sempre criam ou restauram uma conta
+com perfil `admin`. Na aba **Usuários**, administradores podem criar outras contas
+com um dos dois perfis:
+
+- `admin`: acesso total à interface e a todas as alterações;
+- `user`: acesso somente de leitura à Visão geral, Fila de pedidos e detalhes.
+
+O sistema impede que um administrador altere a própria role ou exclua a própria
+conta. Todos os usuários podem trocar a própria senha pelo rodapé do menu.
 
 Portas publicadas: **8080** (tela) e **444** (`storescp` da primeira unidade).
 Internamente, o listener usa a porta não privilegiada **10444**, conforme
@@ -166,9 +176,20 @@ Campos principais:
 - Calling AET e Dest AET
 - Porta do storescp (única no servidor)
 - Token (identificação na nuvem)
+- Endpoint de envio para a nuvem e espera antes de compactar/enviar
 - Retrieve de exames anteriores (opcional) e timeout, com padrão de 30 minutos
 
 Depois de salvar, cadastre o Dest AET + porta **no PACS**.
+
+## Recriar o banco de desenvolvimento
+
+Esta versão altera diretamente o schema de desenvolvimento e não inclui migração
+de bancos anteriores. Antes de iniciar a versão atualizada, descarte o banco ou o
+volume antigo somente se os dados de desenvolvimento puderem ser perdidos.
+
+No Docker, `docker compose down -v` remove o volume `retrieve-data`. No ambiente
+local, remova `data/retrieve.db`. A próxima inicialização cria o schema novo e a
+conta administrativa definida no `.env`.
 
 O worker envia o Token de Integração no header `token`. O GET deve retornar um
 array JSON e os campos `patientId`, `accessionNumber`, `patientBirthdate` e

@@ -60,7 +60,7 @@ from app.orders_api import (
     parse_api_order,
 )
 from app.parse import parse_findscu_output
-from app.rules import drop_codes, get_settings, schedule_from_now
+from app.rules import drop_codes, schedule_from_now
 
 log = logging.getLogger("worker")
 STALE_LOCK = timedelta(minutes=20)
@@ -789,7 +789,6 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
 
 
 def compact_unit(db: Session, unit: Unit) -> None:
-    settings = get_settings(db)
     origin = Path(unit.receive_dir)
     dest_dir = Path(unit.send_dir)
     error_dir = Path(unit.error_dir)
@@ -799,7 +798,7 @@ def compact_unit(db: Session, unit: Unit) -> None:
         return
     drops = drop_codes(db)
     dicom_rules = load_rule_specs(db, unit.id)
-    settle = settings.file_settle_seconds or 3
+    settle = unit.file_settle_seconds
     now = datetime.now().timestamp()
     jobs: list[Path] = []
     for path in origin.iterdir():

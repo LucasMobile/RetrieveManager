@@ -32,7 +32,8 @@
         <a href="#orders-api-title"><span>03</span><strong>Pedidos PLERES</strong></a>
         <a href="#prior-title"><span>04</span><strong>Exames anteriores</strong></a>
         <a href="#storage-title"><span>05</span><strong>Store e pastas</strong></a>
-        <a href="#limits-title"><span>06</span><strong>Processamento</strong></a>
+        <a href="#cloud-title"><span>06</span><strong>Envio para a nuvem</strong></a>
+        <a href="#limits-title"><span>07</span><strong>Processamento</strong></a>
       </nav>
       <div class="unit-form-nav__note">
         <strong>Antes de salvar</strong>
@@ -193,9 +194,37 @@
           </div>
         </section>
 
-        <section class="form-section" aria-labelledby="limits-title">
+        <section class="form-section" aria-labelledby="cloud-title">
           <div class="form-section__header">
             <span class="form-section__number">06</span>
+            <div><h2 id="cloud-title">Envio para a nuvem</h2><p>Destino e intervalo de segurança usados exclusivamente por esta unidade.</p></div>
+          </div>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--2">
+              <div class="field field--full">
+                <label for="cloud-url">URL de destino</label>
+                <input id="cloud-url" class="mono" name="cloud_url" type="url" maxlength="500" value="{{ unit.cloud_url if unit else default_cloud_url }}" placeholder="https://api.exemplo.com/imagens" spellcheck="false" autocomplete="url" required>
+                <span class="field__hint">Endpoint que recebe os arquivos DICOM desta unidade por POST.</span>
+              </div>
+              <div class="field">
+                <label for="file-settle-seconds">Espera antes de compactar e enviar</label>
+                <div class="settings-unit-input">
+                  <input id="file-settle-seconds" name="file_settle_seconds" type="number" min="0" max="3600" value="{{ unit.file_settle_seconds if unit else 3 }}">
+                  <span aria-hidden="true">s</span>
+                </div>
+                <span class="field__hint">Garante que a gravação do arquivo terminou.</span>
+              </div>
+            </div>
+            <div class="settings-note">
+              {{ icon("info") }}
+              <span>As alterações serão aplicadas aos próximos arquivos processados pelo worker.</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="form-section" aria-labelledby="limits-title">
+          <div class="form-section__header">
+            <span class="form-section__number">07</span>
             <div><h2 id="limits-title">Limites de processamento</h2><p>Timeouts, paralelismo e frequência de busca desta unidade.</p></div>
           </div>
           <div class="form-section__body">

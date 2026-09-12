@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}{% if managed_user %}Editar {{ managed_user.username }}{% else %}Novo usuário{% endif %} · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack user-form-page">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <nav class="breadcrumb" aria-label="Navegação estrutural">
+        <a href="/users">Usuários</a><span aria-hidden="true">/</span><span>{% if managed_user %}{{ managed_user.username }}{% else %}Novo usuário{% endif %}</span>
+      </nav>
+      <p class="eyebrow">Controle de acesso</p>
+      <h1>{% if managed_user %}Editar usuário{% else %}Novo usuário{% endif %}</h1>
+      <p class="page-header__description">{% if managed_user %}Altere o perfil ou redefina a senha da conta.{% else %}Crie uma credencial e escolha as permissões iniciais.{% endif %}</p>
+    </div>
+    <div class="page-header__actions"><a class="btn btn--secondary" href="/users">{{ icon("arrow-left") }} Voltar</a></div>
+  </header>
+
+  <section class="surface settings-card user-editor" aria-labelledby="user-editor-title">
+    <header class="settings-card__header">
+      <div class="settings-card__heading">
+        <span class="settings-card__icon">{{ icon("users") }}</span>
+        <div><h2 id="user-editor-title">Dados da conta</h2><p>Senhas nunca são exibidas ou registradas nos logs.</p></div>
+      </div>
+      {% if managed_user %}<span class="status-badge status-badge--{{ 'active' if managed_user.role == 'admin' else 'neutral' }}">{{ 'Administrador' if managed_user.role == 'admin' else 'Usuário' }}</span>{% endif %}
+    </header>
+    <form method="post" action="{% if managed_user %}/users/{{ managed_user.id }}{% else %}/users/new{% endif %}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <div class="settings-card__body">
+        <div class="settings-fields-grid">
+          <div class="field">
+            <label for="managed-username">Usuário</label>
+            {% if managed_user %}
+            <input id="managed-username" value="{{ managed_user.username }}" disabled>
+            <span class="field__hint">O nome de uma conta existente não pode ser alterado.</span>
+            {% else %}
+            <input id="managed-username" name="username" minlength="3" maxlength="80" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+            <span class="field__hint">Use letras, números, ponto, hífen, sublinhado ou @.</span>
+            {% endif %}
+          </div>
+          <div class="field">
+            <label for="managed-role">Perfil de acesso</label>
+            {% if managed_user and managed_user.id == user.id %}
+            <input type="hidden" name="role" value="{{ managed_user.role }}">
+            <select id="managed-role" disabled><option>Administrador</option></select>
+            <span class="field__hint">Você não pode alterar o perfil da própria conta.</span>
+            {% else %}
+            <select id="managed-role" name="role" required>
+              <option value="user" {% if not managed_user or managed_user.role == 'user' %}selected{% endif %}>Usuário — somente leitura</option>
+              <option value="admin" {% if managed_user and managed_user.role == 'admin' %}selected{% endif %}>Administrador — acesso total</option>
+            </select>
+            <span class="field__hint">Usuários comuns acessam somente Visão geral e Fila de pedidos.</span>
+            {% endif %}
+          </div>
+          {% if managed_user and managed_user.id == user.id %}
+          <div class="settings-security-note">
+            {{ icon("lock") }}
+            <div><strong>Senha da própria conta</strong><span>Para sua segurança, confirme a senha atual em <a href="/account/password">Alterar minha senha</a>.</span></div>
+          </div>
+          {% else %}
+          <div class="field">
+            <label for="managed-password">{% if managed_user %}Nova senha{% else %}Senha inicial{% endif %}</label>
+            <div class="field__control">
+              <input id="managed-password" name="{{ 'new_password' if managed_user else 'password' }}" type="password" autocomplete="new-password" {% if not managed_user %}required{% endif %}>
+              <button class="field__action field__action--icon" type="button" data-password-toggle="managed-password" data-password-label="senha" aria-label="Mostrar senha" title="Mostrar senha" aria-pressed="false"><span data-password-show>{{ icon("eye") }}</span><span data-password-hide hidden>{{ icon("eye-off") }}</span></button>
+            </div>
+            <span class="field__hint">{% if managed_user %}Deixe em branco para manter a senha atual. {% endif %}Use entre 12 e 72 bytes.</span>
+          </div>
+          <div class="field">
+            <label for="managed-password-confirmation">Confirmar senha</label>
+            <div class="field__control">
+              <input id="managed-password-confirmation" name="password_confirmation" type="password" autocomplete="new-password" {% if not managed_user %}required{% endif %}>
+              <button class="field__action field__action--icon" type="button" data-password-toggle="managed-password-confirmation" data-password-label="confirmação da senha" aria-label="Mostrar confirmação da senha" title="Mostrar senha" aria-pressed="false"><span data-password-show>{{ icon("eye") }}</span><span data-password-hide hidden>{{ icon("eye-off") }}</span></button>
+            </div>
+          </div>
+          {% endif %}
+        </div>
+        <div class="settings-security-note">{{ icon("lock") }}<div><strong>Perfis protegidos no servidor</strong><span>Esconder opções na interface não substitui a autorização; cada rota administrativa também valida a role da sessão.</span></div></div>
+      </div>
+      <footer class="settings-card__footer">
+        <span>{% if managed_user %}As alterações entram em vigor na próxima requisição do usuário.{% else %}A conta poderá entrar no sistema imediatamente.{% endif %}</span>
+        <div class="button-group"><a class="btn btn--quiet" href="/users">Cancelar</a><button class="btn btn--primary" type="submit">{{ icon("check") }} {% if managed_user %}Salvar alterações{% else %}Criar usuário{% endif %}</button></div>
+      </footer>
+    </form>
+  </section>
+</div>
+{% endblock %}

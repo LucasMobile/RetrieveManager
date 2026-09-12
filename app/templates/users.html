@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Usuários · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack users-page">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Configurações</p>
+      <h1>Usuários</h1>
+      <p class="page-header__description">Gerencie quem pode acompanhar a operação e quem possui acesso administrativo.</p>
+    </div>
+    <div class="page-header__actions">
+      <a class="btn btn--primary" href="/users/new">{{ icon("plus") }} Novo usuário</a>
+    </div>
+  </header>
+
+  <section class="surface users-summary" aria-label="Resumo dos usuários">
+    <div><strong>{{ summary.total }}</strong><span>usuário{% if summary.total != 1 %}s{% endif %} cadastrado{% if summary.total != 1 %}s{% endif %}</span></div>
+    <div><strong>{{ summary.admins }}</strong><span>administrador{% if summary.admins != 1 %}es{% endif %}</span></div>
+    <div><strong>{{ summary.regular }}</strong><span>somente acompanhamento</span></div>
+  </section>
+
+  <section class="surface units-table-card" aria-labelledby="users-title">
+    <div class="units-table-card__header">
+      <div>
+        <h2 id="users-title">Contas cadastradas</h2>
+        <p>Administradores configuram o sistema; usuários comuns possuem acesso somente de leitura à operação.</p>
+      </div>
+      <span>{{ summary.total }} conta{% if summary.total != 1 %}s{% endif %}</span>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table users-table">
+        <thead><tr><th scope="col">Usuário</th><th scope="col">Perfil</th><th scope="col">Permissões</th><th scope="col" class="align-right">Ações</th></tr></thead>
+        <tbody>
+          {% for managed_user in users %}
+          <tr>
+            <td>
+              <span class="user-identity">
+                <span class="user-identity__avatar" aria-hidden="true">{{ managed_user.username[:1]|upper }}</span>
+                <span><strong>{{ managed_user.username }}</strong>{% if managed_user.id == user.id %}<small>Conta atual</small>{% endif %}</span>
+              </span>
+            </td>
+            <td><span class="status-badge status-badge--{{ 'active' if managed_user.role == 'admin' else 'neutral' }}">{{ 'Administrador' if managed_user.role == 'admin' else 'Usuário' }}</span></td>
+            <td><span class="table-secondary">{{ 'Acesso total e alterações' if managed_user.role == 'admin' else 'Visão geral e fila, sem edição' }}</span></td>
+            <td>
+              <div class="table-actions">
+                <a class="action-icon" href="/users/{{ managed_user.id }}" data-tooltip="Editar usuário" title="Editar usuário" aria-label="Editar usuário">{{ icon("edit") }}</a>
+                <form class="inline-form" method="post" action="/users/{{ managed_user.id }}/delete" data-confirm="Excluir o usuário {{ managed_user.username }}? Essa pessoa perderá o acesso ao sistema." data-confirm-label="Excluir usuário">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                  <button class="action-icon action-icon--danger{% if managed_user.id == user.id %} is-disabled{% endif %}" type="submit" data-tooltip="{{ 'Não é possível excluir a própria conta' if managed_user.id == user.id else 'Excluir usuário' }}" title="Excluir usuário" aria-label="Excluir usuário" {% if managed_user.id == user.id %}disabled{% endif %}>{{ icon("trash") }}</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

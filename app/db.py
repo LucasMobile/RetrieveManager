@@ -192,17 +192,19 @@ def _migrate_schema() -> None:
 
 def _seed(db: Session) -> None:
     if db.scalar(select(User).limit(1)) is None:
-        db.add(User(username=ADMIN_USER, password_hash=hash_password(ADMIN_PASSWORD)))
+        db.add(
+            User(
+                username=ADMIN_USER,
+                password_hash=hash_password(ADMIN_PASSWORD),
+                role="admin",
+            )
+        )
 
     if db.scalar(select(Settings).limit(1)) is None:
-        from app.config import DEFAULT_CLOUD_URL
-
         db.add(
             Settings(
                 id=1,
-                cloud_url=DEFAULT_CLOUD_URL,
                 drop_study_prefix="SLRX",
-                file_settle_seconds=3,
             )
         )
 

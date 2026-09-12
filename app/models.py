@@ -23,16 +23,15 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), default="admin", nullable=False)
 
 
 class Settings(Base):
     __tablename__ = "settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    cloud_url: Mapped[str] = mapped_column(String(500), nullable=False)
     # Campo legado consumido uma única vez pela migração para DicomRule.
     drop_study_prefix: Mapped[str] = mapped_column(String(32), default="SLRX")
-    file_settle_seconds: Mapped[int] = mapped_column(Integer, default=3)
 
 
 class Unit(Base):
@@ -63,6 +62,8 @@ class Unit(Base):
     error_dir: Mapped[str] = mapped_column(String(500), nullable=False)
 
     token: Mapped[str] = mapped_column(String(255), default="")
+    cloud_url: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    file_settle_seconds: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
 
     move_timeout_first: Mapped[int] = mapped_column(Integer, default=600)
     move_timeout_second: Mapped[int] = mapped_column(Integer, default=900)

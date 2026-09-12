@@ -32,6 +32,8 @@ class ValidationTest(unittest.TestCase):
             "send_dir": root,
             "error_dir": root,
             "token": "unit-token",
+            "cloud_url": "https://idr.mobilemed.com.br/api/router/send-image",
+            "file_settle_seconds": "0",
             "move_timeout_first": "600",
             "move_timeout_second": "900",
             "max_parallel_moves": "2",
@@ -45,6 +47,8 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(result["orders_api_station_id"], "48")
         self.assertTrue(result["retrieve_prior_enabled"])
         self.assertEqual(result["move_timeout_prior"], 1800)
+        self.assertEqual(result["cloud_url"], "https://idr.mobilemed.com.br/api/router/send-image")
+        self.assertEqual(result["file_settle_seconds"], 0)
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):

@@ -8,7 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=2">
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>{% block title %}Retrieve Manager{% endblock %}</title>
-  <link rel="stylesheet" href="/static/app.css?v=19">
+  <link rel="stylesheet" href="/static/app.css?v=20">
   <script src="/static/app.js?v=10" defer></script>
 </head>
 <body>
@@ -34,6 +34,7 @@
       <a href="/orders" class="nav__item{% if nav == 'orders' %} is-active{% endif %}"{% if nav == 'orders' %} aria-current="page"{% endif %}>
         {{ icon("orders") }}<span>Fila de pedidos</span>
       </a>
+      {% if user and user.role == 'admin' %}
       <a href="/units" class="nav__item{% if nav == 'units' %} is-active{% endif %}"{% if nav == 'units' %} aria-current="page"{% endif %}>
         {{ icon("building") }}<span>Unidades</span>
       </a>
@@ -48,18 +49,19 @@
       <a href="/rules/compress" class="nav__item{% if nav == 'compress' %} is-active{% endif %}"{% if nav == 'compress' %} aria-current="page"{% endif %}>
         {{ icon("compress") }}<span>Compactação</span>
       </a>
-      <a href="/settings" class="nav__item{% if nav == 'settings' %} is-active{% endif %}"{% if nav == 'settings' %} aria-current="page"{% endif %}>
-        {{ icon("settings") }}<span>Nuvem e acesso</span>
+      <a href="/users" class="nav__item{% if nav == 'users' %} is-active{% endif %}"{% if nav == 'users' %} aria-current="page"{% endif %}>
+        {{ icon("users") }}<span>Usuários</span>
       </a>
+      {% endif %}
     </nav>
 
     {% if user %}
     <div class="account">
       <div class="account__avatar" aria-hidden="true">{{ user.username[:1]|upper }}</div>
-      <div class="account__copy">
+      <a class="account__copy" href="/account/password" title="Alterar minha senha">
         <strong>{{ user.username }}</strong>
-        <span>Administrador</span>
-      </div>
+        <span>{{ 'Administrador' if user.role == 'admin' else 'Usuário' }}</span>
+      </a>
       <form method="post" action="/logout">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="icon-button icon-button--inverse" type="submit" aria-label="Sair da conta" title="Sair">

@@ -9,9 +9,9 @@
       <h1>Visão geral</h1>
       <p class="page-header__description">Disponibilidade das unidades e volume em cada etapa do processamento.</p>
     </div>
-    <div class="page-header__actions">
+    {% if user.role == 'admin' %}<div class="page-header__actions">
       <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
-    </div>
+    </div>{% endif %}
   </header>
 
   <section class="poll-region" data-poll="/dashboard/partial?page={{ pager.page if pager else 1 }}" data-interval="5000" aria-live="polite" aria-label="Estado das unidades">

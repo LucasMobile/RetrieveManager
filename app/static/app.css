@@ -126,7 +126,7 @@ code { padding: .12em .35em; border: 1px solid var(--color-neutral-200); border-
   display: grid; width: 2.25rem; height: 2.25rem; place-items: center; border-radius: var(--radius-md);
   background: #254959; color: #c9e4ea; font-size: .8125rem; font-weight: 700;
 }
-.account__copy { display: grid; min-width: 0; line-height: 1.25; }
+.account__copy { display: grid; min-width: 0; color: inherit; line-height: 1.25; text-decoration: none; }
 .account__copy strong { overflow: hidden; color: var(--color-white); font-size: .8125rem; font-weight: 650; text-overflow: ellipsis; }
 .account__copy span { margin-top: .15rem; color: #829ba5; font-size: .75rem; }
 .workspace { min-width: 0; }
@@ -794,6 +794,21 @@ input[type="checkbox"] { width: 1.125rem; min-height: 1.125rem; accent-color: va
 .settings-card__footer > span { color: var(--color-neutral-600); font-size: .6875rem; }
 .settings-card__footer--access { justify-content: flex-end; }
 
+.users-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; }
+.users-summary > div { min-height: 5rem; padding: var(--space-4) var(--space-5); border-left: 1px solid var(--color-neutral-100); }
+.users-summary > div:first-child { border-left: 0; }
+.users-summary strong { display: block; font-size: 1.5rem; line-height: 1.15; }
+.users-summary span { display: block; margin-top: var(--space-1); color: var(--color-neutral-600); font-size: .75rem; }
+.users-table { min-width: 48rem; }
+.users-table th:last-child { text-align: right; }
+.user-identity { display: flex; align-items: center; gap: var(--space-3); }
+.user-identity > span:last-child { display: grid; }
+.user-identity strong { color: var(--color-neutral-950); font-size: .875rem; }
+.user-identity small { margin-top: .15rem; color: var(--color-neutral-500); font-size: .6875rem; }
+.user-identity__avatar { display: grid; width: 2rem; height: 2rem; flex: 0 0 auto; place-items: center; border-radius: var(--radius-md); background: var(--color-primary-50); color: var(--color-primary-700); font-size: .75rem; font-weight: 720; }
+.user-editor { width: min(100%, 58rem); }
+.account-password-card { width: min(100%, 38rem); }
+
 .dicom-rules-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; }
 .dicom-rules-summary > div {
   min-height: 5rem; padding: var(--space-4) var(--space-5); border-left: 1px solid var(--color-neutral-100);
@@ -963,6 +978,9 @@ input[type="checkbox"] { width: 1.125rem; min-height: 1.125rem; accent-color: va
   .page { padding-inline: var(--space-8); }
   .compression-config-grid { grid-template-columns: 1fr; }
   .settings-layout { grid-template-columns: 1fr; }
+  .users-summary { grid-template-columns: 1fr; }
+  .users-summary > div { border-top: 1px solid var(--color-neutral-100); border-left: 0; }
+  .users-summary > div:first-child { border-top: 0; }
   .unit-grid { grid-template-columns: 1fr; }
   .operation-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .operation-summary__lead { grid-column: 1 / -1; border-bottom: 1px solid var(--color-neutral-100); }

@@ -20,7 +20,6 @@ from app.pipeline import (
     run_claimed_move,
     send_unit,
 )
-from app.rules import get_settings
 from app.storescp import StoreSupervisor
 
 log = logging.getLogger("worker")
@@ -99,7 +98,6 @@ def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
         recover_stale_locks(db)
         units = list(db.scalars(select(Unit)))
         supervisor.reconcile(units)
-        settings = get_settings(db)
         for unit in units:
             if not unit.enabled:
                 continue
@@ -108,7 +106,7 @@ def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
             for order_id, kind in claim_due_moves(db, unit):
                 pool.submit(_move_job, order_id, kind)
             compact_unit(db, unit)
-            send_unit(db, unit, settings.cloud_url, settings.file_settle_seconds)
+            send_unit(db, unit, unit.cloud_url, unit.file_settle_seconds)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,12 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from app.config import ALLOWED_DATA_ROOTS, CLOUD_ALLOWED_HOSTS, IS_PRODUCTION
+from app.config import (
+    ALLOWED_DATA_ROOTS,
+    CLOUD_ALLOWED_HOSTS,
+    DEFAULT_CLOUD_URL,
+    IS_PRODUCTION,
+)
 
 _AET = re.compile(r"^[A-Za-z0-9 _-]{1,16}$")
 _HOSTNAME = re.compile(
@@ -99,6 +104,16 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
         "send_dir": validate_data_path(form.get("send_dir", ""), "Pasta de envio"),
         "error_dir": validate_data_path(form.get("error_dir", ""), "Pasta de erro"),
         "token": form.get("token", "").strip(),
+        "cloud_url": validate_cloud_url(
+            form.get("cloud_url", DEFAULT_CLOUD_URL)
+        ),
+        "file_settle_seconds": bounded_int(
+            form.get("file_settle_seconds"),
+            "Espera antes de compactar e enviar",
+            minimum=0,
+            maximum=3600,
+            default=3,
+        ),
         "move_timeout_first": bounded_int(
             form.get("move_timeout_first"),
             "Timeout do 1º C-MOVE",

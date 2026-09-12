@@ -298,7 +298,6 @@ class DicomRulesTest(unittest.TestCase):
             db.add(
                 Settings(
                     id=1,
-                    cloud_url="https://example.test",
                     drop_study_prefix="SLRX",
                 )
             )

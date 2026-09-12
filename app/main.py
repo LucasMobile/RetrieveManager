@@ -7,9 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
-from urllib.parse import urlparse
-
-from fastapi import Depends, FastAPI, Form, Query, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -22,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.config import BASE_DIR, SECRET_KEY, SESSION_HTTPS_ONLY
+from app.config import BASE_DIR, DEFAULT_CLOUD_URL, SECRET_KEY, SESSION_HTTPS_ONLY
 from app.db import get_db, init_db
 from app.dicom_rules import (
     ACTIONS,
@@ -57,7 +55,7 @@ from app.netutil import port_listening
 from app.observability import configure_logging, log_event, new_correlation_id
 from app.pager import paginate, query_keep
 from app.pipeline import folder_counts
-from app.rules import get_settings, schedule_from_now
+from app.rules import schedule_from_now
 from app.security import (
     clear_login_failures,
     csrf_token,
@@ -68,7 +66,6 @@ from app.security import (
     verify_password,
 )
 from app.validation import (
-    validate_cloud_url,
     validate_jpeg_flag,
     validate_modality,
     validate_pacs_connection,
@@ -79,6 +76,7 @@ ORDERS_PAGE = 40
 EVENTS_PAGE = 10
 UNITS_PAGE = 20
 DASH_PAGE = 8
+USER_ROLES = frozenset({"admin", "user"})
 ACTIVE_ORDER_STATUSES = frozenset({"retrieving", "retrieving_second", "receiving"})
 ACTIVE_PRIOR_STATUSES = frozenset({"queued", "retry_wait", "retrieving"})
 PRIOR_STATUS_LABELS = {
@@ -139,6 +137,12 @@ def require_user(request: Request, db: Session = Depends(get_db)) -> User:
     user = current_user(request, db)
     if user is None:
         raise LoginRedirect()
+    return user
+
+
+def require_admin(user: User = Depends(require_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Acesso exclusivo para administradores.")
     return user
 
 
@@ -230,8 +234,8 @@ async def _request_validation_error(request: Request, exc: RequestValidationErro
             "Revise os valores e tente novamente."
         ),
         action_href={
-            "/settings/password": "/settings",
-            "/settings": "/settings",
+            "/account/password": "/account/password",
+            "/users/new": "/users/new",
             "/rules/retrieve": "/rules/retrieve",
             "/rules/compress": "/rules/compress",
             "/rules/drop": "/rules/compress",
@@ -540,7 +544,7 @@ def units_list(
     request: Request,
     page: int = 1,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     total = db.scalar(select(func.count()).select_from(Unit)) or 0
     enabled = (
@@ -573,12 +577,14 @@ def units_list(
 
 @app.get("/units/new", response_class=HTMLResponse)
 def units_new(
-    request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
+    request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
     return templates.TemplateResponse(
         request=request,
         name="units_form.html",
-        context=ctx(request, db, "units", unit=None),
+        context=ctx(
+            request, db, "units", unit=None, default_cloud_url=DEFAULT_CLOUD_URL
+        ),
     )
 
 
@@ -608,6 +614,8 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
         obj.token = token
     elif unit is None:
         obj.token = ""
+    obj.cloud_url = str(form["cloud_url"])
+    obj.file_settle_seconds = int(form["file_settle_seconds"])
     obj.move_timeout_first = int(form["move_timeout_first"])
     obj.move_timeout_second = int(form["move_timeout_second"])
     obj.max_parallel_moves = int(form["max_parallel_moves"])
@@ -626,7 +634,7 @@ def _port_taken(db: Session, port: int, unit_id: int | None) -> bool:
 
 @app.post("/units/new")
 async def units_create(
-    request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
+    request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
     raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
     try:
@@ -669,7 +677,7 @@ async def units_create(
 @app.post("/units/test-echo")
 async def units_test_echo(
     request: Request,
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
     try:
@@ -742,7 +750,7 @@ def units_edit(
     unit_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
     if unit is None:
@@ -750,7 +758,9 @@ def units_edit(
     return templates.TemplateResponse(
         request=request,
         name="units_form.html",
-        context=ctx(request, db, "units", unit=unit),
+        context=ctx(
+            request, db, "units", unit=unit, default_cloud_url=DEFAULT_CLOUD_URL
+        ),
     )
 
 
@@ -759,7 +769,7 @@ async def units_update(
     unit_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
     if unit is None:
@@ -798,7 +808,7 @@ def units_toggle(
     unit_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
     if unit:
@@ -813,7 +823,7 @@ def units_delete(
     unit_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
     if unit:
@@ -838,7 +848,7 @@ def units_retry_errors(
     unit_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
     if unit is None:
@@ -903,7 +913,7 @@ def rules_dicom(
     request: Request,
     edit: int | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rules = _dicom_rule_views(db)
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
@@ -941,7 +951,7 @@ def rules_dicom(
 @app.get("/rules/tag-info")
 def rules_dicom_tag_info(
     tag: str = Query(..., min_length=1, max_length=32),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     try:
         normalized = normalize_dicom_tag(tag)
@@ -1005,7 +1015,7 @@ def _store_dicom_rule(db: Session, rule: DicomRule, data: dict[str, Any]) -> Non
 async def rules_dicom_create(
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     try:
         data = _validated_dicom_rule_form(db, await request.form())
@@ -1034,7 +1044,7 @@ async def rules_dicom_update(
     rule_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(DicomRule, rule_id)
     if rule is None:
@@ -1066,7 +1076,7 @@ def rules_dicom_toggle(
     rule_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(DicomRule, rule_id)
     if rule is not None:
@@ -1081,7 +1091,7 @@ def rules_dicom_delete(
     rule_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(DicomRule, rule_id)
     if rule is not None:
@@ -1098,7 +1108,7 @@ def rules_dicom_delete(
 
 @app.get("/rules/retrieve", response_class=HTMLResponse)
 def rules_retrieve(
-    request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
+    request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
     rules = list(db.scalars(select(ModalityRule).order_by(ModalityRule.modality)))
     default_rule = next((rule for rule in rules if rule.modality == "*"), None)
@@ -1127,7 +1137,7 @@ def rules_retrieve_add(
     second_retrieve: Literal["0", "1"] = Form("0"),
     second_wait_minutes: int = Form(90, ge=0, le=2880),
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     try:
         safe_modality = validate_modality(modality)
@@ -1160,7 +1170,7 @@ def rules_retrieve_update(
     second_retrieve: Literal["0", "1"] = Form("0"),
     second_wait_minutes: int = Form(90, ge=0, le=2880),
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(ModalityRule, rule_id)
     if rule:
@@ -1189,7 +1199,7 @@ def rules_retrieve_delete(
     rule_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(ModalityRule, rule_id)
     if rule is None:
@@ -1217,7 +1227,7 @@ def rules_retrieve_delete(
 
 @app.get("/rules/compress", response_class=HTMLResponse)
 def rules_compress(
-    request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
+    request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
     compress = list(db.scalars(select(CompressRule).order_by(CompressRule.modality)))
     drops = list(db.scalars(select(DropModality).order_by(DropModality.code)))
@@ -1247,7 +1257,7 @@ def rules_compress_add(
     modality: str = Form(...),
     jpeg_flag: str = Form(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     try:
         safe_modality = validate_modality(modality)
@@ -1272,7 +1282,7 @@ def rules_compress_update(
     modality: str = Form(...),
     jpeg_flag: str = Form(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(CompressRule, rule_id)
     if rule:
@@ -1299,7 +1309,7 @@ def rules_compress_delete(
     rule_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     rule = db.get(CompressRule, rule_id)
     if rule is None:
@@ -1351,7 +1361,7 @@ def rules_drop_add(
     request: Request,
     code: str = Form(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     try:
         safe_code = validate_modality(code)
@@ -1376,7 +1386,7 @@ def rules_drop_delete(
     drop_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     row = db.get(DropModality, drop_id)
     if row:
@@ -1593,7 +1603,7 @@ def order_retry(
     order_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
     if (
@@ -1628,7 +1638,7 @@ def order_retry_prior(
     order_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
     if order is None:
@@ -1702,7 +1712,7 @@ def order_cancel(
     order_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
     if order and order.status not in ("done", "cancelled"):
@@ -1729,7 +1739,7 @@ def order_delete(
     order_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(require_user),
+    user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
     if order is None:
@@ -1758,65 +1768,263 @@ def order_delete(
     return RedirectResponse("/orders", status_code=303)
 
 
-@app.get("/settings", response_class=HTMLResponse)
-def settings_page(
-    request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)
+def _normalize_username(value: str) -> str:
+    username = value.strip()
+    if not 3 <= len(username) <= 80:
+        raise ValueError("O usuário deve ter entre 3 e 80 caracteres.")
+    if not all(char.isalnum() or char in "._-@" for char in username):
+        raise ValueError(
+            "O usuário aceita apenas letras, números, ponto, hífen, sublinhado e @."
+        )
+    return username
+
+
+def _validate_password(password: str, confirmation: str) -> None:
+    if password != confirmation:
+        raise ValueError("A confirmação da senha não confere.")
+    password_bytes = len(password.encode("utf-8"))
+    if not 12 <= password_bytes <= 72:
+        raise ValueError("A senha deve ter entre 12 e 72 bytes.")
+
+
+def _admin_count(db: Session) -> int:
+    return (
+        db.scalar(select(func.count()).select_from(User).where(User.role == "admin"))
+        or 0
+    )
+
+
+@app.get("/settings")
+def settings_redirect(user: User = Depends(require_admin)):
+    return RedirectResponse("/users", status_code=303)
+
+
+@app.get("/users", response_class=HTMLResponse)
+def users_list(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
 ):
-    settings = get_settings(db)
-    settings_summary = {
-        "cloud_host": urlparse(settings.cloud_url).hostname or "Não configurado",
-        "settle_seconds": settings.file_settle_seconds,
-    }
+    users = list(db.scalars(select(User).order_by(User.username)))
+    admin_count = sum(item.role == "admin" for item in users)
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="users.html",
         context=ctx(
             request,
             db,
-            "settings",
-            settings=settings,
-            settings_summary=settings_summary,
+            "users",
+            users=users,
+            summary={
+                "total": len(users),
+                "admins": admin_count,
+                "regular": len(users) - admin_count,
+            },
         ),
     )
 
 
-@app.post("/settings")
-def settings_save(
+@app.get("/users/new", response_class=HTMLResponse)
+def users_new(
     request: Request,
-    cloud_url: str = Form(..., min_length=1, max_length=500),
-    file_settle_seconds: int = Form(3, ge=0, le=3600),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    return templates.TemplateResponse(
+        request=request,
+        name="user_form.html",
+        context=ctx(request, db, "users", managed_user=None),
+    )
+
+
+@app.post("/users/new")
+def users_create(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    password_confirmation: str = Form(...),
+    role: str = Form(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    try:
+        clean_username = _normalize_username(username)
+        _validate_password(password, password_confirmation)
+        if role not in USER_ROLES:
+            raise ValueError("Perfil de acesso inválido.")
+    except ValueError as exc:
+        flash(request, str(exc), "err")
+        return RedirectResponse("/users/new", status_code=303)
+    if db.scalar(select(User).where(User.username == clean_username)) is not None:
+        flash(request, "Já existe um usuário com esse nome.", "err")
+        return RedirectResponse("/users/new", status_code=303)
+    managed_user = User(
+        username=clean_username,
+        password_hash=hash_password(password),
+        role=role,
+    )
+    db.add(managed_user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        flash(request, "Já existe um usuário com esse nome.", "err")
+        return RedirectResponse("/users/new", status_code=303)
+    log_event(
+        log,
+        logging.INFO,
+        "user.create",
+        resource=f"user:{managed_user.id}",
+        status="success",
+        user_id=user.id,
+        managed_user_id=managed_user.id,
+        managed_user_role=managed_user.role,
+    )
+    flash(request, "Usuário criado.")
+    return RedirectResponse("/users", status_code=303)
+
+
+@app.get("/users/{managed_user_id}", response_class=HTMLResponse)
+def users_edit(
+    managed_user_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    managed_user = db.get(User, managed_user_id)
+    if managed_user is None:
+        return RedirectResponse("/users", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="user_form.html",
+        context=ctx(request, db, "users", managed_user=managed_user),
+    )
+
+
+@app.post("/users/{managed_user_id}")
+def users_update(
+    managed_user_id: int,
+    request: Request,
+    role: str = Form(...),
+    new_password: str = Form(""),
+    password_confirmation: str = Form(""),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    managed_user = db.get(User, managed_user_id)
+    if managed_user is None:
+        return RedirectResponse("/users", status_code=303)
+    if role not in USER_ROLES:
+        flash(request, "Perfil de acesso inválido.", "err")
+        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+    if managed_user.id == user.id and role != managed_user.role:
+        flash(request, "Você não pode alterar o perfil da própria conta.", "err")
+        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+    if managed_user.id == user.id and (new_password or password_confirmation):
+        flash(
+            request,
+            "Use a opção Alterar minha senha para modificar a própria senha.",
+            "err",
+        )
+        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+    if managed_user.role == "admin" and role != "admin" and _admin_count(db) <= 1:
+        flash(request, "O sistema precisa manter pelo menos um administrador.", "err")
+        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+    if new_password or password_confirmation:
+        try:
+            _validate_password(new_password, password_confirmation)
+        except ValueError as exc:
+            flash(request, str(exc), "err")
+            return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+        managed_user.password_hash = hash_password(new_password)
+    managed_user.role = role
+    db.commit()
+    log_event(
+        log,
+        logging.INFO,
+        "user.update",
+        resource=f"user:{managed_user.id}",
+        status="success",
+        user_id=user.id,
+        managed_user_id=managed_user.id,
+        managed_user_role=managed_user.role,
+        password_reset=bool(new_password),
+    )
+    flash(request, "Usuário atualizado.")
+    return RedirectResponse("/users", status_code=303)
+
+
+@app.post("/users/{managed_user_id}/delete")
+def users_delete(
+    managed_user_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    managed_user = db.get(User, managed_user_id)
+    if managed_user is None:
+        return RedirectResponse("/users", status_code=303)
+    if managed_user.id == user.id:
+        flash(request, "Você não pode excluir a própria conta.", "err")
+        return RedirectResponse("/users", status_code=303)
+    if managed_user.role == "admin" and _admin_count(db) <= 1:
+        flash(request, "O sistema precisa manter pelo menos um administrador.", "err")
+        return RedirectResponse("/users", status_code=303)
+    deleted_user_id = managed_user.id
+    db.delete(managed_user)
+    db.commit()
+    log_event(
+        log,
+        logging.INFO,
+        "user.delete",
+        resource=f"user:{deleted_user_id}",
+        status="success",
+        user_id=user.id,
+        managed_user_id=deleted_user_id,
+    )
+    flash(request, "Usuário excluído.")
+    return RedirectResponse("/users", status_code=303)
+
+
+@app.get("/account/password", response_class=HTMLResponse)
+def account_password_page(
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
-    settings = get_settings(db)
-    try:
-        safe_cloud_url = validate_cloud_url(cloud_url)
-    except ValueError as exc:
-        flash(request, str(exc), "err")
-        return RedirectResponse("/settings", status_code=303)
-    settings.cloud_url = safe_cloud_url
-    settings.file_settle_seconds = file_settle_seconds
-    db.commit()
-    flash(request, "Configuração da nuvem salva.")
-    return RedirectResponse("/settings", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="account_password.html",
+        context=ctx(request, db, "account"),
+    )
 
 
-@app.post("/settings/password")
-def settings_password(
+@app.post("/account/password")
+def account_password_update(
     request: Request,
     current: str = Form(...),
     new_password: str = Form(...),
+    password_confirmation: str = Form(...),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
     if not verify_password(current, user.password_hash):
         flash(request, "Senha atual incorreta.", "err")
-        return RedirectResponse("/settings", status_code=303)
-    password_bytes = len(new_password.encode("utf-8"))
-    if password_bytes < 12 or password_bytes > 72:
-        flash(request, "A nova senha deve ter entre 12 e 72 bytes.", "err")
-        return RedirectResponse("/settings", status_code=303)
+        return RedirectResponse("/account/password", status_code=303)
+    try:
+        _validate_password(new_password, password_confirmation)
+    except ValueError as exc:
+        flash(request, str(exc), "err")
+        return RedirectResponse("/account/password", status_code=303)
     user.password_hash = hash_password(new_password)
     db.commit()
+    log_event(
+        log,
+        logging.INFO,
+        "user.password_change",
+        resource=f"user:{user.id}",
+        status="success",
+        user_id=user.id,
+    )
     flash(request, "Senha atualizada.")
-    return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/account/password", status_code=303)
