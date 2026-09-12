@@ -612,7 +612,7 @@ input[type="checkbox"] { width: 1.125rem; min-height: 1.125rem; accent-color: va
 .retrieve-attempt.is-off > span strong { color: var(--color-neutral-600); }
 .retrieve-switch { position: relative; width: 2.625rem; height: 1.5rem; flex: 0 0 auto; padding: 0; border: 0; border-radius: 999px; background: #aebbc1; cursor: pointer; }
 .retrieve-switch::after { position: absolute; top: .1875rem; left: .1875rem; width: 1.125rem; height: 1.125rem; border-radius: 50%; background: var(--color-white); box-shadow: 0 1px 3px rgb(16 35 47 / 25%); content: ""; transition: transform 140ms ease; }
-.retrieve-switch[aria-checked="true"] { background: var(--color-success-700); }
+.retrieve-switch[aria-checked="true"] { background: var(--color-primary-700); }
 .retrieve-switch[aria-checked="true"]::after { transform: translateX(1.125rem); }
 .retrieve-rule-actions { gap: .1875rem; }
 .retrieve-rules-note { min-height: 3.875rem; display: flex; align-items: center; gap: var(--space-2); padding: 0 var(--space-6); color: var(--color-neutral-600); background: #fbfcfc; border-top: 1px solid var(--color-neutral-100); font-size: .6875rem; }

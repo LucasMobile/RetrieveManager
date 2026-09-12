@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
+
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -137,6 +139,7 @@ def require_user(request: Request, db: Session = Depends(get_db)) -> User:
     user = current_user(request, db)
     if user is None:
         raise LoginRedirect()
+    request.state.user = user
     return user
 
 
@@ -267,7 +270,7 @@ async def _unexpected_error(request: Request, _exc: Exception):
 
 
 def ctx(request: Request, db: Session, nav: str, **extra: Any) -> dict:
-    user = current_user(request, db)
+    user = getattr(request.state, "user", None) or current_user(request, db)
     data = {"request": request, "user": user, "nav": nav, "flash": _flash(request)}
     data.update(extra)
     return data
@@ -375,17 +378,11 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
-def _unit_view(unit: Unit, counts: tuple[int, int, int, int]) -> Unit:
-    watching, queue, running, errors = counts
-    unit.counts = {  # type: ignore[attr-defined]
-        "watching": watching,
-        "queue": queue,
-        "running": running,
-        "error": errors,
-    }
-    unit.folders = folder_counts(unit)  # type: ignore[attr-defined]
-    unit.store_up = port_listening(unit.store_port) if unit.enabled else False  # type: ignore[attr-defined]
-    return unit
+def _unit_runtime(unit: Unit) -> tuple[dict[str, int], bool]:
+    return (
+        folder_counts(unit),
+        port_listening(unit.store_port) if unit.enabled else False,
+    )
 
 
 def _dashboard_units(
@@ -501,7 +498,22 @@ def _dashboard_units(
         "running": int(summary_counts[2] or 0),
         "error": int(summary_counts[3] or 0),
     }
-    views = [_unit_view(unit, stats.get(unit.id, (0, 0, 0, 0))) for unit in units]
+    if units:
+        with ThreadPoolExecutor(max_workers=len(units)) as executor:
+            runtime = list(executor.map(_unit_runtime, units))
+        for unit, (folders, store_up) in zip(units, runtime, strict=True):
+            unit.folders = folders  # type: ignore[attr-defined]
+            unit.store_up = store_up  # type: ignore[attr-defined]
+    views = []
+    for unit in units:
+        watching, queue, running, errors = stats.get(unit.id, (0, 0, 0, 0))
+        unit.counts = {  # type: ignore[attr-defined]
+            "watching": watching,
+            "queue": queue,
+            "running": running,
+            "error": errors,
+        }
+        views.append(unit)
     return views, pager, summary
 
 

@@ -485,6 +485,13 @@ class SecurityTest(unittest.TestCase):
             )
             self.assertEqual(response.headers["cache-control"], "no-store")
 
+        static_response = self.client.get("/static/app.css")
+        self.assertEqual(static_response.status_code, 200)
+        self.assertEqual(
+            static_response.headers["cache-control"],
+            "public, max-age=31536000, immutable",
+        )
+
     def test_echo_header_keeps_multipart_form_readable(self):
         self.login()
         token = self.token("/units/new")

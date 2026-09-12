@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -113,6 +114,27 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(active_view.counts["queue"], 3)
             self.assertEqual(active_view.counts["running"], 1)
             self.assertEqual(active_view.counts["error"], 2)
+
+    def test_unit_runtime_checks_run_concurrently(self):
+        barrier = threading.Barrier(2)
+
+        def wait_for_other_check(_port):
+            barrier.wait(timeout=2)
+            return True
+
+        with self.Session() as db:
+            db.add_all(
+                [
+                    self._unit("A", enabled=True),
+                    self._unit("B", enabled=True),
+                ]
+            )
+            db.commit()
+            with patch("app.main.port_listening", side_effect=wait_for_other_check):
+                units, _pager, _summary = _dashboard_units(db, 1)
+
+        self.assertEqual(len(units), 2)
+        self.assertTrue(all(unit.store_up for unit in units))
 
 
 if __name__ == "__main__":

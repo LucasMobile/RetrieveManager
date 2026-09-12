@@ -110,7 +110,9 @@ def apply_security_headers(request: Request, response: Response) -> Response:
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    if not request.url.path.startswith("/static/"):
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
         response.headers["Cache-Control"] = "no-store"
     if request.url.scheme == "https" or PUBLIC_ORIGIN.startswith("https://"):
         response.headers["Strict-Transport-Security"] = (
