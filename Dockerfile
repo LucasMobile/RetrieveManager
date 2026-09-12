@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm AS python-builder
+FROM python:3.14-slim-bookworm AS python-builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
@@ -8,7 +8,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 
-FROM python:3.12-slim-bookworm AS dcmtk-builder
+FROM python:3.14-slim-bookworm AS dcmtk-builder
 
 ARG DCMTK_VERSION=3.7.0
 ARG DCMTK_URL=https://dicom.offis.de/download/dcmtk/release/bin/dcmtk-3.7.0-linux-x86_64.tar.bz2
@@ -48,7 +48,7 @@ RUN if [ -f "/tmp/vendor/dcmtk-${DCMTK_VERSION}-linux-x86_64.tar.bz2" ]; then \
     && /opt/dcmtk/bin/dcmcjpeg --version
 
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

@@ -33,19 +33,19 @@ docker compose up -d --build
 
 ### Servidor sem acesso ao Docker Hub
 
-O erro `lookup registry-1.docker.io: i/o timeout` **não é do Dockerfile**. O host não resolve/alcança `registry-1.docker.io`, então não baixa `python:3.12-slim-bookworm`.
+O erro `lookup registry-1.docker.io: i/o timeout` **não é do Dockerfile**. O host não resolve/alcança `registry-1.docker.io`, então não baixa `python:3.14-slim-bookworm`.
 
 Em uma máquina **com internet**:
 
 ```bash
-docker pull python:3.12-slim-bookworm
-docker save python:3.12-slim-bookworm | gzip > python-3.12-slim-bookworm.tar.gz
+docker pull python:3.14-slim-bookworm
+docker save python:3.14-slim-bookworm | gzip > python-3.14-slim-bookworm.tar.gz
 ```
 
 No servidor:
 
 ```bash
-gunzip -c python-3.12-slim-bookworm.tar.gz | docker load
+gunzip -c python-3.14-slim-bookworm.tar.gz | docker load
 cd /opt/retrieve-manager
 COMPOSE_BAKE=false docker compose -p retrieve up -d --build
 ```
@@ -126,7 +126,7 @@ Saúde e logs:
 - O worker possui healthcheck por heartbeat atualizado a cada ciclo.
 - `docker compose logs -f web worker`: eventos JSON com `correlation_id`.
 
-DICOM no container: **DCMTK 3.7.0** (`findscu`, `movescu`, `storescp`, `dcmcjpeg`) — sem dcm4che e sem binário no host. Python na imagem: pydicom 3.0.2 e aiohttp 3.14.3.
+DICOM no container: **DCMTK 3.7.0** (`findscu`, `movescu`, `storescp`, `dcmcjpeg`) — sem dcm4che e sem binário no host. A imagem usa Python 3.14, pydicom 3.0.2 e aiohttp 3.14.3.
 
 ## Desenvolvimento (Windows / sem Docker)
 
