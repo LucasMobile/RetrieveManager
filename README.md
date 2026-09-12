@@ -196,4 +196,22 @@ seus tempos e eventual segundo retrieve não se aplicam aos exames anteriores.
 | MR | 15 min | 90 min |
 | * (demais) | 10 min | não |
 
-Descarte no recebimento (editável): PR, PS, SG, SR, RA, US. StudyID `SLRX…` também é apagado.
+Descarte no recebimento por modalidade (editável): PR, PS, SG, SR, RA, US.
+
+## Regras DICOM
+
+A página **Regras** permite avaliar tags DICOM padrão antes da compactação. Cada
+regra pode ser vinculada a uma ou mais unidades, recebe uma prioridade e combina
+suas condições com **E** ou **OU**. As comparações não diferenciam maiúsculas de
+minúsculas.
+
+Operadores disponíveis: igual, diferente, existe, não existe, contém, começa com,
+termina com e começa com seguido por números. As ações podem excluir a imagem,
+substituir/preencher o valor de uma tag padrão ou remover uma tag. Regras com menor
+prioridade numérica executam primeiro; uma exclusão encerra o processamento daquele
+arquivo. As aplicações ficam associadas ao registro da imagem para auditoria.
+
+Na primeira inicialização após a atualização, o prefixo de Study ID configurado
+anteriormente é convertido em uma regra para as unidades existentes. Para `SLRX`,
+o comportamento preservado corresponde a Study IDs iniciados por `SLRX` e seguidos
+por números. O descarte simples por modalidade permanece em **Compactação**.

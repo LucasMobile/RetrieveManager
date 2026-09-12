@@ -5,8 +5,11 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+from app.dicom_rules import RuleMatch
 from app.models import (
     Base,
+    DicomRule,
+    DicomRuleApplication,
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
@@ -210,6 +213,55 @@ class TransferTrackingTest(unittest.TestCase):
             link = db.scalar(select(HistoricalImageLink))
             self.assertIsNotNone(link)
             self.assertEqual(link.historical_study_id, study.id)
+
+    def test_applied_dicom_rule_is_audited_on_transfer(self):
+        with self.Session() as db:
+            unit = Unit(
+                name="unit",
+                orders_api_url="https://integracao.example/v1/pedidos",
+                orders_api_token="integration-token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir="/receive",
+                send_dir="/send",
+                error_dir="/error",
+                token="token",
+            )
+            db.add(unit)
+            db.flush()
+            dicom_rule = DicomRule(
+                name="Descartar SLRX",
+                enabled=True,
+                priority=10,
+                combinator="and",
+                action="delete",
+            )
+            db.add(dicom_rule)
+            db.flush()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "image",
+                    "",
+                    "1.2.3",
+                    "discarded_rule",
+                    rule_matches=(
+                        RuleMatch(dicom_rule.id, dicom_rule.name, "delete"),
+                    ),
+                ),
+            )
+            db.commit()
+
+            application = db.scalar(select(DicomRuleApplication))
+            self.assertIsNotNone(application)
+            self.assertEqual(application.rule_id, dicom_rule.id)
+            self.assertEqual(application.rule_name, "Descartar SLRX")
+            self.assertEqual(application.action, "delete")
 
 
 if __name__ == "__main__":

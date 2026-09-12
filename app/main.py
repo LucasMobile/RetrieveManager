@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -25,11 +24,25 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import BASE_DIR, SECRET_KEY, SESSION_HTTPS_ONLY
 from app.db import get_db, init_db
+from app.dicom_rules import (
+    ACTIONS,
+    COMBINATORS,
+    OPERATORS,
+    VALUELESS_OPERATORS,
+    dicom_tag_name,
+    migrate_legacy_study_rule,
+    normalize_dicom_tag,
+    validate_rule_payload,
+)
 from app.dicom_tools import ToolMissing, c_echo
 from app.middleware import apply_security_headers, request_middleware
 from app.models import (
     STATUSES,
     CompressRule,
+    DicomRule,
+    DicomRuleApplication,
+    DicomRuleCondition,
+    DicomRuleUnit,
     DropModality,
     HistoricalImageLink,
     HistoricalStudy,
@@ -222,6 +235,7 @@ async def _request_validation_error(request: Request, exc: RequestValidationErro
             "/rules/retrieve": "/rules/retrieve",
             "/rules/compress": "/rules/compress",
             "/rules/drop": "/rules/compress",
+            "/rules": "/rules",
             "/login": "/login",
         }.get(request.url.path, "/"),
         action_label="Voltar",
@@ -641,6 +655,8 @@ async def units_create(
     unit = _unit_from_form(form, None)
     db.add(unit)
     try:
+        db.flush()
+        migrate_legacy_study_rule(db)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -801,6 +817,11 @@ def units_delete(
 ):
     unit = db.get(Unit, unit_id)
     if unit:
+        db.execute(
+            delete(DicomRuleApplication).where(
+                DicomRuleApplication.unit_id == unit.id
+            )
+        )
         db.execute(delete(ImageTransfer).where(ImageTransfer.unit_id == unit.id))
         ids = list(db.scalars(select(Order.id).where(Order.unit_id == unit.id)))
         if ids:
@@ -833,6 +854,246 @@ def units_retry_errors(
                 moved += 1
     flash(request, f"{moved} arquivo(s) devolvidos ao recebimento.")
     return RedirectResponse(f"/units/{unit_id}", status_code=303)
+
+
+def _dicom_rule_views(db: Session) -> list[DicomRule]:
+    rules = list(
+        db.scalars(
+            select(DicomRule)
+            .options(
+                selectinload(DicomRule.conditions),
+                selectinload(DicomRule.unit_links).selectinload(DicomRuleUnit.unit),
+            )
+            .order_by(DicomRule.priority, DicomRule.id)
+        )
+    )
+    application_counts = dict(
+        db.execute(
+            select(DicomRuleApplication.rule_id, func.count())
+            .where(DicomRuleApplication.rule_id.is_not(None))
+            .group_by(DicomRuleApplication.rule_id)
+        ).all()
+    )
+    for rule in rules:
+        rule.unit_names = [  # type: ignore[attr-defined]
+            link.unit.name for link in rule.unit_links if link.unit is not None
+        ]
+        rule.action_label = ACTIONS.get(rule.action, rule.action)  # type: ignore[attr-defined]
+        rule.combinator_label = COMBINATORS.get(  # type: ignore[attr-defined]
+            rule.combinator, rule.combinator
+        )
+        rule.action_tag_name = (  # type: ignore[attr-defined]
+            dicom_tag_name(rule.action_tag) if rule.action_tag else ""
+        )
+        rule.application_count = int(  # type: ignore[attr-defined]
+            application_counts.get(rule.id, 0)
+        )
+        for condition in rule.conditions:
+            condition.tag_name = dicom_tag_name(  # type: ignore[attr-defined]
+                condition.tag
+            )
+            condition.operator_label = OPERATORS.get(  # type: ignore[attr-defined]
+                condition.operator, condition.operator
+            )
+    return rules
+
+
+@app.get("/rules", response_class=HTMLResponse)
+def rules_dicom(
+    request: Request,
+    edit: int | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    rules = _dicom_rule_views(db)
+    units = list(db.scalars(select(Unit).order_by(Unit.name)))
+    edit_rule = next((rule for rule in rules if rule.id == edit), None)
+    return templates.TemplateResponse(
+        request=request,
+        name="rules_dicom.html",
+        context=ctx(
+            request,
+            db,
+            "rules",
+            rules=rules,
+            units=units,
+            edit_rule=edit_rule,
+            operators=OPERATORS,
+            combinators=COMBINATORS,
+            actions=ACTIONS,
+            valueless_operators=VALUELESS_OPERATORS,
+            summary={
+                "total": len(rules),
+                "active": sum(rule.enabled for rule in rules),
+                "units": len(
+                    {
+                        link.unit_id
+                        for rule in rules
+                        if rule.enabled
+                        for link in rule.unit_links
+                    }
+                ),
+            },
+        ),
+    )
+
+
+@app.get("/rules/tag-info")
+def rules_dicom_tag_info(
+    tag: str = Query(..., min_length=1, max_length=32),
+    user: User = Depends(require_user),
+):
+    try:
+        normalized = normalize_dicom_tag(tag)
+        return {"ok": True, "tag": normalized, "name": dicom_tag_name(normalized)}
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+
+
+def _validated_dicom_rule_form(db: Session, form: Any) -> dict[str, Any]:
+    valid_unit_ids = set(db.scalars(select(Unit.id)))
+    return validate_rule_payload(
+        name=str(form.get("name") or ""),
+        enabled=form.get("enabled") == "1",
+        priority=str(form.get("priority") or ""),
+        combinator=str(form.get("combinator") or ""),
+        action=str(form.get("action") or ""),
+        action_tag=str(form.get("action_tag") or ""),
+        action_value=str(form.get("action_value") or ""),
+        unit_ids=[str(value) for value in form.getlist("unit_ids")],
+        condition_tags=[str(value) for value in form.getlist("condition_tag")],
+        condition_operators=[
+            str(value) for value in form.getlist("condition_operator")
+        ],
+        condition_values=[
+            str(value) for value in form.getlist("condition_value")
+        ],
+        valid_unit_ids=valid_unit_ids,
+    )
+
+
+def _store_dicom_rule(db: Session, rule: DicomRule, data: dict[str, Any]) -> None:
+    rule.name = data["name"]
+    rule.enabled = data["enabled"]
+    rule.priority = data["priority"]
+    rule.combinator = data["combinator"]
+    rule.action = data["action"]
+    rule.action_tag = data["action_tag"]
+    rule.action_value = data["action_value"]
+    db.add(rule)
+    db.flush()
+    db.execute(delete(DicomRuleCondition).where(DicomRuleCondition.rule_id == rule.id))
+    db.execute(delete(DicomRuleUnit).where(DicomRuleUnit.rule_id == rule.id))
+    db.flush()
+    db.add_all(
+        DicomRuleCondition(
+            rule_id=rule.id,
+            position=position,
+            tag=condition["tag"],
+            operator=condition["operator"],
+            value=condition["value"],
+        )
+        for position, condition in enumerate(data["conditions"])
+    )
+    db.add_all(
+        DicomRuleUnit(rule_id=rule.id, unit_id=unit_id)
+        for unit_id in data["unit_ids"]
+    )
+
+
+@app.post("/rules")
+async def rules_dicom_create(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    try:
+        data = _validated_dicom_rule_form(db, await request.form())
+        rule = DicomRule()
+        _store_dicom_rule(db, rule, data)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        flash(request, str(exc), "err")
+        return RedirectResponse("/rules", status_code=303)
+    log_event(
+        log,
+        logging.INFO,
+        "dicom.rule.create",
+        resource=f"dicom-rule:{rule.id}",
+        status="success",
+        rule_id=rule.id,
+        user_id=user.id,
+    )
+    flash(request, "Regra DICOM criada.")
+    return RedirectResponse("/rules", status_code=303)
+
+
+@app.post("/rules/dicom/{rule_id}")
+async def rules_dicom_update(
+    rule_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    rule = db.get(DicomRule, rule_id)
+    if rule is None:
+        flash(request, "Regra não encontrada.", "err")
+        return RedirectResponse("/rules", status_code=303)
+    try:
+        data = _validated_dicom_rule_form(db, await request.form())
+        _store_dicom_rule(db, rule, data)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        flash(request, str(exc), "err")
+        return RedirectResponse(f"/rules?edit={rule_id}", status_code=303)
+    log_event(
+        log,
+        logging.INFO,
+        "dicom.rule.update",
+        resource=f"dicom-rule:{rule.id}",
+        status="success",
+        rule_id=rule.id,
+        user_id=user.id,
+    )
+    flash(request, "Regra DICOM atualizada.")
+    return RedirectResponse("/rules", status_code=303)
+
+
+@app.post("/rules/dicom/{rule_id}/toggle")
+def rules_dicom_toggle(
+    rule_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    rule = db.get(DicomRule, rule_id)
+    if rule is not None:
+        rule.enabled = not rule.enabled
+        db.commit()
+        flash(request, "Regra ativada." if rule.enabled else "Regra desativada.")
+    return RedirectResponse("/rules", status_code=303)
+
+
+@app.post("/rules/dicom/{rule_id}/delete")
+def rules_dicom_delete(
+    rule_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    rule = db.get(DicomRule, rule_id)
+    if rule is not None:
+        db.execute(
+            update(DicomRuleApplication)
+            .where(DicomRuleApplication.rule_id == rule.id)
+            .values(rule_id=None)
+        )
+        db.delete(rule)
+        db.commit()
+        flash(request, "Regra DICOM excluída.")
+    return RedirectResponse("/rules", status_code=303)
 
 
 @app.get("/rules/retrieve", response_class=HTMLResponse)
@@ -1504,7 +1765,6 @@ def settings_page(
     settings = get_settings(db)
     settings_summary = {
         "cloud_host": urlparse(settings.cloud_url).hostname or "Não configurado",
-        "drop_prefix": settings.drop_study_prefix or "—",
         "settle_seconds": settings.file_settle_seconds,
     }
     return templates.TemplateResponse(
@@ -1524,7 +1784,6 @@ def settings_page(
 def settings_save(
     request: Request,
     cloud_url: str = Form(..., min_length=1, max_length=500),
-    drop_study_prefix: str = Form("SLRX"),
     file_settle_seconds: int = Form(3, ge=0, le=3600),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
@@ -1535,12 +1794,7 @@ def settings_save(
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/settings", status_code=303)
-    prefix = drop_study_prefix.strip().upper()
-    if prefix and not re.fullmatch(r"[A-Z0-9_-]{1,32}", prefix):
-        flash(request, "Prefixo de StudyID inválido.", "err")
-        return RedirectResponse("/settings", status_code=303)
     settings.cloud_url = safe_cloud_url
-    settings.drop_study_prefix = prefix
     settings.file_settle_seconds = file_settle_seconds
     db.commit()
     flash(request, "Configuração da nuvem salva.")

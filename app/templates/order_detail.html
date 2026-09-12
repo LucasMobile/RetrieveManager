@@ -89,7 +89,7 @@
                 <td>{{ study.study_date or '—' }}</td>
                 <td><span class="table-primary mono">{{ study.accession or 'Sem accession' }}</span><span class="table-secondary mono">{{ study.study_uid }}</span>{% if study.description %}<span class="table-secondary">{{ study.description }}</span>{% endif %}</td>
                 <td><span class="modality-mark">{{ study.modality or '—' }}</span><span class="table-secondary">{{ study.body_part or 'Não informado' }}</span></td>
-                <td><span class="table-primary">{{ study.image_total }}</span><span class="table-secondary">Enviadas {{ study.image_counts.get('uploaded', 0) }} · Compactadas {{ study.image_counts.get('compressed', 0) }} · Erros {{ study.image_counts.get('compression_error', 0) + study.image_counts.get('upload_error', 0) }} · Descartadas {{ study.image_counts.get('discarded_modality', 0) + study.image_counts.get('discarded_study', 0) }}</span></td>
+                <td><span class="table-primary">{{ study.image_total }}</span><span class="table-secondary">Enviadas {{ study.image_counts.get('uploaded', 0) }} · Compactadas {{ study.image_counts.get('compressed', 0) }} · Erros {{ study.image_counts.get('compression_error', 0) + study.image_counts.get('upload_error', 0) + study.image_counts.get('rule_error', 0) }} · Descartadas {{ study.image_counts.get('discarded_modality', 0) + study.image_counts.get('discarded_study', 0) + study.image_counts.get('discarded_rule', 0) }}</span></td>
               </tr>
               {% endfor %}
             </tbody>

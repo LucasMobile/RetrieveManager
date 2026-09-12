@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 from app.config import BASE_DIR, DEFAULT_CLOUD_URL
 from app.main import app, get_db
 from app.middleware import _same_origin
-from app.models import Base, Settings, User
+from app.models import Base, DicomRule, Settings, Unit, User
 from app.security import hash_password
 from app.validation import validate_cloud_url
 
@@ -118,7 +118,12 @@ class SecurityTest(unittest.TestCase):
 
     def test_valid_settings_form_and_validation_do_not_mutate_on_error(self):
         self.login()
-        token = self.token("/settings")
+        settings_page = self.client.get("/settings")
+        self.assertEqual(settings_page.status_code, 200)
+        self.assertNotIn('name="drop_study_prefix"', settings_page.text)
+        token = re.search(
+            r'name="csrf_token" value="([^"]+)"', settings_page.text
+        )[1]
         data = {
             "csrf_token": token,
             "cloud_url": DEFAULT_CLOUD_URL,
@@ -160,6 +165,87 @@ class SecurityTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_cloud_url(DEFAULT_CLOUD_URL + "x" * 500)
+
+    def test_dicom_rule_page_create_and_static_rule_routes(self):
+        self.login()
+        with self.Session() as db:
+            unit = Unit(
+                name="Unidade de teste",
+                orders_api_url="https://example.test/orders",
+                orders_api_token="integration-token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir="/receive",
+                send_dir="/send",
+                error_dir="/error",
+                token="token",
+            )
+            db.add(unit)
+            db.commit()
+            unit_id = unit.id
+
+        token = self.token("/rules")
+        response = self.client.post(
+            "/rules",
+            data={
+                "csrf_token": token,
+                "name": "Descartar SLRX",
+                "enabled": "1",
+                "priority": "10",
+                "unit_ids": [str(unit_id)],
+                "combinator": "and",
+                "condition_tag": ["0020,0010"],
+                "condition_operator": ["starts_with_digits"],
+                "condition_value": ["SLRX"],
+                "action": "delete",
+                "action_tag": "",
+                "action_value": "",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            created = db.scalar(select(DicomRule))
+            self.assertIsNotNone(created)
+            created_id = created.id
+            self.assertEqual(created.conditions[0].tag, "0020,0010")
+            self.assertEqual(created.unit_links[0].unit_id, unit_id)
+
+        edit_page = self.client.get(f"/rules?edit={created_id}")
+        self.assertEqual(edit_page.status_code, 200)
+        response = self.client.post(
+            f"/rules/dicom/{created_id}",
+            data={
+                "csrf_token": token,
+                "name": "Normalizar instituição",
+                "enabled": "1",
+                "priority": "20",
+                "unit_ids": [str(unit_id)],
+                "combinator": "or",
+                "condition_tag": ["0008,0060", "0008,0080"],
+                "condition_operator": ["equals", "not_exists"],
+                "condition_value": ["CT", ""],
+                "action": "replace",
+                "action_tag": "0008,0080",
+                "action_value": "Mobilemed",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            updated = db.get(DicomRule, created_id)
+            self.assertEqual(updated.name, "Normalizar instituição")
+            self.assertEqual(updated.combinator, "or")
+            self.assertEqual(updated.action, "replace")
+            self.assertEqual(len(updated.conditions), 2)
+
+        tag_info = self.client.get("/rules/tag-info", params={"tag": "0008,0060"})
+        self.assertEqual(tag_info.status_code, 200)
+        self.assertEqual(tag_info.json()["tag"], "0008,0060")
+        self.assertEqual(self.client.get("/rules/retrieve").status_code, 200)
 
     def test_headers_on_success_rejection_and_unexpected_errors(self):
         responses = [self.client.get("/health/live"), self.client.post("/logout")]

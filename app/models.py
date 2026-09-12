@@ -30,6 +30,7 @@ class Settings(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cloud_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    # Campo legado consumido uma única vez pela migração para DicomRule.
     drop_study_prefix: Mapped[str] = mapped_column(String(32), default="SLRX")
     file_settle_seconds: Mapped[int] = mapped_column(Integer, default=3)
 
@@ -80,6 +81,9 @@ class Unit(Base):
     orders: Mapped[list["Order"]] = relationship(
         back_populates="unit", cascade="all, delete-orphan"
     )
+    dicom_rule_links: Mapped[list["DicomRuleUnit"]] = relationship(
+        back_populates="unit", cascade="all, delete-orphan"
+    )
 
 
 class ModalityRule(Base):
@@ -105,6 +109,61 @@ class DropModality(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     code: Mapped[str] = mapped_column(String(8), unique=True, nullable=False)
+
+
+class DicomRule(Base):
+    __tablename__ = "dicom_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100)
+    combinator: Mapped[str] = mapped_column(String(8), default="and")
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_tag: Mapped[str] = mapped_column(String(9), default="")
+    action_value: Mapped[str] = mapped_column(Text, default="")
+    system_key: Mapped[str] = mapped_column(
+        String(64), nullable=True, default=None, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+    conditions: Mapped[list["DicomRuleCondition"]] = relationship(
+        back_populates="rule",
+        cascade="all, delete-orphan",
+        order_by="DicomRuleCondition.position",
+    )
+    unit_links: Mapped[list["DicomRuleUnit"]] = relationship(
+        back_populates="rule", cascade="all, delete-orphan"
+    )
+
+
+class DicomRuleCondition(Base):
+    __tablename__ = "dicom_rule_conditions"
+    __table_args__ = (Index("ix_dicom_condition_rule", "rule_id", "position"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("dicom_rules.id"), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    tag: Mapped[str] = mapped_column(String(9), nullable=False)
+    operator: Mapped[str] = mapped_column(String(32), nullable=False)
+    value: Mapped[str] = mapped_column(Text, default="")
+
+    rule: Mapped[DicomRule] = relationship(back_populates="conditions")
+
+
+class DicomRuleUnit(Base):
+    __tablename__ = "dicom_rule_units"
+
+    rule_id: Mapped[int] = mapped_column(
+        ForeignKey("dicom_rules.id"), primary_key=True
+    )
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), primary_key=True)
+
+    rule: Mapped[DicomRule] = relationship(back_populates="unit_links")
+    unit: Mapped[Unit] = relationship(back_populates="dicom_rule_links")
 
 
 class Order(Base):
@@ -269,6 +328,30 @@ class ImageTransfer(Base):
     historical_links: Mapped[list[HistoricalImageLink]] = relationship(
         back_populates="transfer", cascade="all, delete-orphan"
     )
+    rule_applications: Mapped[list["DicomRuleApplication"]] = relationship(
+        back_populates="transfer", cascade="all, delete-orphan"
+    )
+
+
+class DicomRuleApplication(Base):
+    __tablename__ = "dicom_rule_applications"
+    __table_args__ = (
+        Index("ix_dicom_rule_application_transfer", "transfer_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(
+        ForeignKey("dicom_rules.id", ondelete="SET NULL"), nullable=True
+    )
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
+    transfer_id: Mapped[int] = mapped_column(
+        ForeignKey("image_transfers.id", ondelete="CASCADE"), nullable=False
+    )
+    rule_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    transfer: Mapped[ImageTransfer] = relationship(back_populates="rule_applications")
 
 
 STATUSES = {

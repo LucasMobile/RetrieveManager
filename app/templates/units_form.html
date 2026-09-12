@@ -147,7 +147,7 @@
             <div class="form-grid form-grid--2">
               <div class="field">
                 <label for="retrieve-prior-enabled">Retrieve de exames anteriores</label>
-                <label><input id="retrieve-prior-enabled" name="retrieve_prior_enabled" type="checkbox" value="1" {% if unit and unit.retrieve_prior_enabled %}checked{% endif %}> Ativar histórico do paciente</label>
+                <label class="checkbox-option"><input id="retrieve-prior-enabled" name="retrieve_prior_enabled" type="checkbox" value="1" {% if unit and unit.retrieve_prior_enabled %}checked{% endif %}> <span>Ativar histórico do paciente</span></label>
                 <span class="field__hint">Quando ativo, entra imediatamente na mesma fila dos C-MOVEs atuais.</span>
               </div>
               <div class="field">

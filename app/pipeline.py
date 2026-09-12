@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import (
@@ -27,6 +26,13 @@ from app.config import (
     SEND_RETRY_BASE_SECONDS,
     SEND_RETRY_MAX_SECONDS,
 )
+from app.dicom_rules import (
+    RuleExecutionError,
+    RuleMatch,
+    RuleSpec,
+    apply_rule_specs,
+    load_rule_specs,
+)
 from app.dicom_tools import (
     ToolMissing,
     c_find,
@@ -38,6 +44,7 @@ from app.dicom_tools import (
 from app.events import add_event
 from app.models import (
     CompressRule,
+    DicomRuleApplication,
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
@@ -75,6 +82,7 @@ class CompactResult:
     body_part: str = ""
     description: str = ""
     observed_at: datetime | None = None
+    rule_matches: tuple[RuleMatch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -790,7 +798,7 @@ def compact_unit(db: Session, unit: Unit) -> None:
     if not origin.is_dir():
         return
     drops = drop_codes(db)
-    prefix = (settings.drop_study_prefix or "SLRX").upper()
+    dicom_rules = load_rule_specs(db, unit.id)
     settle = settings.file_settle_seconds or 3
     now = datetime.now().timestamp()
     jobs: list[Path] = []
@@ -838,8 +846,8 @@ def compact_unit(db: Session, unit: Unit) -> None:
                 str(error_dir / p.name),
                 unit.token,
                 drops,
-                prefix,
                 compress_map,
+                dicom_rules,
             )
             for p in jobs
         ]
@@ -870,8 +878,8 @@ def _compact_one(
     error: str,
     token: str,
     drops: set[str],
-    study_prefix: str,
     compress_map: dict[str, str],
+    dicom_rules: tuple[RuleSpec, ...],
 ) -> CompactResult:
     name = os.path.basename(filepath)
     prefix = _filename_mod(name)
@@ -893,22 +901,48 @@ def _compact_one(
         "description": str(getattr(image, "StudyDescription", "") or ""),
         "observed_at": datetime.fromtimestamp(Path(filepath).stat().st_mtime),
     }
-    if prefix in drops or modality in drops:
-        os.remove(filepath)
-        return CompactResult(
-            name, "", study_uid, "discarded_modality", **identity
-        )
-
-    study_id = str(getattr(image, "StudyID", "") or "")
-    if study_prefix and re.match(rf"^{re.escape(study_prefix)}\d+", study_id, re.I):
-        os.remove(filepath)
-        return CompactResult(name, "", study_uid, "discarded_study", **identity)
-
+    # Add the system-managed values before evaluating rules so a configured
+    # replacement/removal remains the final value written to the DICOM file.
     image.SpecificCharacterSet = "ISO_IR 100"
     image.InstitutionalDepartmentName = token
+    try:
+        rule_result = apply_rule_specs(image, dicom_rules)
+    except RuleExecutionError as exc:
+        shutil.move(filepath, error)
+        return CompactResult(
+            name,
+            name,
+            study_uid,
+            "rule_error",
+            type(exc).__name__,
+            **identity,
+            rule_matches=exc.matches,
+        )
+    if rule_result.delete_image:
+        os.remove(filepath)
+        return CompactResult(
+            name,
+            "",
+            study_uid,
+            "discarded_rule",
+            **identity,
+            rule_matches=rule_result.matches,
+        )
+    processing_modality = str(getattr(image, "Modality", "") or prefix).upper()
+    if prefix in drops or processing_modality in drops:
+        os.remove(filepath)
+        return CompactResult(
+            name,
+            "",
+            study_uid,
+            "discarded_modality",
+            **identity,
+            rule_matches=rule_result.matches,
+        )
+
     image.save_as(filepath)
 
-    flag = compress_map.get(modality, compress_map.get("*", "+e1"))
+    flag = compress_map.get(processing_modality, compress_map.get("*", "+e1"))
     try:
         code, _out = dcmcjpeg(flag, filepath, dest)
     except ToolMissing as exc:
@@ -920,6 +954,7 @@ def _compact_one(
             "compression_error",
             type(exc).__name__,
             **identity,
+            rule_matches=rule_result.matches,
         )
     if code == 0:
         os.remove(filepath)
@@ -929,6 +964,7 @@ def _compact_one(
             study_uid,
             "compressed",
             **identity,
+            rule_matches=rule_result.matches,
         )
     shutil.move(filepath, error)
     return CompactResult(
@@ -938,6 +974,7 @@ def _compact_one(
         "compression_error",
         "DcmcjpegError",
         **identity,
+        rule_matches=rule_result.matches,
     )
 
 
@@ -977,6 +1014,21 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         transfer.last_http_status = None
     transfer.status = result.status
     transfer.last_error = result.error_type
+    db.execute(
+        delete(DicomRuleApplication).where(
+            DicomRuleApplication.transfer_id == transfer.id
+        )
+    )
+    db.add_all(
+        DicomRuleApplication(
+            rule_id=match.rule_id,
+            unit_id=unit.id,
+            transfer_id=transfer.id,
+            rule_name=match.rule_name,
+            action=match.action,
+        )
+        for match in result.rule_matches
+    )
     _associate_historical_transfer(db, unit, result, transfer)
     level = logging.ERROR if result.error_type else logging.INFO
     with log_context(correlation_id):
@@ -990,6 +1042,7 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
             transfer_id=transfer.id,
             order_id=order.id if order else None,
             unit_id=unit.id,
+            applied_rule_ids=[match.rule_id for match in result.rule_matches],
         )
 
 

@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Regras DICOM · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack dicom-rules-page">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Configurações</p>
+      <h1>Regras</h1>
+      <p class="page-header__description">Crie condições específicas por tag DICOM e escolha em quais unidades serão aplicadas antes da compactação.</p>
+    </div>
+    <div class="page-header__actions"><a class="btn btn--primary" href="#rule-editor">{{ icon("plus") }} Nova regra</a></div>
+  </header>
+
+  <section class="card card--flush dicom-rules-summary" aria-label="Resumo das regras">
+    <div><strong>{{ summary.total }}</strong><span>regras cadastradas</span></div>
+    <div><strong>{{ summary.active }}</strong><span>regras ativas</span></div>
+    <div><strong>{{ summary.units }}</strong><span>unidades cobertas</span></div>
+  </section>
+
+  <section class="surface dicom-rules-list" aria-labelledby="rules-list-title">
+    <header class="dicom-rules-list__header">
+      <div><h2 id="rules-list-title">Regras cadastradas</h2><p>Valores menores de prioridade são processados primeiro.</p></div>
+      <span class="chip">{{ summary.active }} ativa{% if summary.active != 1 %}s{% endif %}</span>
+    </header>
+    {% if rules %}
+    <div class="dicom-rule-cards">
+      {% for rule in rules %}
+      <article class="dicom-rule-card{% if not rule.enabled %} is-disabled{% endif %}">
+        <div class="dicom-rule-card__main">
+          <div class="dicom-rule-card__title">
+            <span class="dicom-rule-card__priority">{{ rule.priority }}</span>
+            <div><h3>{{ rule.name }}</h3><p>{{ rule.combinator_label }}</p></div>
+            <span class="status-badge {{ 'ok' if rule.enabled else 'off' }}">{{ 'Ativa' if rule.enabled else 'Inativa' }}</span>
+          </div>
+          <div class="dicom-rule-card__conditions">
+            {% for condition in rule.conditions %}
+            <div><span>SE{% if not loop.first %} {{ 'E' if rule.combinator == 'and' else 'OU' }}{% endif %}</span><strong>{{ condition.tag_name }}</strong><code>{{ condition.tag }}</code><em>{{ condition.operator_label }}{% if condition.operator not in valueless_operators %} “{{ condition.value }}”{% endif %}</em></div>
+            {% endfor %}
+          </div>
+          <div class="dicom-rule-card__action"><span>ENTÃO</span><strong>{{ rule.action_label }}</strong>{% if rule.action_tag %}<code>{{ rule.action_tag }}</code><small>{{ rule.action_tag_name }}{% if rule.action == 'replace' %} → “{{ rule.action_value }}”{% endif %}</small>{% endif %}</div>
+          <div class="dicom-rule-card__units">{{ icon("building") }} <span>{{ rule.unit_names|join(', ') if rule.unit_names else 'Nenhuma unidade selecionada' }} · {{ rule.application_count }} imagem{% if rule.application_count != 1 %}s{% endif %} correspondida{% if rule.application_count != 1 %}s{% endif %}</span></div>
+        </div>
+        <div class="dicom-rule-card__actions">
+          <a class="action-icon" href="/rules?edit={{ rule.id }}#rule-editor" data-tooltip="Editar regra" aria-label="Editar {{ rule.name }}">{{ icon("edit") }}</a>
+          <form method="post" action="/rules/dicom/{{ rule.id }}/toggle"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon" type="submit" data-tooltip="{{ 'Desativar' if rule.enabled else 'Ativar' }} regra" aria-label="{{ 'Desativar' if rule.enabled else 'Ativar' }} {{ rule.name }}">{{ icon("pause" if rule.enabled else "play") }}</button></form>
+          <form method="post" action="/rules/dicom/{{ rule.id }}/delete" data-confirm="Excluir a regra {{ rule.name }}? O histórico das aplicações já realizadas será preservado." data-confirm-label="Excluir regra"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir regra" aria-label="Excluir {{ rule.name }}">{{ icon("trash") }}</button></form>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("rules") }}</div><h2>Nenhuma regra cadastrada</h2><p>Crie uma regra para avaliar tags dos próximos arquivos recebidos.</p></div></div>
+    {% endif %}
+  </section>
+
+  {% set selected_unit_ids = edit_rule.unit_links|map(attribute='unit_id')|list if edit_rule else [] %}
+  <section class="surface dicom-rule-editor" id="rule-editor" aria-labelledby="rule-editor-title">
+    <header class="dicom-rules-list__header">
+      <div><h2 id="rule-editor-title">{{ 'Editar regra' if edit_rule else 'Nova regra' }}</h2><p>As condições são comparadas sem diferenciar maiúsculas e minúsculas.</p></div>
+      {% if edit_rule %}<a class="btn btn--quiet btn--sm" href="/rules#rule-editor">Cancelar edição</a>{% endif %}
+    </header>
+    <form class="dicom-rule-form" method="post" action="{{ '/rules/dicom/' ~ edit_rule.id if edit_rule else '/rules' }}" data-dicom-rule-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <div class="dicom-rule-form__grid">
+        <div class="field field--wide"><label for="rule-name">Nome da regra</label><input id="rule-name" name="name" maxlength="120" value="{{ edit_rule.name if edit_rule else '' }}" placeholder="Ex.: Descartar imagens SLRX" required></div>
+        <div class="field"><label for="rule-priority">Prioridade</label><input id="rule-priority" name="priority" type="number" min="1" max="9999" value="{{ edit_rule.priority if edit_rule else 100 }}" required><span class="field__hint">Menor executa primeiro.</span></div>
+        <div class="field dicom-rule-form__enabled"><span class="field__label">Estado</span><label class="checkbox-option"><input name="enabled" type="checkbox" value="1" {% if not edit_rule or edit_rule.enabled %}checked{% endif %}><span>Regra ativa</span></label></div>
+      </div>
+
+      <fieldset class="dicom-rule-fieldset">
+        <legend>Unidades</legend>
+        <p>Selecione uma ou mais unidades onde a regra será aplicada.</p>
+        {% if units %}<div class="dicom-unit-options">{% for unit in units %}<label class="checkbox-option"><input name="unit_ids" type="checkbox" value="{{ unit.id }}" {% if unit.id in selected_unit_ids %}checked{% endif %}><span>{{ unit.name }}</span></label>{% endfor %}</div>{% else %}<div class="settings-note">{{ icon("info") }} <span>Cadastre uma unidade antes de criar regras.</span></div>{% endif %}
+      </fieldset>
+
+      <fieldset class="dicom-rule-fieldset">
+        <legend class="visually-hidden">Condições</legend>
+        <div class="dicom-rule-fieldset__heading"><div><h3>Condições</h3><p>Escolha um único combinador para todas as condições.</p></div><div class="field"><label for="rule-combinator">Combinação</label><select id="rule-combinator" name="combinator">{% for key, label in combinators.items() %}<option value="{{ key }}" {% if edit_rule and edit_rule.combinator == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div></div>
+        <div class="dicom-condition-list" data-condition-list>
+          {% set conditions = edit_rule.conditions if edit_rule else [none] %}
+          {% for condition in conditions %}
+          <div class="dicom-condition-row" data-condition-row>
+            <div class="field"><label>Tag DICOM</label><input class="mono" name="condition_tag" value="{{ condition.tag if condition else '' }}" placeholder="0020,0010" maxlength="32" data-dicom-tag required><span class="field__hint" data-tag-name>{{ condition.tag_name if condition else 'Informe uma tag padrão' }}</span></div>
+            <div class="field"><label>Operador</label><select name="condition_operator" data-condition-operator>{% for key, label in operators.items() %}<option value="{{ key }}" {% if condition and condition.operator == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+            <div class="field"><label>Valor</label><input name="condition_value" value="{{ condition.value if condition else '' }}" maxlength="2048" data-condition-value placeholder="Valor para comparar"></div>
+            <button class="action-icon action-icon--danger" type="button" data-condition-remove data-tooltip="Remover condição" aria-label="Remover condição">{{ icon("trash") }}</button>
+          </div>
+          {% endfor %}
+        </div>
+        <button class="btn btn--secondary btn--sm" type="button" data-condition-add>{{ icon("plus") }} Adicionar condição</button>
+      </fieldset>
+
+      <fieldset class="dicom-rule-fieldset">
+        <legend>Ação</legend>
+        <p>Uma única ação será executada quando a regra corresponder.</p>
+        <div class="dicom-action-grid">
+          <div class="field"><label for="rule-action">Ação</label><select id="rule-action" name="action" data-rule-action>{% for key, label in actions.items() %}<option value="{{ key }}" {% if edit_rule and edit_rule.action == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+          <div class="field" data-action-tag-field><label for="rule-action-tag">Tag que será alterada</label><input id="rule-action-tag" class="mono" name="action_tag" value="{{ edit_rule.action_tag if edit_rule else '' }}" placeholder="0008,0080" maxlength="32" data-dicom-tag><span class="field__hint" data-tag-name>{{ edit_rule.action_tag_name if edit_rule and edit_rule.action_tag else 'Informe uma tag padrão' }}</span></div>
+          <div class="field" data-action-value-field><label for="rule-action-value">Novo valor</label><input id="rule-action-value" name="action_value" value="{{ edit_rule.action_value if edit_rule else '' }}" maxlength="2048" placeholder="Valor que será gravado"></div>
+        </div>
+      </fieldset>
+
+      <footer class="dicom-rule-form__footer"><span>{{ icon("info") }} Alterações valem para os próximos arquivos processados.</span><button class="btn btn--primary" type="submit">{{ icon("save") }} {{ 'Salvar alterações' if edit_rule else 'Criar regra' }}</button></footer>
+    </form>
+  </section>
+</div>
+
+<template data-condition-template>
+  <div class="dicom-condition-row" data-condition-row>
+    <div class="field"><label>Tag DICOM</label><input class="mono" name="condition_tag" placeholder="0020,0010" maxlength="32" data-dicom-tag required><span class="field__hint" data-tag-name>Informe uma tag padrão</span></div>
+    <div class="field"><label>Operador</label><select name="condition_operator" data-condition-operator>{% for key, label in operators.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
+    <div class="field"><label>Valor</label><input name="condition_value" maxlength="2048" data-condition-value placeholder="Valor para comparar"></div>
+    <button class="action-icon action-icon--danger" type="button" data-condition-remove data-tooltip="Remover condição" aria-label="Remover condição">{{ icon("trash") }}</button>
+  </div>
+</template>
+{% endblock %}

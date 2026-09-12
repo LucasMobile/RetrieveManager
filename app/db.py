@@ -252,4 +252,8 @@ def _seed(db: Session) -> None:
     for order in db.scalars(select(Order).where(Order.correlation_id == "")):
         order.correlation_id = str(uuid4())
 
+    db.flush()
+    from app.dicom_rules import migrate_legacy_study_rule
+
+    migrate_legacy_study_rule(db)
     db.commit()

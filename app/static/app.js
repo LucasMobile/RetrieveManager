@@ -239,4 +239,99 @@
       setSecondRetrieve(toggle.getAttribute("aria-checked") !== "true");
     });
   });
+
+  const dicomRuleForm = document.querySelector("[data-dicom-rule-form]");
+  if (dicomRuleForm) {
+    const conditionList = dicomRuleForm.querySelector("[data-condition-list]");
+    const conditionTemplate = document.querySelector("[data-condition-template]");
+    const valuelessOperators = new Set(["exists", "not_exists"]);
+
+    const updateRemoveButtons = () => {
+      const rows = conditionList?.querySelectorAll("[data-condition-row]") || [];
+      rows.forEach((row) => {
+        const button = row.querySelector("[data-condition-remove]");
+        if (button) button.disabled = rows.length === 1;
+      });
+    };
+
+    const updateConditionValue = (row) => {
+      const operator = row.querySelector("[data-condition-operator]");
+      const value = row.querySelector("[data-condition-value]");
+      if (!operator || !value) return;
+      const valueless = valuelessOperators.has(operator.value);
+      value.required = !valueless;
+      value.readOnly = valueless;
+      value.placeholder = valueless ? "Não se aplica" : "Valor para comparar";
+      if (valueless) value.value = "";
+    };
+
+    const resolveTagName = async (input) => {
+      const hint = input.closest(".field")?.querySelector("[data-tag-name]");
+      const raw = input.value.trim();
+      if (!hint || !raw) {
+        if (hint) hint.textContent = "Informe uma tag padrão";
+        return;
+      }
+      hint.textContent = "Validando tag…";
+      try {
+        const response = await fetch(`/rules/tag-info?tag=${encodeURIComponent(raw)}`);
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.message || "Tag inválida");
+        input.value = result.tag;
+        input.setCustomValidity("");
+        hint.textContent = result.name;
+      } catch (error) {
+        input.setCustomValidity(error.message || "Tag DICOM inválida");
+        hint.textContent = error.message || "Tag DICOM inválida";
+      }
+    };
+
+    const initializeConditionRow = (row) => {
+      const operator = row.querySelector("[data-condition-operator]");
+      operator?.addEventListener("change", () => updateConditionValue(row));
+      row.querySelector("[data-condition-remove]")?.addEventListener("click", () => {
+        row.remove();
+        updateRemoveButtons();
+      });
+      updateConditionValue(row);
+    };
+
+    conditionList?.querySelectorAll("[data-condition-row]").forEach(initializeConditionRow);
+    dicomRuleForm.querySelector("[data-condition-add]")?.addEventListener("click", () => {
+      if (!conditionTemplate || !conditionList) return;
+      if (conditionList.querySelectorAll("[data-condition-row]").length >= 20) return;
+      const fragment = conditionTemplate.content.cloneNode(true);
+      const row = fragment.querySelector("[data-condition-row]");
+      initializeConditionRow(row);
+      conditionList.appendChild(fragment);
+      updateRemoveButtons();
+      row.querySelector("[data-dicom-tag]")?.focus();
+    });
+    updateRemoveButtons();
+
+    dicomRuleForm.addEventListener("focusout", (event) => {
+      if (event.target.matches?.("[data-dicom-tag]")) resolveTagName(event.target);
+    });
+    dicomRuleForm.addEventListener("input", (event) => {
+      if (event.target.matches?.("[data-dicom-tag]")) {
+        event.target.setCustomValidity("");
+      }
+    });
+
+    const action = dicomRuleForm.querySelector("[data-rule-action]");
+    const actionTagField = dicomRuleForm.querySelector("[data-action-tag-field]");
+    const actionValueField = dicomRuleForm.querySelector("[data-action-value-field]");
+    const actionTag = actionTagField?.querySelector("input");
+    const actionValue = actionValueField?.querySelector("input");
+    const updateActionFields = () => {
+      const changesTag = action?.value === "replace" || action?.value === "remove";
+      const replaces = action?.value === "replace";
+      if (actionTagField) actionTagField.hidden = !changesTag;
+      if (actionValueField) actionValueField.hidden = !replaces;
+      if (actionTag) actionTag.required = changesTag;
+      if (actionValue) actionValue.required = replaces;
+    };
+    action?.addEventListener("change", updateActionFields);
+    updateActionFields();
+  }
 })();
