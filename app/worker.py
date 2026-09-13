@@ -13,6 +13,7 @@ from app.models import Unit
 from app.observability import configure_logging, log_event
 from app.pipeline import (
     claim_due_moves,
+    cleanup_unmatched_orders,
     compact_unit,
     find_pending,
     ingest_unit,
@@ -55,7 +56,7 @@ def main() -> None:
     supervisor = StoreSupervisor()
     pool = ThreadPoolExecutor(max_workers=16)
     with SessionLocal() as db:
-        units = list(db.scalars(select(Unit)))
+        units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))
         log_event(
             log,
             logging.INFO,
@@ -96,7 +97,8 @@ def main() -> None:
 def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
     with SessionLocal() as db:
         recover_stale_locks(db)
-        units = list(db.scalars(select(Unit)))
+        cleanup_unmatched_orders(db)
+        units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))
         supervisor.reconcile(units)
         for unit in units:
             if not unit.enabled:

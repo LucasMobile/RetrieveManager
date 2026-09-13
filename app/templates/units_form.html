@@ -54,7 +54,6 @@
               <div class="field">
                 <label for="unit-name">Nome da unidade</label>
                 <input id="unit-name" name="name" value="{{ unit.name if unit else '' }}" maxlength="120" required>
-                <span class="field__hint">Use um nome reconhecível pela equipe de operação.</span>
               </div>
               <div class="field">
                 <label for="unit-enabled">Estado da unidade</label>
@@ -127,8 +126,8 @@
               </div>
               <div class="field">
                 <label for="orders-api-token">Token de Integração</label>
-                <input id="orders-api-token" name="orders_api_token" type="password" maxlength="2048" value="" autocomplete="off" {% if not unit %}required{% endif %}>
-                <span class="field__hint">Enviado no header “token”.{% if unit %} Deixe em branco para manter o token atual.{% endif %}</span>
+                <input id="orders-api-token" name="orders_api_token" type="password" maxlength="2048" value=""{% if unit and unit.orders_api_token %} placeholder="••••••••••••"{% endif %} autocomplete="off" {% if not unit %}required{% endif %}>
+                <span class="field__hint">Enviado no header “token”.</span>
               </div>
               <div class="field">
                 <label for="orders-api-station-id">ID Posto</label>
@@ -174,8 +173,8 @@
               </div>
               <div class="field">
                 <label for="unit-token">Token da unidade</label>
-                <input id="unit-token" name="token" type="password" maxlength="64" value="" autocomplete="off" {% if not unit %}required{% endif %}>
-                <span class="field__hint">Tag DICOM 0008,1040.{% if unit %} Deixe em branco para manter o token atual.{% endif %}</span>
+                <input id="unit-token" name="token" type="password" maxlength="64" value=""{% if unit and unit.token %} placeholder="••••••••••••"{% endif %} autocomplete="off" {% if not unit %}required{% endif %}>
+                <span class="field__hint">Tag DICOM 0008,1040.</span>
               </div>
               <div class="field">
                 <label for="receive-dir">Recebimento DICOM</label>
@@ -204,7 +203,6 @@
               <div class="field field--full">
                 <label for="cloud-url">URL de destino</label>
                 <input id="cloud-url" class="mono" name="cloud_url" type="url" maxlength="500" value="{{ unit.cloud_url if unit else default_cloud_url }}" placeholder="https://api.exemplo.com/imagens" spellcheck="false" autocomplete="url" required>
-                <span class="field__hint">Endpoint que recebe os arquivos DICOM desta unidade por POST.</span>
               </div>
               <div class="field">
                 <label for="file-settle-seconds">Espera antes de compactar e enviar</label>
@@ -212,7 +210,6 @@
                   <input id="file-settle-seconds" name="file_settle_seconds" type="number" min="0" max="3600" value="{{ unit.file_settle_seconds if unit else 3 }}">
                   <span aria-hidden="true">s</span>
                 </div>
-                <span class="field__hint">Garante que a gravação do arquivo terminou.</span>
               </div>
             </div>
             <div class="settings-note">
@@ -259,9 +256,9 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
             <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar erros</button>
           </form>
-          <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Excluir esta unidade? Todos os pedidos e eventos do histórico também serão removidos. Esta ação não pode ser desfeita." data-confirm-label="Excluir unidade">
+          <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Arquivar esta unidade? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-            <button class="btn btn--danger" type="submit">{{ icon("trash") }} Excluir unidade</button>
+            <button class="btn btn--danger" type="submit">{{ icon("trash") }} Arquivar unidade</button>
           </form>
         </div>
       </section>

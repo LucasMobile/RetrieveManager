@@ -335,7 +335,11 @@ def migrate_legacy_study_rule(db: Session) -> bool:
     prefix = (settings.drop_study_prefix or "").strip().upper()
     if not prefix:
         return False
-    units = list(db.scalars(select(Unit).order_by(Unit.id)))
+    units = list(
+        db.scalars(
+            select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.id)
+        )
+    )
     if not units:
         return False
     existing = db.scalar(

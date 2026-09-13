@@ -1,6 +1,21 @@
 {% from "icons.html" import icon %}
 {% if pager and pager.total %}
 <nav class="pager" aria-label="Paginação">
+  {% if pager.cursor %}
+  <span>Exibindo {{ pager.count }} de {{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+  <div class="pager__controls">
+    {% if pager.has_prev %}
+      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}after={{ pager.prev_cursor }}" rel="prev" aria-label="Página anterior">{{ icon("chevron-left") }} <span>Mais recentes</span></a>
+    {% else %}
+      <span class="pager__link is-disabled" aria-disabled="true">{{ icon("chevron-left") }} <span>Mais recentes</span></span>
+    {% endif %}
+    {% if pager.has_next %}
+      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}before={{ pager.next_cursor }}" rel="next" aria-label="Próxima página"><span>Mais antigos</span> {{ icon("chevron-right") }}</a>
+    {% else %}
+      <span class="pager__link is-disabled" aria-disabled="true"><span>Mais antigos</span> {{ icon("chevron-right") }}</span>
+    {% endif %}
+  </div>
+  {% else %}
   <span>Exibindo {{ pager.from }}–{{ pager.to }} de {{ pager.total }}</span>
   <div class="pager__controls">
     {% if pager.has_prev %}
@@ -15,5 +30,6 @@
       <span class="pager__link is-disabled" aria-disabled="true"><span>Próxima</span> {{ icon("chevron-right") }}</span>
     {% endif %}
   </div>
+  {% endif %}
 </nav>
 {% endif %}

@@ -6,24 +6,25 @@
   <header class="page-header order-detail-header">
     <div class="page-header__copy">
       <nav class="breadcrumb" aria-label="Navegação estrutural">
-        <a href="/orders">Fila de pedidos</a><span aria-hidden="true">/</span><span>{{ order.unit.name }}</span>
+        <a href="{{ '/orders/history' if order.archived_at else '/orders' }}">{{ 'Histórico de pedidos' if order.archived_at else 'Fila de pedidos' }}</a><span aria-hidden="true">/</span><span>{{ order.unit.name }}</span>
       </nav>
       <div class="order-detail-title">
         <h1>Pedido {{ order.acc }}</h1>
         <span class="status-badge {{ badge }}">{{ status_label }}</span>
+        {% if order.archived_at %}<span class="status-badge neutral">Arquivado</span>{% endif %}
       </div>
       <p class="page-header__description mono">Origem API{% if order.source_id %} · {{ order.source_id }}{% endif %}</p>
     </div>
     <div class="page-header__actions">
-      {% if user.role == 'admin' %}
+      {% if user.role == 'admin' and not order.archived_at %}
       {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') and order.prior_status not in ('queued', 'retry_wait', 'retrieving') %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="btn btn--primary" type="submit">{{ icon("retry") }} Reprocessar</button>
       </form>
-      <form class="inline-form" method="post" action="/orders/{{ order.id }}/delete" data-confirm="Excluir este pedido? O histórico será removido, mas os arquivos clínicos serão preservados." data-confirm-label="Excluir pedido">
+      <form class="inline-form" method="post" action="/orders/{{ order.id }}/delete" data-confirm="Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados." data-confirm-label="Arquivar pedido">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <button class="btn btn--danger" type="submit">{{ icon("trash") }} Excluir</button>
+        <button class="btn btn--danger" type="submit">{{ icon("trash") }} Arquivar</button>
       </form>
       {% endif %}
       {% if order.status not in ('done', 'cancelled') %}
@@ -33,7 +34,7 @@
       </form>
       {% endif %}
       {% endif %}
-      <a class="btn btn--secondary" href="/orders">{{ icon("arrow-left") }} Voltar</a>
+      <a class="btn btn--secondary" href="{{ '/orders/history' if order.archived_at else '/orders' }}">{{ icon("arrow-left") }} Voltar</a>
     </div>
   </header>
 
@@ -52,6 +53,11 @@
           <div><dt>Leitura PLERES</dt><dd>{% if order.api_read_status == 'confirmed' %}Confirmada{% else %}Confirmação pendente{% endif %}{% if order.api_read_attempts %} · {{ order.api_read_attempts }} tentativa{% if order.api_read_attempts != 1 %}s{% endif %}{% endif %}</dd></div>
           <div><dt>Nascimento</dt><dd>{{ order.birth_date or 'Não informado' }}</dd></div>
           <div><dt>Data do exame</dt><dd>{{ order.exam_date or 'Não informado' }}</dd></div>
+          {% if order.archived_at %}
+          <div><dt>Arquivado em</dt><dd>{{ order.archived_at.strftime('%d/%m/%Y %H:%M') }}</dd></div>
+          <div><dt>Arquivado por</dt><dd>{{ order.archived_by_username or 'Sistema' }}</dd></div>
+          <div><dt>Motivo</dt><dd>{{ order.archive_reason or 'Não informado' }}</dd></div>
+          {% endif %}
           <div><dt>Modalidade</dt><dd><span class="modality-mark">{{ order.modality or '—' }}</span></dd></div>
           <div><dt>Body Part</dt><dd>{{ order.body_part or 'Não informado' }}</dd></div>
           <div><dt>Study UID</dt><dd class="mono">{{ order.study_uid or 'Não informado' }}</dd></div>
@@ -75,7 +81,7 @@
           <div><dt>Imagens associadas</dt><dd>{{ historical_total_images }}</dd></div>
         </dl>
         {% if order.prior_last_error %}<div class="order-error"><strong>Último erro do histórico</strong><span>{{ order.prior_last_error }}</span></div>{% endif %}
-        {% if user.role == 'admin' and order.prior_status in ('done', 'error') %}
+        {% if user.role == 'admin' and not order.archived_at and order.prior_status in ('done', 'error') %}
         <form method="post" action="/orders/{{ order.id }}/retry-prior" data-confirm="Executar novamente o retrieve de exames anteriores?" data-confirm-label="Reprocessar histórico">
           <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
           <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar histórico</button>

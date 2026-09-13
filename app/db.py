@@ -83,6 +83,7 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     _migrate_schema()
     Base.metadata.create_all(bind=engine)
+    _ensure_postgresql_indexes()
     with SessionLocal() as db:
         _seed(db)
 
@@ -111,6 +112,9 @@ def _migrate_schema() -> None:
             "orders_api_station_id": "VARCHAR(64) NOT NULL DEFAULT ''",
             "retrieve_prior_enabled": "BOOLEAN NOT NULL DEFAULT 0",
             "move_timeout_prior": "INTEGER NOT NULL DEFAULT 1800",
+            "deleted_at": "DATETIME",
+            "deleted_by_user_id": "INTEGER",
+            "deleted_by_username": "VARCHAR(80) NOT NULL DEFAULT ''",
         }
         with engine.begin() as connection:
             for name, definition in unit_additions.items():
@@ -146,6 +150,10 @@ def _migrate_schema() -> None:
         "prior_heartbeat_at": "DATETIME",
         "prior_attempts": "INTEGER NOT NULL DEFAULT 0",
         "prior_last_error": "TEXT NOT NULL DEFAULT ''",
+        "archived_at": "DATETIME",
+        "archive_reason": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "archived_by_user_id": "INTEGER",
+        "archived_by_username": "VARCHAR(80) NOT NULL DEFAULT ''",
     }
     with engine.begin() as connection:
         for name, definition in order_additions.items():
@@ -188,6 +196,56 @@ def _migrate_schema() -> None:
                 "ON orders (unit_id, prior_status, prior_due_at)"
             )
         )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_orders_active_id "
+                "ON orders (archived_at, id)"
+            )
+        )
+        if "order_events" in table_names:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_order_events_order_id_id "
+                    "ON order_events (order_id, id)"
+                )
+            )
+        if "image_transfers" in table_names:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_transfer_order_status "
+                    "ON image_transfers (order_id, status)"
+                )
+            )
+
+
+def _ensure_postgresql_indexes() -> None:
+    """Install PostgreSQL-only indexes used by large operational queues."""
+    if not DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg://")):
+        return
+    statements = (
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        "CREATE INDEX IF NOT EXISTS ix_orders_active_id_partial "
+        "ON orders (id DESC) WHERE archived_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS ix_orders_active_unit_status_id_partial "
+        "ON orders (unit_id, status, id DESC) WHERE archived_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS ix_orders_active_prior_status_unit_partial "
+        "ON orders (prior_status, unit_id) WHERE archived_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS ix_orders_unmatched_cleanup_partial "
+        "ON orders (created_at, id) WHERE archived_at IS NULL "
+        "AND status = 'watching' AND study_uid = '' "
+        "AND last_find_at IS NOT NULL AND attempts > 0",
+        "CREATE INDEX IF NOT EXISTS ix_orders_archived_at_id_partial "
+        "ON orders (archived_at DESC, id DESC) WHERE archived_at IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_orders_acc_trgm "
+        "ON orders USING gin (acc gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS ix_orders_pat_id_trgm "
+        "ON orders USING gin (pat_id gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS ix_orders_source_id_trgm "
+        "ON orders USING gin (source_id gin_trgm_ops)",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def _seed(db: Session) -> None:

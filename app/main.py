@@ -6,7 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from time import perf_counter
+from threading import Lock
+from time import monotonic, perf_counter
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
@@ -38,6 +39,7 @@ from app.dicom_tools import ToolMissing, c_echo
 from app.middleware import apply_security_headers, request_middleware
 from app.models import (
     STATUSES,
+    AuditLog,
     CompressRule,
     DicomRule,
     DicomRuleApplication,
@@ -57,6 +59,7 @@ from app.netutil import port_listening
 from app.observability import configure_logging, log_event, new_correlation_id
 from app.pager import paginate, query_keep
 from app.pipeline import folder_counts
+from app.retention import archive_order, archive_unit
 from app.rules import schedule_from_now
 from app.security import (
     clear_login_failures,
@@ -76,6 +79,7 @@ from app.validation import (
 
 ORDERS_PAGE = 40
 EVENTS_PAGE = 10
+AUDIT_LOGS_PAGE = 50
 UNITS_PAGE = 20
 DASH_PAGE = 8
 USER_ROLES = frozenset({"admin", "user"})
@@ -89,7 +93,41 @@ PRIOR_STATUS_LABELS = {
     "done": "Concluído",
     "error": "Erro",
 }
+AUDIT_ACTION_LABELS = {
+    "create": "Adição",
+    "update": "Alteração",
+    "delete": "Remoção",
+    "enable": "Ativação",
+    "disable": "Desativação",
+    "retry": "Reprocessamento",
+    "cancel": "Cancelamento",
+    "password": "Senha alterada",
+    "archive": "Arquivamento",
+}
+AUDIT_RESOURCE_LABELS = {
+    "unit": "Unidade",
+    "order": "Pedido",
+    "dicom_rule": "Regra DICOM",
+    "retrieve_rule": "Regra de retrieve",
+    "compress_rule": "Regra de compactação",
+    "drop_rule": "Regra de descarte",
+    "user": "Usuário",
+}
+AUDIT_ACTION_BADGES = {
+    "create": "active",
+    "update": "info",
+    "delete": "danger",
+    "enable": "success",
+    "disable": "neutral",
+    "retry": "warning",
+    "cancel": "danger",
+    "password": "info",
+    "archive": "neutral",
+}
 log = logging.getLogger("web")
+
+_dashboard_stats_cache: dict[str, Any] = {"expires_at": 0.0}
+_dashboard_stats_lock = Lock()
 
 configure_logging()
 
@@ -276,6 +314,38 @@ def ctx(request: Request, db: Session, nav: str, **extra: Any) -> dict:
     return data
 
 
+def _audit(
+    db: Session,
+    request: Request | None,
+    user: User | None,
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: int | str | None,
+    resource_name: str,
+    summary: str,
+) -> None:
+    actor_id = getattr(user, "id", None)
+    actor_username = getattr(user, "username", None)
+    actor_role = getattr(user, "role", None)
+    client = getattr(request, "client", None) if request else None
+    db.add(
+        AuditLog(
+            actor_id=actor_id,
+            actor_username=actor_username or (
+                f"Usuário #{actor_id}" if actor_id else "Sistema"
+            ),
+            actor_role=actor_role or ("admin" if actor_id else "system"),
+            action=action,
+            resource_type=resource_type,
+            resource_id=str(resource_id or ""),
+            resource_name=resource_name[:255],
+            summary=summary[:500],
+            ip_address=(client.host if client else "")[:64],
+        )
+    )
+
+
 def badge_for(status: str) -> str:
     return {
         "done": "ok",
@@ -388,116 +458,119 @@ def _unit_runtime(unit: Unit) -> tuple[dict[str, int], bool]:
 def _dashboard_units(
     db: Session, page: int
 ) -> tuple[list[Unit], dict[str, int | bool], dict[str, int]]:
-    total = db.scalar(select(func.count()).select_from(Unit)) or 0
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(Unit)
+            .where(Unit.deleted_at.is_(None))
+        )
+        or 0
+    )
     pager = paginate(total, page, DASH_PAGE)
     units = list(
         db.scalars(
             select(Unit)
+            .where(Unit.deleted_at.is_(None))
             .order_by(Unit.name)
             .offset(pager["offset"])
             .limit(pager["size"])
         )
     )
-    unit_ids = [unit.id for unit in units]
-    stats: dict[int, tuple[int, int, int, int]] = {}
-    if unit_ids:
-        day = datetime.now() - timedelta(hours=24)
-        rows = db.execute(
-            select(
-                Order.unit_id,
-                func.sum(case((Order.status == "watching", 1), else_=0)),
-                func.sum(
-                    case(
-                        (
-                            Order.status.in_(("wait_retrieve", "wait_second"))
-                            | Order.prior_status.in_(("queued", "retry_wait")),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                func.sum(
-                    case(
-                        (
-                            Order.status.in_(("retrieving", "retrieving_second"))
-                            | (Order.prior_status == "retrieving"),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                func.sum(
-                    case(
-                        (
+    with _dashboard_stats_lock:
+        cache_valid = (
+            _dashboard_stats_cache.get("engine_id") == id(db.get_bind())
+            and monotonic()
+            < float(_dashboard_stats_cache.get("expires_at", 0.0))
+        )
+        if cache_valid:
+            stats = _dashboard_stats_cache["stats"]
+            summary = _dashboard_stats_cache["summary"]
+        else:
+            stats: dict[int, tuple[int, int, int, int]] = {}
+            day = datetime.now() - timedelta(hours=24)
+            rows = db.execute(
+                select(
+                    Order.unit_id,
+                    func.sum(case((Order.status == "watching", 1), else_=0)),
+                    func.sum(
+                        case(
                             (
-                                (Order.status == "error")
-                                | (Order.prior_status == "error")
-                            )
-                            & (Order.updated_at >= day),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-            )
-            .where(Order.unit_id.in_(unit_ids))
-            .group_by(Order.unit_id)
-        )
-        for row in rows:
-            stats[int(row[0])] = (
-                int(row[1] or 0),
-                int(row[2] or 0),
-                int(row[3] or 0),
-                int(row[4] or 0),
-            )
-    day = datetime.now() - timedelta(hours=24)
-    summary_counts = db.execute(
-        select(
-            func.sum(case((Order.status == "watching", 1), else_=0)),
-            func.sum(
-                case(
-                    (
-                        Order.status.in_(("wait_retrieve", "wait_second"))
-                        | Order.prior_status.in_(("queued", "retry_wait")),
-                        1,
-                    ),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (
-                        Order.status.in_(("retrieving", "retrieving_second"))
-                        | (Order.prior_status == "retrieving"),
-                        1,
-                    ),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (
-                        (
-                            (Order.status == "error")
-                            | (Order.prior_status == "error")
+                                Order.status.in_(("wait_retrieve", "wait_second"))
+                                | Order.prior_status.in_(("queued", "retry_wait")),
+                                1,
+                            ),
+                            else_=0,
                         )
-                        & (Order.updated_at >= day),
-                        1,
                     ),
-                    else_=0,
+                    func.sum(
+                        case(
+                            (
+                                Order.status.in_(("retrieving", "retrieving_second"))
+                                | (Order.prior_status == "retrieving"),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                (
+                                    (Order.status == "error")
+                                    | (Order.prior_status == "error")
+                                )
+                                & (Order.updated_at >= day),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
                 )
-            ),
-        )
-    ).one()
-    summary = {
-        "enabled": int(
-            db.scalar(select(func.count()).select_from(Unit).where(Unit.enabled)) or 0
-        ),
-        "watching": int(summary_counts[0] or 0),
-        "queue": int(summary_counts[1] or 0),
-        "running": int(summary_counts[2] or 0),
-        "error": int(summary_counts[3] or 0),
-    }
+                .where(
+                    Order.archived_at.is_(None),
+                    or_(
+                        Order.status.in_(
+                            (
+                                "watching",
+                                "wait_retrieve",
+                                "wait_second",
+                                "retrieving",
+                                "retrieving_second",
+                                "error",
+                            )
+                        ),
+                        Order.prior_status.in_(
+                            ("queued", "retry_wait", "retrieving", "error")
+                        ),
+                    ),
+                )
+                .group_by(Order.unit_id)
+            )
+            for row in rows:
+                stats[int(row[0])] = tuple(int(value or 0) for value in row[1:5])
+            summary = {
+                "enabled": int(
+                    db.scalar(
+                        select(func.count())
+                        .select_from(Unit)
+                        .where(
+                            Unit.enabled.is_(True),
+                            Unit.deleted_at.is_(None),
+                        )
+                    )
+                    or 0
+                ),
+                "watching": sum(row[0] for row in stats.values()),
+                "queue": sum(row[1] for row in stats.values()),
+                "running": sum(row[2] for row in stats.values()),
+                "error": sum(row[3] for row in stats.values()),
+            }
+            _dashboard_stats_cache.update(
+                expires_at=monotonic() + 5,
+                engine_id=id(db.get_bind()),
+                stats=stats,
+                summary=summary,
+            )
     if units:
         with ThreadPoolExecutor(max_workers=len(units)) as executor:
             runtime = list(executor.map(_unit_runtime, units))
@@ -558,15 +631,27 @@ def units_list(
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    total = db.scalar(select(func.count()).select_from(Unit)) or 0
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(Unit)
+            .where(Unit.deleted_at.is_(None))
+        )
+        or 0
+    )
     enabled = (
-        db.scalar(select(func.count()).select_from(Unit).where(Unit.enabled.is_(True)))
+        db.scalar(
+            select(func.count())
+            .select_from(Unit)
+            .where(Unit.enabled.is_(True), Unit.deleted_at.is_(None))
+        )
         or 0
     )
     pager = paginate(total, page, UNITS_PAGE)
     units = list(
         db.scalars(
             select(Unit)
+            .where(Unit.deleted_at.is_(None))
             .order_by(Unit.name)
             .offset(pager["offset"])
             .limit(pager["size"])
@@ -638,7 +723,10 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
 
 
 def _port_taken(db: Session, port: int, unit_id: int | None) -> bool:
-    q = select(Unit).where(Unit.store_port == port)
+    q = select(Unit).where(
+        Unit.store_port == port,
+        Unit.deleted_at.is_(None),
+    )
     if unit_id:
         q = q.where(Unit.id != unit_id)
     return db.scalar(q) is not None
@@ -677,6 +765,16 @@ async def units_create(
     try:
         db.flush()
         migrate_legacy_study_rule(db)
+        _audit(
+            db,
+            request,
+            user,
+            action="create",
+            resource_type="unit",
+            resource_id=unit.id,
+            resource_name=unit.name,
+            summary="Unidade adicionada ao sistema.",
+        )
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -765,7 +863,7 @@ def units_edit(
     user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
-    if unit is None:
+    if unit is None or unit.deleted_at is not None:
         return RedirectResponse("/units", status_code=303)
     return templates.TemplateResponse(
         request=request,
@@ -784,7 +882,7 @@ async def units_update(
     user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
-    if unit is None:
+    if unit is None or unit.deleted_at is not None:
         return RedirectResponse("/units", status_code=303)
     raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
     try:
@@ -806,6 +904,16 @@ async def units_update(
         return RedirectResponse(f"/units/{unit_id}", status_code=303)
     _unit_from_form(form, unit)
     try:
+        _audit(
+            db,
+            request,
+            user,
+            action="update",
+            resource_type="unit",
+            resource_id=unit.id,
+            resource_name=unit.name,
+            summary="Configuração da unidade atualizada.",
+        )
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -823,8 +931,18 @@ def units_toggle(
     user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
-    if unit:
+    if unit and unit.deleted_at is None:
         unit.enabled = not unit.enabled
+        _audit(
+            db,
+            request,
+            user,
+            action="enable" if unit.enabled else "disable",
+            resource_type="unit",
+            resource_id=unit.id,
+            resource_name=unit.name,
+            summary="Unidade ativada." if unit.enabled else "Unidade pausada.",
+        )
         db.commit()
         flash(request, "Unidade " + ("ativada" if unit.enabled else "pausada") + ".")
     return RedirectResponse(request.headers.get("referer") or "/units", status_code=303)
@@ -838,20 +956,57 @@ def units_delete(
     user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
-    if unit:
-        db.execute(
-            delete(DicomRuleApplication).where(
-                DicomRuleApplication.unit_id == unit.id
+    if unit and unit.deleted_at is None:
+        processing = db.scalar(
+            select(func.count()).where(
+                Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
+                or_(
+                    Order.status.in_(ACTIVE_ORDER_STATUSES),
+                    Order.prior_status.in_(ACTIVE_PRIOR_STATUSES),
+                ),
             )
         )
-        db.execute(delete(ImageTransfer).where(ImageTransfer.unit_id == unit.id))
-        ids = list(db.scalars(select(Order.id).where(Order.unit_id == unit.id)))
-        if ids:
-            db.execute(delete(OrderEvent).where(OrderEvent.order_id.in_(ids)))
-            db.execute(delete(Order).where(Order.unit_id == unit.id))
-        db.delete(unit)
+        if processing:
+            flash(
+                request,
+                "Aguarde os pedidos em processamento terminarem antes de arquivar.",
+                "err",
+            )
+            return RedirectResponse("/units", status_code=303)
+        unit_name = unit.name
+        archived_at = datetime.now()
+        archive_unit(
+            unit,
+            actor_id=user.id,
+            actor_username=user.username,
+            archived_at=archived_at,
+        )
+        archived_orders = db.execute(
+            update(Order)
+            .where(Order.unit_id == unit.id, Order.archived_at.is_(None))
+            .values(
+                archived_at=archived_at,
+                archive_reason="Unidade arquivada pelo administrador.",
+                archived_by_user_id=user.id,
+                archived_by_username=user.username,
+            )
+        ).rowcount
+        _audit(
+            db,
+            request,
+            user,
+            action="archive",
+            resource_type="unit",
+            resource_id=unit_id,
+            resource_name=unit_name,
+            summary=(
+                f"Unidade arquivada; {archived_orders or 0} pedido(s) "
+                "foram movidos para o histórico."
+            ),
+        )
         db.commit()
-        flash(request, "Unidade apagada.")
+        flash(request, "Unidade arquivada com seus pedidos preservados.")
     return RedirectResponse("/units", status_code=303)
 
 
@@ -863,7 +1018,7 @@ def units_retry_errors(
     user: User = Depends(require_admin),
 ):
     unit = db.get(Unit, unit_id)
-    if unit is None:
+    if unit is None or unit.deleted_at is not None:
         return RedirectResponse("/units", status_code=303)
     src = Path(unit.error_dir)
     dest = Path(unit.receive_dir)
@@ -874,6 +1029,17 @@ def units_retry_errors(
             if f.is_file():
                 shutil.move(str(f), str(dest / f.name))
                 moved += 1
+    _audit(
+        db,
+        request,
+        user,
+        action="retry",
+        resource_type="unit",
+        resource_id=unit.id,
+        resource_name=unit.name,
+        summary=f"{moved} arquivo(s) devolvidos à fila de recebimento.",
+    )
+    db.commit()
     flash(request, f"{moved} arquivo(s) devolvidos ao recebimento.")
     return RedirectResponse(f"/units/{unit_id}", status_code=303)
 
@@ -928,7 +1094,11 @@ def rules_dicom(
     user: User = Depends(require_admin),
 ):
     rules = _dicom_rule_views(db)
-    units = list(db.scalars(select(Unit).order_by(Unit.name)))
+    units = list(
+        db.scalars(
+            select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.name)
+        )
+    )
     edit_rule = next((rule for rule in rules if rule.id == edit), None)
     return templates.TemplateResponse(
         request=request,
@@ -973,7 +1143,9 @@ def rules_dicom_tag_info(
 
 
 def _validated_dicom_rule_form(db: Session, form: Any) -> dict[str, Any]:
-    valid_unit_ids = set(db.scalars(select(Unit.id)))
+    valid_unit_ids = set(
+        db.scalars(select(Unit.id).where(Unit.deleted_at.is_(None)))
+    )
     return validate_rule_payload(
         name=str(form.get("name") or ""),
         enabled=form.get("enabled") == "1",
@@ -1033,6 +1205,16 @@ async def rules_dicom_create(
         data = _validated_dicom_rule_form(db, await request.form())
         rule = DicomRule()
         _store_dicom_rule(db, rule, data)
+        _audit(
+            db,
+            request,
+            user,
+            action="create",
+            resource_type="dicom_rule",
+            resource_id=rule.id,
+            resource_name=rule.name,
+            summary=f"Regra criada com {len(data['conditions'])} condição(ões).",
+        )
         db.commit()
     except ValueError as exc:
         db.rollback()
@@ -1065,6 +1247,16 @@ async def rules_dicom_update(
     try:
         data = _validated_dicom_rule_form(db, await request.form())
         _store_dicom_rule(db, rule, data)
+        _audit(
+            db,
+            request,
+            user,
+            action="update",
+            resource_type="dicom_rule",
+            resource_id=rule.id,
+            resource_name=rule.name,
+            summary=f"Regra atualizada com {len(data['conditions'])} condição(ões).",
+        )
         db.commit()
     except ValueError as exc:
         db.rollback()
@@ -1093,6 +1285,16 @@ def rules_dicom_toggle(
     rule = db.get(DicomRule, rule_id)
     if rule is not None:
         rule.enabled = not rule.enabled
+        _audit(
+            db,
+            request,
+            user,
+            action="enable" if rule.enabled else "disable",
+            resource_type="dicom_rule",
+            resource_id=rule.id,
+            resource_name=rule.name,
+            summary="Regra ativada." if rule.enabled else "Regra desativada.",
+        )
         db.commit()
         flash(request, "Regra ativada." if rule.enabled else "Regra desativada.")
     return RedirectResponse("/rules", status_code=303)
@@ -1107,12 +1309,23 @@ def rules_dicom_delete(
 ):
     rule = db.get(DicomRule, rule_id)
     if rule is not None:
+        rule_name = rule.name
         db.execute(
             update(DicomRuleApplication)
             .where(DicomRuleApplication.rule_id == rule.id)
             .values(rule_id=None)
         )
         db.delete(rule)
+        _audit(
+            db,
+            request,
+            user,
+            action="delete",
+            resource_type="dicom_rule",
+            resource_id=rule_id,
+            resource_name=rule_name,
+            summary="Regra DICOM removida.",
+        )
         db.commit()
         flash(request, "Regra DICOM excluída.")
     return RedirectResponse("/rules", status_code=303)
@@ -1156,15 +1369,25 @@ def rules_retrieve_add(
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/rules/retrieve", status_code=303)
-    db.add(
-        ModalityRule(
-            modality=safe_modality,
-            wait_minutes=wait_minutes,
-            second_retrieve=second_retrieve == "1",
-            second_wait_minutes=second_wait_minutes,
-        )
+    rule = ModalityRule(
+        modality=safe_modality,
+        wait_minutes=wait_minutes,
+        second_retrieve=second_retrieve == "1",
+        second_wait_minutes=second_wait_minutes,
     )
+    db.add(rule)
     try:
+        db.flush()
+        _audit(
+            db,
+            request,
+            user,
+            action="create",
+            resource_type="retrieve_rule",
+            resource_id=rule.id,
+            resource_name=rule.modality,
+            summary="Regra de tempo de retrieve adicionada.",
+        )
         db.commit()
         flash(request, "Regra adicionada.")
     except IntegrityError:
@@ -1198,6 +1421,16 @@ def rules_retrieve_update(
         if rule.second_retrieve:
             rule.second_wait_minutes = second_wait_minutes
         try:
+            _audit(
+                db,
+                request,
+                user,
+                action="update",
+                resource_type="retrieve_rule",
+                resource_id=rule.id,
+                resource_name=rule.modality,
+                summary="Tempos de retrieve atualizados.",
+            )
             db.commit()
             flash(request, "Regra salva.")
         except IntegrityError:
@@ -1223,6 +1456,16 @@ def rules_retrieve_delete(
 
     modality = rule.modality
     db.delete(rule)
+    _audit(
+        db,
+        request,
+        user,
+        action="delete",
+        resource_type="retrieve_rule",
+        resource_id=rule_id,
+        resource_name=modality,
+        summary="Regra de tempo de retrieve removida.",
+    )
     db.commit()
     log_event(
         log,
@@ -1277,8 +1520,20 @@ def rules_compress_add(
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/rules/compress", status_code=303)
-    db.add(CompressRule(modality=safe_modality, jpeg_flag=safe_flag))
+    rule = CompressRule(modality=safe_modality, jpeg_flag=safe_flag)
+    db.add(rule)
     try:
+        db.flush()
+        _audit(
+            db,
+            request,
+            user,
+            action="create",
+            resource_type="compress_rule",
+            resource_id=rule.id,
+            resource_name=rule.modality,
+            summary=f"Perfil de compactação {rule.jpeg_flag} adicionado.",
+        )
         db.commit()
         flash(request, "Perfil JPEG adicionado.")
     except IntegrityError:
@@ -1308,6 +1563,16 @@ def rules_compress_update(
             rule.modality = safe_modality
         rule.jpeg_flag = safe_flag
         try:
+            _audit(
+                db,
+                request,
+                user,
+                action="update",
+                resource_type="compress_rule",
+                resource_id=rule.id,
+                resource_name=rule.modality,
+                summary=f"Perfil de compactação alterado para {rule.jpeg_flag}.",
+            )
             db.commit()
             flash(request, "Perfil salvo.")
         except IntegrityError:
@@ -1353,6 +1618,16 @@ def rules_compress_delete(
     modality = rule.modality
     jpeg_flag = rule.jpeg_flag
     db.delete(rule)
+    _audit(
+        db,
+        request,
+        user,
+        action="delete",
+        resource_type="compress_rule",
+        resource_id=rule_id,
+        resource_name=modality,
+        summary=f"Perfil de compactação {jpeg_flag} removido.",
+    )
     db.commit()
     log_event(
         log,
@@ -1383,8 +1658,20 @@ def rules_drop_add(
     if safe_code == "*":
         flash(request, "O descarte não aceita modalidade curinga.", "err")
         return RedirectResponse("/rules/compress", status_code=303)
-    db.add(DropModality(code=safe_code))
+    row = DropModality(code=safe_code)
+    db.add(row)
     try:
+        db.flush()
+        _audit(
+            db,
+            request,
+            user,
+            action="create",
+            resource_type="drop_rule",
+            resource_id=row.id,
+            resource_name=row.code,
+            summary="Modalidade adicionada à lista de descarte.",
+        )
         db.commit()
         flash(request, "Modalidade adicionada ao descarte.")
     except IntegrityError:
@@ -1402,7 +1689,18 @@ def rules_drop_delete(
 ):
     row = db.get(DropModality, drop_id)
     if row:
+        code = row.code
         db.delete(row)
+        _audit(
+            db,
+            request,
+            user,
+            action="delete",
+            resource_type="drop_rule",
+            resource_id=drop_id,
+            resource_name=code,
+            summary="Modalidade removida da lista de descarte.",
+        )
         db.commit()
         flash(request, "Modalidade removida da lista de descarte.")
     return RedirectResponse("/rules/compress", status_code=303)
@@ -1414,13 +1712,67 @@ def orders_list(
     unit_id: int | None = None,
     status: str = Query("", max_length=32),
     q: str = Query("", max_length=200),
-    page: int = 1,
+    before: int | None = Query(None, ge=1),
+    after: int | None = Query(None, ge=1),
+    page: int | None = Query(None, ge=1),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
+    return _orders_response(
+        request,
+        db,
+        unit_id=unit_id,
+        status=status,
+        q=q,
+        before=before,
+        after=after,
+        history=False,
+    )
+
+
+@app.get("/orders/history", response_class=HTMLResponse)
+def orders_history(
+    request: Request,
+    unit_id: int | None = None,
+    status: str = Query("", max_length=32),
+    q: str = Query("", max_length=200),
+    before: int | None = Query(None, ge=1),
+    after: int | None = Query(None, ge=1),
+    page: int | None = Query(None, ge=1),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    return _orders_response(
+        request,
+        db,
+        unit_id=unit_id,
+        status=status,
+        q=q,
+        before=before,
+        after=after,
+        history=True,
+    )
+
+
+def _orders_response(
+    request: Request,
+    db: Session,
+    *,
+    unit_id: int | None,
+    status: str,
+    q: str,
+    before: int | None,
+    after: int | None,
+    history: bool,
+):
     if status and status not in STATUSES:
         raise StarletteHTTPException(422, "Status inválido")
-    filt = select(Order)
+    if before and after:
+        raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
+    archived_filter = (
+        Order.archived_at.is_not(None) if history else Order.archived_at.is_(None)
+    )
+    filt = select(Order).where(archived_filter)
     if unit_id:
         filt = filt.where(Order.unit_id == unit_id)
     if status:
@@ -1429,9 +1781,9 @@ def orders_list(
         like = f"%{q.strip()}%"
         filt = filt.where(
             or_(
-                Order.acc.like(like),
-                Order.pat_id.like(like),
-                Order.source_id.like(like),
+                Order.acc.ilike(like),
+                Order.pat_id.ilike(like),
+                Order.source_id.ilike(like),
             )
         )
     total = db.scalar(select(func.count()).select_from(filt.subquery())) or 0
@@ -1480,20 +1832,51 @@ def orders_list(
         "running": int(order_status_counts[1] or 0),
         "done": int(order_status_counts[2] or 0),
     }
-    pager = paginate(total, page, ORDERS_PAGE)
-    stmt = (
-        filt.options(selectinload(Order.unit))
-        .order_by(Order.id.desc())
-        .offset(pager["offset"])
-        .limit(pager["size"])
-    )
+    stmt = filt.options(selectinload(Order.unit))
+    if before:
+        stmt = stmt.where(Order.id < before).order_by(Order.id.desc())
+    elif after:
+        stmt = stmt.where(Order.id > after).order_by(Order.id.asc())
+    else:
+        stmt = stmt.order_by(Order.id.desc())
+    stmt = stmt.limit(ORDERS_PAGE)
     rows = list(db.scalars(stmt))
+    if after:
+        rows.reverse()
     for o in rows:
         o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
         o.badge = badge_for(o.status)  # type: ignore[attr-defined]
         o.prior_status_label = PRIOR_STATUS_LABELS.get(  # type: ignore[attr-defined]
             o.prior_status, o.prior_status
         )
+    has_prev = False
+    has_next = False
+    if rows:
+        has_prev = (
+            db.scalar(
+                filt.where(Order.id > rows[0].id)
+                .with_only_columns(Order.id)
+                .limit(1)
+            )
+            is not None
+        )
+        has_next = (
+            db.scalar(
+                filt.where(Order.id < rows[-1].id)
+                .with_only_columns(Order.id)
+                .limit(1)
+            )
+            is not None
+        )
+    pager = {
+        "cursor": True,
+        "total": total,
+        "count": len(rows),
+        "has_prev": has_prev,
+        "has_next": has_next,
+        "prev_cursor": rows[0].id if rows else None,
+        "next_cursor": rows[-1].id if rows else None,
+    }
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
     qs = query_keep(unit_id=unit_id, status=status, q=q)
     return templates.TemplateResponse(
@@ -1502,7 +1885,7 @@ def orders_list(
         context=ctx(
             request,
             db,
-            "orders",
+            "order_history" if history else "orders",
             orders=rows,
             units=units,
             statuses=STATUSES,
@@ -1512,6 +1895,8 @@ def orders_list(
             pager=pager,
             order_summary=order_summary,
             qs=qs,
+            history=history,
+            orders_path="/orders/history" if history else "/orders",
         ),
     )
 
@@ -1592,7 +1977,7 @@ def order_detail(
         context=ctx(
             request,
             db,
-            "orders",
+            "order_history" if order.archived_at else "orders",
             order=order,
             events=events,
             status_label=STATUSES.get(order.status, order.status),
@@ -1620,10 +2005,21 @@ def order_retry(
     order = db.get(Order, order_id)
     if (
         order
+        and order.archived_at is None
         and order.status not in ACTIVE_ORDER_STATUSES
         and order.prior_status not in ACTIVE_PRIOR_STATUSES
     ):
         _reset_order_for_reprocess(db, order)
+        _audit(
+            db,
+            request,
+            user,
+            action="retry",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary="Pedido reiniciado para novo retrieve e envio.",
+        )
         db.commit()
         log_event(
             log,
@@ -1656,6 +2052,9 @@ def order_retry_prior(
     if order is None:
         flash(request, "Pedido não encontrado.", "err")
         return RedirectResponse("/orders", status_code=303)
+    if order.archived_at is not None:
+        flash(request, "Pedidos arquivados são somente para consulta.", "err")
+        return RedirectResponse(f"/orders/{order_id}", status_code=303)
     if order.prior_status == "disabled":
         flash(request, "O retrieve histórico não está habilitado neste pedido.", "err")
     elif order.prior_status in ACTIVE_PRIOR_STATUSES:
@@ -1678,6 +2077,16 @@ def order_retry_prior(
                 level="info",
                 message="Reprocessamento manual do histórico solicitado",
             )
+        )
+        _audit(
+            db,
+            request,
+            user,
+            action="retry",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary="Retrieve histórico colocado novamente na fila.",
         )
         db.commit()
         log_event(
@@ -1727,8 +2136,22 @@ def order_cancel(
     user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
-    if order and order.status not in ("done", "cancelled"):
+    if (
+        order
+        and order.archived_at is None
+        and order.status not in ("done", "cancelled")
+    ):
         order.status = "cancelled"
+        _audit(
+            db,
+            request,
+            user,
+            action="cancel",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary="Processamento do pedido cancelado.",
+        )
         db.commit()
         flash(request, "Pedido cancelado.")
     return RedirectResponse(
@@ -1736,14 +2159,21 @@ def order_cancel(
     )
 
 
-def _delete_order_record(db: Session, order: Order) -> None:
-    db.execute(
-        update(ImageTransfer)
-        .where(ImageTransfer.order_id == order.id)
-        .values(order_id=None)
+def _delete_order_record(
+    db: Session,
+    order: Order,
+    *,
+    actor_id: int | None = None,
+    actor_username: str = "Sistema",
+    reason: str = "Pedido arquivado manualmente.",
+) -> None:
+    archive_order(
+        db,
+        order,
+        reason=reason,
+        actor_id=actor_id,
+        actor_username=actor_username,
     )
-    db.execute(delete(OrderEvent).where(OrderEvent.order_id == order.id))
-    db.delete(order)
 
 
 @app.post("/orders/{order_id}/delete")
@@ -1757,6 +2187,9 @@ def order_delete(
     if order is None:
         flash(request, "Pedido não encontrado.", "err")
         return RedirectResponse("/orders", status_code=303)
+    if order.archived_at is not None:
+        flash(request, "O pedido já está arquivado.", "err")
+        return RedirectResponse("/orders/history", status_code=303)
     if (
         order.status in ACTIVE_ORDER_STATUSES
         or order.prior_status in ACTIVE_PRIOR_STATUSES
@@ -1764,19 +2197,35 @@ def order_delete(
         flash(request, "Aguarde o processamento atual terminar para excluir.", "err")
         return RedirectResponse("/orders", status_code=303)
     unit_id = order.unit_id
-    _delete_order_record(db, order)
+    accession = order.acc
+    _delete_order_record(
+        db,
+        order,
+        actor_id=user.id,
+        actor_username=user.username,
+    )
+    _audit(
+        db,
+        request,
+        user,
+        action="archive",
+        resource_type="order",
+        resource_id=order_id,
+        resource_name=accession,
+        summary="Pedido arquivado com eventos e arquivos clínicos preservados.",
+    )
     db.commit()
     log_event(
         log,
         logging.INFO,
-        "order.delete",
+        "order.archive",
         resource=f"order:{order_id}",
         status="success",
         order_id=order_id,
         unit_id=unit_id,
         user_id=user.id,
     )
-    flash(request, "Pedido excluído. Os arquivos clínicos foram preservados.")
+    flash(request, "Pedido arquivado. Todo o histórico foi preservado.")
     return RedirectResponse("/orders", status_code=303)
 
 
@@ -1803,6 +2252,83 @@ def _admin_count(db: Session) -> int:
     return (
         db.scalar(select(func.count()).select_from(User).where(User.role == "admin"))
         or 0
+    )
+
+
+@app.get("/logs", response_class=HTMLResponse)
+def audit_logs(
+    request: Request,
+    action: str = Query("", max_length=32),
+    resource: str = Query("", max_length=32),
+    q: str = Query("", max_length=120),
+    page: int = 1,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    if action and action not in AUDIT_ACTION_LABELS:
+        raise StarletteHTTPException(422, "Ação de auditoria inválida")
+    if resource and resource not in AUDIT_RESOURCE_LABELS:
+        raise StarletteHTTPException(422, "Tipo de recurso inválido")
+
+    filtered = select(AuditLog)
+    if action:
+        filtered = filtered.where(AuditLog.action == action)
+    if resource:
+        filtered = filtered.where(AuditLog.resource_type == resource)
+    search = q.strip()
+    if search:
+        like = f"%{search}%"
+        filtered = filtered.where(
+            or_(
+                AuditLog.actor_username.like(like),
+                AuditLog.resource_name.like(like),
+                AuditLog.resource_id.like(like),
+                AuditLog.summary.like(like),
+            )
+        )
+
+    count_query = select(func.count()).select_from(filtered.subquery())
+    pager = paginate(int(db.scalar(count_query) or 0), page, AUDIT_LOGS_PAGE)
+    entries = list(
+        db.scalars(
+            filtered.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .offset(pager["offset"])
+            .limit(pager["size"])
+        )
+    )
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    summary = {
+        "total": int(db.scalar(select(func.count()).select_from(AuditLog)) or 0),
+        "today": int(
+            db.scalar(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(AuditLog.created_at >= today)
+            )
+            or 0
+        ),
+        "actors": int(
+            db.scalar(select(func.count(func.distinct(AuditLog.actor_username)))) or 0
+        ),
+    }
+    return templates.TemplateResponse(
+        request=request,
+        name="logs.html",
+        context=ctx(
+            request,
+            db,
+            "logs",
+            entries=entries,
+            summary=summary,
+            action=action,
+            resource=resource,
+            q=search,
+            action_labels=AUDIT_ACTION_LABELS,
+            resource_labels=AUDIT_RESOURCE_LABELS,
+            action_badges=AUDIT_ACTION_BADGES,
+            pager=pager,
+            qs=query_keep(action=action, resource=resource, q=search),
+        ),
     )
 
 
@@ -1877,6 +2403,17 @@ def users_create(
     )
     db.add(managed_user)
     try:
+        db.flush()
+        _audit(
+            db,
+            request,
+            user,
+            action="create",
+            resource_type="user",
+            resource_id=managed_user.id,
+            resource_name=managed_user.username,
+            summary=f"Usuário criado com o perfil {managed_user.role}.",
+        )
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -1950,6 +2487,19 @@ def users_update(
             return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
         managed_user.password_hash = hash_password(new_password)
     managed_user.role = role
+    update_summary = f"Perfil definido como {role}."
+    if new_password:
+        update_summary += " Senha redefinida pelo administrador."
+    _audit(
+        db,
+        request,
+        user,
+        action="update",
+        resource_type="user",
+        resource_id=managed_user.id,
+        resource_name=managed_user.username,
+        summary=update_summary,
+    )
     db.commit()
     log_event(
         log,
@@ -1983,7 +2533,18 @@ def users_delete(
         flash(request, "O sistema precisa manter pelo menos um administrador.", "err")
         return RedirectResponse("/users", status_code=303)
     deleted_user_id = managed_user.id
+    deleted_username = managed_user.username
     db.delete(managed_user)
+    _audit(
+        db,
+        request,
+        user,
+        action="delete",
+        resource_type="user",
+        resource_id=deleted_user_id,
+        resource_name=deleted_username,
+        summary="Conta de usuário removida.",
+    )
     db.commit()
     log_event(
         log,
@@ -2029,6 +2590,16 @@ def account_password_update(
         flash(request, str(exc), "err")
         return RedirectResponse("/account/password", status_code=303)
     user.password_hash = hash_password(new_password)
+    _audit(
+        db,
+        request,
+        user,
+        action="password",
+        resource_type="user",
+        resource_id=user.id,
+        resource_name=user.username,
+        summary="Usuário alterou a própria senha.",
+    )
     db.commit()
     log_event(
         log,

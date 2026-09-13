@@ -20,9 +20,30 @@
     button.addEventListener("click", () => setSidebar(false));
   });
 
+  const accountMenu = document.querySelector("[data-account-menu]");
+  const accountMenuToggle = accountMenu?.querySelector("[data-account-menu-toggle]");
+  const accountMenuPanel = accountMenu?.querySelector("[data-account-menu-panel]");
+  const setAccountMenu = (open, restoreFocus = false) => {
+    if (!accountMenuToggle || !accountMenuPanel) return;
+    accountMenuToggle.setAttribute("aria-expanded", String(open));
+    accountMenuPanel.hidden = !open;
+    if (restoreFocus) accountMenuToggle.focus();
+  };
+
+  accountMenuToggle?.addEventListener("click", () => {
+    setAccountMenu(accountMenuToggle.getAttribute("aria-expanded") !== "true");
+  });
+
+  document.addEventListener("click", (event) => {
+    if (accountMenu && !accountMenu.contains(event.target)) setAccountMenu(false);
+  });
+
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && body.classList.contains("sidebar-is-open")) {
       setSidebar(false);
+    }
+    if (event.key === "Escape" && accountMenuToggle?.getAttribute("aria-expanded") === "true") {
+      setAccountMenu(false, true);
     }
   });
 
@@ -246,11 +267,15 @@
     const conditionTemplate = document.querySelector("[data-condition-template]");
     const valuelessOperators = new Set(["exists", "not_exists"]);
 
-    const updateRemoveButtons = () => {
+    const updateConditionRows = () => {
       const rows = conditionList?.querySelectorAll("[data-condition-row]") || [];
-      rows.forEach((row) => {
+      const combinator = dicomRuleForm.querySelector("#rule-combinator")?.value;
+      rows.forEach((row, index) => {
         const button = row.querySelector("[data-condition-remove]");
         if (button) button.disabled = rows.length === 1;
+        const number = row.querySelector("[data-condition-number]");
+        if (number) number.textContent = String(index + 1);
+        row.dataset.joinLabel = combinator === "or" ? "OU" : "E";
       });
     };
 
@@ -291,7 +316,7 @@
       operator?.addEventListener("change", () => updateConditionValue(row));
       row.querySelector("[data-condition-remove]")?.addEventListener("click", () => {
         row.remove();
-        updateRemoveButtons();
+        updateConditionRows();
       });
       updateConditionValue(row);
     };
@@ -304,10 +329,11 @@
       const row = fragment.querySelector("[data-condition-row]");
       initializeConditionRow(row);
       conditionList.appendChild(fragment);
-      updateRemoveButtons();
+      updateConditionRows();
       row.querySelector("[data-dicom-tag]")?.focus();
     });
-    updateRemoveButtons();
+    dicomRuleForm.querySelector("#rule-combinator")?.addEventListener("change", updateConditionRows);
+    updateConditionRows();
 
     dicomRuleForm.addEventListener("focusout", (event) => {
       if (event.target.matches?.("[data-dicom-tag]")) resolveTagName(event.target);

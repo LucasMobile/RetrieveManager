@@ -26,10 +26,18 @@ deste servidor. O mesmo AET é usado pelo `findscu`, `movescu` e `storescp`.
 ```bash
 cd retrieve-manager
 cp .env.example .env
-# edite SECRET_KEY e RETRIEVE_ADMIN_PASSWORD (o container recusa valores fracos)
+# edite SECRET_KEY, RETRIEVE_ADMIN_PASSWORD e POSTGRES_PASSWORD
 # garanta leitura/escrita das pastas montadas para o UID/GID 10001
 docker compose up -d --build
 ```
+
+O Compose inicia um PostgreSQL dedicado, usado em conjunto pelos serviços `web`
+e `worker`. Os dados do banco ficam no volume `postgres-data`; o volume
+`retrieve-data` continua reservado aos dados locais da aplicação. Não remova o
+volume do PostgreSQL ao recriar os containers.
+
+Como o projeto ainda está em desenvolvimento, o banco PostgreSQL começa vazio e
+nenhum arquivo SQLite antigo é importado automaticamente.
 
 ### Servidor sem acesso ao Docker Hub
 
@@ -132,7 +140,7 @@ o cookie de sessão. Recarregue formulários abertos antes desta atualização.
 Saúde e logs:
 
 - `GET /health/live`: processo web vivo.
-- `GET /health`: readiness com consulta real ao SQLite.
+- `GET /health`: readiness com consulta real ao PostgreSQL.
 - O worker possui healthcheck por heartbeat atualizado a cada ciclo.
 - `docker compose logs -f web worker`: eventos JSON com `correlation_id`.
 
@@ -165,6 +173,19 @@ $env:DATABASE_URL = "sqlite:///:memory:"
 ```
 
 Sem os binários DCMTK no PATH o worker registra erro no pedido e a tela continua utilizável para cadastro. Em produção use o Docker, que já traz o DCMTK 3.7.0.
+
+## Retenção e desempenho dos pedidos
+
+Pedidos não são apagados fisicamente. A ação **Arquivar** remove o registro da
+fila operacional e o mantém, com eventos e vínculos de arquivos, em **Histórico
+de pedidos**. Pedidos sem resultado no C-FIND após 24 horas também são arquivados
+automaticamente. Unidades removidas seguem a mesma regra de preservação.
+
+A fila usa paginação por cursor, sem o custo crescente de `OFFSET`. O PostgreSQL
+recebe índices parciais para registros ativos, histórico e limpeza automática,
+além de índices `pg_trgm` para busca por accession, Patient ID e ID de origem. Os
+agregados da Visão geral têm cache curto de cinco segundos para que vários
+navegadores não repitam as mesmas varreduras do banco a cada atualização.
 
 ## Cadastrar uma unidade
 

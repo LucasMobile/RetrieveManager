@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ from starlette.testclient import TestClient
 from app.config import BASE_DIR, DEFAULT_CLOUD_URL
 from app.main import app, get_db
 from app.middleware import _same_origin
-from app.models import Base, DicomRule, Settings, Unit, User
+from app.models import AuditLog, Base, DicomRule, Order, Settings, Unit, User
 from app.security import hash_password, verify_password
 from app.validation import validate_cloud_url
 
@@ -174,6 +175,15 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(unit.cloud_url, DEFAULT_CLOUD_URL)
             self.assertEqual(unit.file_settle_seconds, 3)
 
+        edit_page = self.client.get(f"/units/{unit_id}")
+        self.assertEqual(edit_page.status_code, 200)
+        self.assertEqual(edit_page.text.count('placeholder="••••••••••••"'), 2)
+        self.assertNotIn('value="integration-token"', edit_page.text)
+        self.assertNotIn('value="unit-token"', edit_page.text)
+        self.assertNotIn(
+            "Deixe em branco para manter o token atual.", edit_page.text
+        )
+
         token = self.token(f"/units/{unit_id}")
         update_data = self.unit_form_data(
             csrf_token=token,
@@ -197,7 +207,10 @@ class SecurityTest(unittest.TestCase):
                 303,
             )
         with self.Session() as db:
-            self.assertEqual(db.get(Unit, unit_id).file_settle_seconds, 7)
+            unit = db.get(Unit, unit_id)
+            self.assertEqual(unit.file_settle_seconds, 7)
+            self.assertEqual(unit.orders_api_token, "integration-token")
+            self.assertEqual(unit.token, "unit-token")
         self.assertEqual(
             self.client.get("/orders", params={"q": "x" * 201}).status_code, 422
         )
@@ -319,6 +332,9 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn('href="/units"', dashboard.text)
         self.assertNotIn('href="/users"', dashboard.text)
         self.assertNotIn("Nova unidade", dashboard.text)
+        self.assertIn("data-account-menu", dashboard.text)
+        self.assertIn('href="/account/password"', dashboard.text)
+        self.assertIn("Trocar senha", dashboard.text)
         orders = self.client.get("/orders")
         self.assertEqual(orders.status_code, 200)
         self.assertNotIn('action="/orders/', orders.text)
@@ -331,6 +347,8 @@ class SecurityTest(unittest.TestCase):
             "/rules/retrieve",
             "/rules/compress",
             "/users",
+            "/logs",
+            "/orders/history",
             "/settings",
         ):
             with self.subTest(path=path):
@@ -349,6 +367,33 @@ class SecurityTest(unittest.TestCase):
                     self.client.post(path, data={"csrf_token": token}).status_code,
                     403,
                 )
+
+    def test_audit_logs_record_changes_and_are_filterable(self):
+        self.login()
+        token = self.token("/units/new")
+        response = self.client.post(
+            "/units/new",
+            data=self.unit_form_data(csrf_token=token),
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+
+        with self.Session() as db:
+            entry = db.scalar(select(AuditLog))
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.actor_username, "tester")
+            self.assertEqual(entry.action, "create")
+            self.assertEqual(entry.resource_type, "unit")
+            self.assertEqual(entry.resource_name, "Unidade de teste")
+
+        logs = self.client.get("/logs", params={"resource": "unit", "action": "create"})
+        self.assertEqual(logs.status_code, 200)
+        self.assertIn("Unidade de teste", logs.text)
+        self.assertIn("Unidade adicionada ao sistema.", logs.text)
+        self.assertEqual(
+            self.client.get("/logs", params={"resource": "invalid"}).status_code,
+            422,
+        )
 
     def test_admin_can_create_update_and_delete_users_with_self_protection(self):
         self.login()
@@ -518,6 +563,102 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("<img src=x", response.text)
         self.assertIn("&lt;img", response.text)
+
+    def test_orders_use_cursor_and_archived_orders_have_separate_history(self):
+        self.login()
+        with self.Session() as db:
+            unit = Unit(
+                name="Cursor",
+                orders_api_url="https://example.test/orders",
+                orders_api_token="token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir=str(BASE_DIR),
+                send_dir=str(BASE_DIR),
+                error_dir=str(BASE_DIR),
+                token="unit-token",
+            )
+            db.add(unit)
+            db.flush()
+            db.add_all(
+                Order(
+                    unit_id=unit.id,
+                    acc=f"active-{index:02d}",
+                    birth_date="20000101",
+                )
+                for index in range(42)
+            )
+            db.add(
+                Order(
+                    unit_id=unit.id,
+                    acc="archived-only",
+                    birth_date="20000101",
+                    archived_at=datetime.now(),
+                    archive_reason="Teste",
+                )
+            )
+            db.commit()
+
+        first = self.client.get("/orders")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.text.count('class="order-date"'), 40)
+        self.assertNotIn("archived-only", first.text)
+        cursor = re.search(r"before=(\d+)", first.text)[1]
+        second = self.client.get("/orders", params={"before": cursor})
+        self.assertEqual(second.text.count('class="order-date"'), 2)
+
+        history = self.client.get("/orders/history")
+        self.assertEqual(history.status_code, 200)
+        self.assertIn("archived-only", history.text)
+        self.assertNotIn("active-41", history.text)
+
+    def test_archiving_unit_preserves_unit_and_orders(self):
+        self.login()
+        with self.Session() as db:
+            unit = Unit(
+                name="Archive unit",
+                orders_api_url="https://example.test/orders",
+                orders_api_token="token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir=str(BASE_DIR),
+                send_dir=str(BASE_DIR),
+                error_dir=str(BASE_DIR),
+                token="unit-token",
+            )
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                acc="unit-archive-order",
+                birth_date="20000101",
+                status="done",
+            )
+            db.add(order)
+            db.commit()
+            unit_id = unit.id
+            order_id = order.id
+
+        token = self.token("/units")
+        response = self.client.post(
+            f"/units/{unit_id}/delete",
+            data={"csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            unit = db.get(Unit, unit_id)
+            order = db.get(Order, order_id)
+            self.assertIsNotNone(unit.deleted_at)
+            self.assertFalse(unit.enabled)
+            self.assertIsNotNone(order.archived_at)
+            self.assertEqual(order.unit_id, unit_id)
 
     def test_error_return_does_not_use_external_referer(self):
         self.login()

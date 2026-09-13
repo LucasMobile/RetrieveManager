@@ -8,8 +8,8 @@
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=2">
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>{% block title %}Retrieve Manager{% endblock %}</title>
-  <link rel="stylesheet" href="/static/app.css?v=23">
-  <script src="/static/app.js?v=10" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=27">
+  <script src="/static/app.js?v=12" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Pular para o conteúdo</a>
@@ -35,6 +35,9 @@
         {{ icon("orders") }}<span>Fila de pedidos</span>
       </a>
       {% if user and user.role == 'admin' %}
+      <a href="/orders/history" class="nav__item{% if nav == 'order_history' %} is-active{% endif %}"{% if nav == 'order_history' %} aria-current="page"{% endif %}>
+        {{ icon("timeline") }}<span>Histórico de pedidos</span>
+      </a>
       <a href="/units" class="nav__item{% if nav == 'units' %} is-active{% endif %}"{% if nav == 'units' %} aria-current="page"{% endif %}>
         {{ icon("building") }}<span>Unidades</span>
       </a>
@@ -52,22 +55,31 @@
       <a href="/users" class="nav__item{% if nav == 'users' %} is-active{% endif %}"{% if nav == 'users' %} aria-current="page"{% endif %}>
         {{ icon("users") }}<span>Usuários</span>
       </a>
+      <a href="/logs" class="nav__item{% if nav == 'logs' %} is-active{% endif %}"{% if nav == 'logs' %} aria-current="page"{% endif %}>
+        {{ icon("timeline") }}<span>Logs</span>
+      </a>
       {% endif %}
     </nav>
 
     {% if user %}
-    <div class="account">
-      <div class="account__avatar" aria-hidden="true">{{ user.username[:1]|upper }}</div>
-      <a class="account__copy" href="/account/password" title="Alterar minha senha">
-        <strong>{{ user.username }}</strong>
-        <span>{{ 'Administrador' if user.role == 'admin' else 'Usuário' }}</span>
-      </a>
+    <div class="account" data-account-menu>
+      <button class="account__trigger" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="account-menu" data-account-menu-toggle>
+        <span class="account__avatar" aria-hidden="true">{{ user.username[:1]|upper }}</span>
+        <span class="account__copy">
+          <strong>{{ user.username }}</strong>
+          <span>{{ 'Administrador' if user.role == 'admin' else 'Usuário' }}</span>
+        </span>
+        {{ icon("chevron-down", "account__chevron") }}
+      </button>
       <form method="post" action="/logout">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button class="icon-button icon-button--inverse" type="submit" aria-label="Sair da conta" title="Sair">
           {{ icon("log-out") }}
         </button>
       </form>
+      <div class="account__menu" id="account-menu" role="menu" data-account-menu-panel hidden>
+        <a href="/account/password" role="menuitem">{{ icon("key") }}<span>Trocar senha</span></a>
+      </div>
     </div>
     {% endif %}
   </aside>

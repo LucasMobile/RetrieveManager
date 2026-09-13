@@ -12,7 +12,7 @@ from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import (
@@ -43,12 +43,14 @@ from app.dicom_tools import (
 )
 from app.events import add_event
 from app.models import (
+    AuditLog,
     CompressRule,
     DicomRuleApplication,
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
     Order,
+    OrderEvent,
     Unit,
 )
 from app.observability import log_context, log_event, new_correlation_id
@@ -59,12 +61,15 @@ from app.orders_api import (
     fetch_orders,
     parse_api_order,
 )
+from app.retention import archive_order
 from app.parse import parse_findscu_output
 from app.rules import drop_codes, schedule_from_now
 
 log = logging.getLogger("worker")
 STALE_LOCK = timedelta(minutes=20)
 PRIOR_RETRY_DELAYS = (60, 300)
+UNMATCHED_ORDER_RETENTION = timedelta(days=1)
+UNMATCHED_ORDER_CLEANUP_BATCH = 500
 
 
 @dataclass(frozen=True)
@@ -117,6 +122,7 @@ def recover_stale_locks(db: Session) -> None:
     rows = list(
         db.scalars(
             select(Order).where(
+                Order.archived_at.is_(None),
                 Order.status.in_(("retrieving", "retrieving_second")),
                 (Order.heartbeat_at.is_(None)) | (Order.heartbeat_at < cutoff),
             )
@@ -146,7 +152,12 @@ def recover_stale_locks(db: Session) -> None:
     # Como o subprocesso é bloqueante, o heartbeat não avança durante a execução;
     # respeite o timeout configurado na unidade antes de considerar o job órfão.
     prior_candidates = list(
-        db.scalars(select(Order).where(Order.prior_status == "retrieving"))
+        db.scalars(
+            select(Order).where(
+                Order.archived_at.is_(None),
+                Order.prior_status == "retrieving",
+            )
+        )
     )
     prior_rows = [
         order
@@ -289,6 +300,19 @@ def ingest_unit(db: Session, unit: Unit) -> int:
         )
         db.add(order)
         db.flush()
+        db.add(
+            AuditLog(
+                actor_id=None,
+                actor_username="Sistema",
+                actor_role="system",
+                action="create",
+                resource_type="order",
+                resource_id=str(order.id),
+                resource_name=order.acc,
+                summary=f"Pedido recebido automaticamente da unidade {unit.name}.",
+                ip_address="",
+            )
+        )
         add_event(
             db,
             order,
@@ -317,6 +341,7 @@ def _acknowledge_pending_orders(db: Session, unit: Unit) -> None:
             select(Order)
             .where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.api_read_status == "pending",
             )
             .order_by(Order.id)
@@ -372,6 +397,63 @@ def _acknowledge_pending_orders(db: Session, unit: Unit) -> None:
     db.commit()
 
 
+def cleanup_unmatched_orders(db: Session, now: datetime | None = None) -> int:
+    current_time = now or datetime.now()
+    cutoff = current_time - UNMATCHED_ORDER_RETENTION
+    orders = list(
+        db.scalars(
+            select(Order)
+            .where(
+                Order.archived_at.is_(None),
+                Order.status == "watching",
+                Order.study_uid == "",
+                Order.last_find_at.is_not(None),
+                Order.attempts > 0,
+                Order.created_at <= cutoff,
+            )
+            .order_by(Order.created_at, Order.id)
+            .limit(UNMATCHED_ORDER_CLEANUP_BATCH)
+        )
+    )
+    for order in orders:
+        order_id = order.id
+        accession = order.acc
+        archive_order(
+            db,
+            order,
+            reason="Nenhum exame localizado pelo C-FIND após 24 horas.",
+            archived_at=current_time,
+        )
+        db.add(
+            AuditLog(
+                actor_id=None,
+                actor_username="Sistema",
+                actor_role="system",
+                action="archive",
+                resource_type="order",
+                resource_id=str(order_id),
+                resource_name=accession,
+                summary=(
+                    "Pedido arquivado automaticamente após 24 horas sem exame "
+                    "localizado pelo C-FIND; histórico preservado."
+                ),
+                ip_address="",
+            )
+        )
+    if orders:
+        db.commit()
+        log_event(
+            log,
+            logging.INFO,
+            "order.unmatched.archive",
+            resource="orders",
+            status="success",
+            archived_count=len(orders),
+            cutoff=cutoff.isoformat(),
+        )
+    return len(orders)
+
+
 def find_pending(db: Session, unit: Unit) -> None:
     now = datetime.now()
     interval = timedelta(seconds=unit.find_interval_seconds or 30)
@@ -380,6 +462,7 @@ def find_pending(db: Session, unit: Unit) -> None:
             select(Order)
             .where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.status == "watching",
                 or_(
                     Order.last_find_at.is_(None),
@@ -517,6 +600,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         db.scalar(
             select(func.count()).where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.status.in_(("retrieving", "retrieving_second")),
             )
         )
@@ -526,6 +610,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         db.scalar(
             select(func.count()).where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.prior_status == "retrieving",
             )
         )
@@ -541,6 +626,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             select(Order)
             .where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.status == "wait_retrieve",
                 Order.prior_status.notin_(("queued", "retry_wait", "retrieving")),
                 Order.retrieve_at.is_not(None),
@@ -554,6 +640,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             select(Order)
             .where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.status == "wait_second",
                 Order.prior_status.notin_(("queued", "retry_wait", "retrieving")),
                 Order.second_retrieve_at.is_not(None),
@@ -566,6 +653,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         db.scalars(
             select(Order).where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.prior_status.in_(("queued", "retry_wait")),
                 Order.prior_due_at.is_not(None),
                 Order.prior_due_at <= now,
@@ -983,6 +1071,7 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         order = db.scalar(
             select(Order)
             .where(Order.unit_id == unit.id, Order.study_uid == result.study_uid)
+            .where(Order.archived_at.is_(None))
             .order_by(Order.id.desc())
             .limit(1)
         )
@@ -1057,6 +1146,7 @@ def _associate_historical_transfer(
         db.scalars(
             select(Order).where(
                 Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
                 Order.prior_status != "disabled",
                 Order.prior_started_at.is_not(None),
                 Order.prior_started_at <= result.observed_at,

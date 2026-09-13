@@ -95,9 +95,9 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
                   <button class="action-icon" type="submit" data-tooltip="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}" aria-label="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}">{{ icon("pause" if u.enabled else "play") }}</button>
                 </form>
-                <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Excluir a unidade {{ u.name }}? Todos os pedidos e eventos do histórico também serão removidos. Esta ação não pode ser desfeita." data-confirm-label="Excluir unidade">
+                <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Arquivar a unidade {{ u.name }}? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-                  <button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir unidade" aria-label="Excluir unidade">{{ icon("trash") }}</button>
+                  <button class="action-icon action-icon--danger" type="submit" data-tooltip="Arquivar unidade" aria-label="Arquivar unidade">{{ icon("trash") }}</button>
                 </form>
               </div>
             </td>

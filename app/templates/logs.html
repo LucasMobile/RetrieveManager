@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Logs · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack logs-page">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Auditoria</p>
+      <h1>Logs</h1>
+      <p class="page-header__description">Acompanhe as alterações realizadas na configuração e nas operações do sistema.</p>
+    </div>
+  </header>
+
+  <section class="surface logs-summary" aria-label="Resumo dos logs">
+    <div><strong>{{ summary.total }}</strong><span>eventos registrados</span></div>
+    <div><strong>{{ summary.today }}</strong><span>eventos hoje</span></div>
+    <div><strong>{{ summary.actors }}</strong><span>autores identificados</span></div>
+  </section>
+
+  <form class="surface filter-bar logs-filter" method="get" action="/logs" aria-label="Filtros dos logs">
+    <div class="filter-grid">
+      <div class="field">
+        <label for="filter-resource">Recurso</label>
+        <select id="filter-resource" name="resource">
+          <option value="">Todos os recursos</option>
+          {% for key, label in resource_labels.items() %}<option value="{{ key }}" {% if resource == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="filter-action">Ação</label>
+        <select id="filter-action" name="action">
+          <option value="">Todas as ações</option>
+          {% for key, label in action_labels.items() %}<option value="{{ key }}" {% if action == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="field logs-filter__search">
+        <label for="filter-query">Pesquisar</label>
+        <div class="input-with-icon">{{ icon("search") }}<input id="filter-query" name="q" maxlength="120" value="{{ q }}" placeholder="Usuário, recurso ou descrição"></div>
+      </div>
+      <div class="filter-actions">
+        <button class="btn btn--primary" type="submit">{{ icon("search") }} Filtrar</button>
+        {% if action or resource or q %}<a class="btn btn--quiet" href="/logs">Limpar</a>{% endif %}
+      </div>
+    </div>
+  </form>
+
+  <section class="surface logs-table-card" aria-labelledby="logs-table-title">
+    <div class="logs-table-card__header">
+      <div><h2 id="logs-table-title">Histórico de alterações</h2><p>Eventos mais recentes aparecem primeiro.</p></div>
+      <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+    </div>
+    {% if entries %}
+    <div class="table-wrap">
+      <table class="data-table logs-table">
+        <thead><tr><th scope="col">Data e hora</th><th scope="col">Usuário</th><th scope="col">Ação</th><th scope="col">Recurso</th><th scope="col">Descrição</th><th scope="col">Origem</th></tr></thead>
+        <tbody>
+          {% for entry in entries %}
+          <tr>
+            <td><span class="log-date"><strong>{{ entry.created_at.strftime('%d/%m/%Y') }}</strong><span>{{ entry.created_at.strftime('%H:%M:%S') }}</span></span></td>
+            <td><span class="table-primary">{{ entry.actor_username }}</span><span class="table-secondary">{{ 'Administrador' if entry.actor_role == 'admin' else ('Usuário' if entry.actor_role == 'user' else 'Automático') }}</span></td>
+            <td><span class="status-badge status-badge--{{ action_badges.get(entry.action, 'neutral') }}">{{ action_labels.get(entry.action, entry.action) }}</span></td>
+            <td><span class="table-primary">{{ resource_labels.get(entry.resource_type, entry.resource_type) }}</span><span class="table-secondary">{{ entry.resource_name }}{% if entry.resource_id %} · #{{ entry.resource_id }}{% endif %}</span></td>
+            <td class="logs-table__summary">{{ entry.summary }}</td>
+            <td><span class="mono log-origin">{{ entry.ip_address or 'interno' }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "pager.html" %}
+    {% else %}
+    <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("timeline") }}</div><h2>Nenhum log encontrado</h2><p>{% if action or resource or q %}Revise os filtros ou limpe a busca para visualizar todo o histórico.{% else %}As próximas alterações realizadas no sistema aparecerão aqui.{% endif %}</p>{% if action or resource or q %}<a class="btn btn--secondary" href="/logs">Limpar filtros</a>{% endif %}</div></div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

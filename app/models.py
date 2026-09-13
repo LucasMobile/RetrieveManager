@@ -26,6 +26,26 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(16), default="admin", nullable=False)
 
 
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        Index("ix_audit_logs_created_at", "created_at"),
+        Index("ix_audit_logs_resource_action", "resource_type", "action"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    actor_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    actor_username: Mapped[str] = mapped_column(String(80), nullable=False)
+    actor_role: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    resource_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    summary: Mapped[str] = mapped_column(String(500), nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+
+
 class Settings(Base):
     __tablename__ = "settings"
 
@@ -78,6 +98,9 @@ class Unit(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now
     )
+    deleted_at: Mapped[datetime] = mapped_column(DateTime, nullable=True, index=True)
+    deleted_by_user_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    deleted_by_username: Mapped[str] = mapped_column(String(80), default="")
 
     orders: Mapped[list["Order"]] = relationship(
         back_populates="unit", cascade="all, delete-orphan"
@@ -185,6 +208,24 @@ class Order(Base):
             "prior_status",
             "prior_due_at",
         ),
+        Index("ix_orders_active_id", "archived_at", "id"),
+        Index(
+            "ix_orders_active_unit_status_id",
+            "archived_at",
+            "unit_id",
+            "status",
+            "id",
+        ),
+        Index(
+            "ix_orders_active_prior_status_unit",
+            "archived_at",
+            "prior_status",
+            "unit_id",
+        ),
+        Index("ix_orders_archive_date_id", "archived_at", "id"),
+        Index("ix_orders_acc", "acc"),
+        Index("ix_orders_pat_id", "pat_id"),
+        Index("ix_orders_source_id", "source_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -232,6 +273,10 @@ class Order(Base):
     )
     found_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     done_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    archived_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    archive_reason: Mapped[str] = mapped_column(String(255), default="")
+    archived_by_user_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    archived_by_username: Mapped[str] = mapped_column(String(80), default="")
 
     unit: Mapped[Unit] = relationship(back_populates="orders")
     events: Mapped[list["OrderEvent"]] = relationship(
@@ -244,6 +289,7 @@ class Order(Base):
 
 class OrderEvent(Base):
     __tablename__ = "order_events"
+    __table_args__ = (Index("ix_order_events_order_id_id", "order_id", "id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
@@ -309,6 +355,7 @@ class ImageTransfer(Base):
     __table_args__ = (
         UniqueConstraint("unit_id", "filename", name="uq_transfer_unit_filename"),
         Index("ix_transfer_unit_status_retry", "unit_id", "status", "next_attempt_at"),
+        Index("ix_transfer_order_status", "order_id", "status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

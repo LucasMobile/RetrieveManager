@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.models import Base, Order, Unit
+from app.models import AuditLog, Base, Order, Unit
 from app.orders_api import AckResult, InvalidApiOrder, OrdersApiError, parse_api_order
 from app.pipeline import _last_orders_api_poll, ingest_unit
 
@@ -110,6 +110,11 @@ class OrdersApiIngestionTest(unittest.TestCase):
             self.assertEqual(orders[0].birth_date, "19551104")
             self.assertEqual(orders[0].exam_date, "20260423")
             self.assertEqual(orders[0].api_read_status, "confirmed")
+            audit = db.scalar(select(AuditLog))
+            self.assertIsNotNone(audit)
+            self.assertEqual(audit.actor_username, "Sistema")
+            self.assertEqual(audit.resource_type, "order")
+            self.assertEqual(audit.resource_id, str(orders[0].id))
             acknowledge.assert_awaited_once_with(
                 unit.orders_api_url,
                 unit.orders_api_token,
