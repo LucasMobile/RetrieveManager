@@ -68,7 +68,9 @@ def validate_data_path(value: str, field: str) -> str:
     return str(path)
 
 
-def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
+def validate_unit_form(
+    form: dict[str, str], *, creating: bool = False
+) -> dict[str, str | int | bool]:
     name = form.get("name", "").strip()
     if not 1 <= len(name) <= 120:
         raise ValueError("Nome da unidade deve ter entre 1 e 120 caracteres")
@@ -76,6 +78,19 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
         raise ValueError("Estado da unidade inválido")
     if form.get("retrieve_prior_enabled", "0") not in {"0", "1"}:
         raise ValueError("Configuração de exames anteriores inválida")
+    orders_api_token = form.get("orders_api_token", "").strip()
+    station_id = form.get("orders_api_station_id", "").strip()
+    token = form.get("token", "").strip()
+    if creating and not token:
+        raise ValueError("Token da unidade é obrigatório.")
+    if len(token) > 64:
+        raise ValueError("Token da unidade excede 64 caracteres.")
+    if creating and not orders_api_token:
+        raise ValueError("Token de Integração é obrigatório.")
+    if len(orders_api_token) > 2048:
+        raise ValueError("Token de Integração excede 2048 caracteres.")
+    if len(station_id) > 64:
+        raise ValueError("ID Posto excede 64 caracteres.")
     return {
         "name": name,
         "enabled": form.get("enabled", "1") == "1",
@@ -88,8 +103,8 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
             default=444,
         ),
         "orders_api_url": validate_orders_api_url(form.get("orders_api_url", "")),
-        "orders_api_token": form.get("orders_api_token", "").strip(),
-        "orders_api_station_id": form.get("orders_api_station_id", "").strip(),
+        "orders_api_token": orders_api_token,
+        "orders_api_station_id": station_id,
         "retrieve_prior_enabled": form.get("retrieve_prior_enabled", "0") == "1",
         "move_timeout_prior": bounded_int(
             form.get("move_timeout_prior"),
@@ -103,10 +118,8 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
         ),
         "send_dir": validate_data_path(form.get("send_dir", ""), "Pasta de envio"),
         "error_dir": validate_data_path(form.get("error_dir", ""), "Pasta de erro"),
-        "token": form.get("token", "").strip(),
-        "cloud_url": validate_cloud_url(
-            form.get("cloud_url", DEFAULT_CLOUD_URL)
-        ),
+        "token": token,
+        "cloud_url": validate_cloud_url(form.get("cloud_url", DEFAULT_CLOUD_URL)),
         "file_settle_seconds": bounded_int(
             form.get("file_settle_seconds"),
             "Espera antes de compactar e enviar",
@@ -160,19 +173,12 @@ def validate_unit_form(form: dict[str, str]) -> dict[str, str | int | bool]:
 
 
 def validate_orders_api_url(value: str) -> str:
-    url = value.strip().rstrip("/")
-    if not 1 <= len(url) <= 500:
-        raise ValueError("URL da API Pedido PLERES deve ter entre 1 e 500 caracteres")
-    parsed = urlparse(url)
-    allowed_schemes = {"https"} if IS_PRODUCTION else {"http", "https"}
-    if parsed.scheme not in allowed_schemes or not parsed.hostname:
-        scheme = "HTTPS" if IS_PRODUCTION else "HTTP ou HTTPS"
-        raise ValueError(f"URL da API Pedido PLERES inválida; use {scheme}")
-    if parsed.username or parsed.password:
-        raise ValueError("URL da API Pedido PLERES não pode conter credenciais")
-    if parsed.query or parsed.fragment:
-        raise ValueError("URL da API Pedido PLERES não deve conter query ou fragmento")
-    return url
+    return _validate_http_url(
+        value,
+        label="URL da API Pedido PLERES",
+        strip_trailing_slash=True,
+        forbid_query_or_fragment=True,
+    )
 
 
 def validate_pacs_connection(form: dict[str, str]) -> dict[str, str | int]:
@@ -192,18 +198,37 @@ def validate_pacs_connection(form: dict[str, str]) -> dict[str, str | int]:
 
 
 def validate_cloud_url(value: str) -> str:
+    return _validate_http_url(
+        value,
+        label="URL da nuvem",
+        allowed_hosts=CLOUD_ALLOWED_HOSTS,
+    )
+
+
+def _validate_http_url(
+    value: str,
+    *,
+    label: str,
+    allowed_hosts: frozenset[str] | set[str] | None = None,
+    strip_trailing_slash: bool = False,
+    forbid_query_or_fragment: bool = False,
+) -> str:
     url = value.strip()
+    if strip_trailing_slash:
+        url = url.rstrip("/")
     if not 1 <= len(url) <= 500:
-        raise ValueError("URL da nuvem deve ter entre 1 e 500 caracteres")
+        raise ValueError(f"{label} deve ter entre 1 e 500 caracteres")
     parsed = urlparse(url)
     allowed_schemes = {"https"} if IS_PRODUCTION else {"http", "https"}
     if parsed.scheme not in allowed_schemes or not parsed.hostname:
         scheme = "HTTPS" if IS_PRODUCTION else "HTTP ou HTTPS"
-        raise ValueError(f"URL da nuvem inválida; use {scheme}")
+        raise ValueError(f"{label} inválida; use {scheme}")
     if parsed.username or parsed.password:
-        raise ValueError("URL da nuvem não pode conter credenciais")
-    if parsed.hostname.lower() not in CLOUD_ALLOWED_HOSTS:
-        allowed = ", ".join(sorted(CLOUD_ALLOWED_HOSTS))
+        raise ValueError(f"{label} não pode conter credenciais")
+    if forbid_query_or_fragment and (parsed.query or parsed.fragment):
+        raise ValueError(f"{label} não deve conter query ou fragmento")
+    if allowed_hosts is not None and parsed.hostname.lower() not in allowed_hosts:
+        allowed = ", ".join(sorted(allowed_hosts))
         raise ValueError(f"Host da nuvem não permitido ({allowed})")
     return url
 

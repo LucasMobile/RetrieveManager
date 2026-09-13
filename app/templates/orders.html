@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import post_action %}
 {% block title %}{{ 'Histórico de pedidos' if history else 'Fila de pedidos' }} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack">
@@ -90,11 +91,9 @@
               <div class="table-actions order-actions">
                 <a class="action-icon" href="/orders/{{ o.id }}" data-tooltip="Visualizar" title="Visualizar" aria-label="Visualizar pedido">{{ icon("eye") }}</a>
                 {% if user.role == 'admin' and not history %}
-                {% if o.status not in ('retrieving', 'retrieving_second', 'receiving') and o.prior_status not in ('queued', 'retry_wait', 'retrieving') %}
-                <form class="inline-form" method="post" action="/orders/{{ o.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon" type="submit" data-tooltip="Reprocessar" title="Reprocessar" aria-label="Reprocessar pedido">{{ icon("retry") }}</button></form>
-                <form class="inline-form" method="post" action="/orders/{{ o.id }}/delete" data-confirm="Arquivar este pedido? Ele sairá da fila, mas todos os dados e eventos serão preservados." data-confirm-label="Arquivar pedido">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon action-icon--danger" type="submit" data-tooltip="Arquivar" title="Arquivar" aria-label="Arquivar pedido">{{ icon("trash") }}</button></form>
+                {% if o.can_reprocess and o.can_archive %}
+                {{ post_action(request, '/orders/' ~ o.id ~ '/retry', 'action-icon', 'Reprocessar pedido', icon_name='retry', tooltip='Reprocessar', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
+                {{ post_action(request, '/orders/' ~ o.id ~ '/delete', 'action-icon action-icon--danger', 'Arquivar pedido', icon_name='trash', tooltip='Arquivar', confirm='Arquivar este pedido? Ele sairá da fila, mas todos os dados e eventos serão preservados.', confirm_label='Arquivar pedido') }}
                 {% else %}
                 <span class="action-icon is-disabled" data-tooltip="Reprocessar indisponível durante o processamento" aria-label="Reprocessar indisponível">{{ icon("retry") }}</span>
                 <span class="action-icon is-disabled" data-tooltip="Excluir indisponível durante o processamento" aria-label="Excluir indisponível">{{ icon("trash") }}</span>

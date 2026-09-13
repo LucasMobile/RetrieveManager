@@ -57,16 +57,25 @@ from app.models import (
 )
 from app.netutil import port_listening
 from app.observability import configure_logging, log_event, new_correlation_id
+from app.order_state import (
+    ACTIVE_ORDER_STATUSES,
+    ACTIVE_PRIOR_STATUSES,
+    can_archive,
+    can_cancel,
+    can_reprocess,
+)
 from app.pager import paginate, query_keep
 from app.pipeline import folder_counts
+from app.rate_limit import (
+    apply_rate_limit_headers,
+    client_ip,
+    login_failure_rate_limiter,
+)
 from app.retention import archive_order, archive_unit
 from app.rules import schedule_from_now
 from app.security import (
-    clear_login_failures,
     csrf_token,
     hash_password,
-    login_allowed,
-    record_login_failure,
     verify_csrf,
     verify_password,
 )
@@ -83,8 +92,6 @@ AUDIT_LOGS_PAGE = 50
 UNITS_PAGE = 20
 DASH_PAGE = 8
 USER_ROLES = frozenset({"admin", "user"})
-ACTIVE_ORDER_STATUSES = frozenset({"retrieving", "retrieving_second", "receiving"})
-ACTIVE_PRIOR_STATUSES = frozenset({"queued", "retry_wait", "retrieving"})
 PRIOR_STATUS_LABELS = {
     "disabled": "Desativado",
     "queued": "Na fila",
@@ -183,7 +190,9 @@ def require_user(request: Request, db: Session = Depends(get_db)) -> User:
 
 def require_admin(user: User = Depends(require_user)) -> User:
     if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Acesso exclusivo para administradores.")
+        raise HTTPException(
+            status_code=403, detail="Acesso exclusivo para administradores."
+        )
     return user
 
 
@@ -332,9 +341,8 @@ def _audit(
     db.add(
         AuditLog(
             actor_id=actor_id,
-            actor_username=actor_username or (
-                f"Usuário #{actor_id}" if actor_id else "Sistema"
-            ),
+            actor_username=actor_username
+            or (f"Usuário #{actor_id}" if actor_id else "Sistema"),
             actor_role=actor_role or ("admin" if actor_id else "system"),
             action=action,
             resource_type=resource_type,
@@ -387,8 +395,9 @@ def login(
     password: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    client_id = request.client.host if request.client else "unknown"
-    if not login_allowed(client_id):
+    client_id = client_ip(request)
+    login_limit = login_failure_rate_limiter.check(client_id)
+    if not login_limit.allowed:
         log_event(
             log,
             logging.WARNING,
@@ -397,14 +406,18 @@ def login(
             status="rate_limited",
             error_type="TooManyLoginAttempts",
         )
-        return templates.TemplateResponse(
-            request=request,
-            name="login.html",
-            context={
-                "request": request,
-                "error": "Muitas tentativas. Aguarde alguns minutos.",
-            },
-            status_code=429,
+        return apply_rate_limit_headers(
+            templates.TemplateResponse(
+                request=request,
+                name="login.html",
+                context={
+                    "request": request,
+                    "error": "Muitas tentativas. Aguarde alguns minutos.",
+                },
+                status_code=429,
+            ),
+            login_limit,
+            scope="failed-login",
         )
     clean_username = username.strip()
     invalid_size = len(clean_username) > 80 or len(password.encode("utf-8")) > 72
@@ -412,7 +425,7 @@ def login(
     if not invalid_size:
         user = db.scalar(select(User).where(User.username == clean_username))
     if user is None or not verify_password(password, user.password_hash):
-        record_login_failure(client_id)
+        login_limit = login_failure_rate_limiter.check(client_id, consume=True)
         log_event(
             log,
             logging.WARNING,
@@ -421,13 +434,16 @@ def login(
             status="failure",
             error_type="InvalidCredentials",
         )
-        return templates.TemplateResponse(
-            request=request,
-            name="login.html",
-            context={"request": request, "error": "Usuário ou senha inválidos."},
-            status_code=401,
+        return apply_rate_limit_headers(
+            templates.TemplateResponse(
+                request=request,
+                name="login.html",
+                context={"request": request, "error": "Usuário ou senha inválidos."},
+                status_code=401,
+            ),
+            login_limit,
+            scope="failed-login",
         )
-    clear_login_failures(client_id)
     request.session.clear()
     request.session["user_id"] = user.id
     csrf_token(request)
@@ -439,7 +455,11 @@ def login(
         status="success",
         user_id=user.id,
     )
-    return RedirectResponse("/", status_code=303)
+    return apply_rate_limit_headers(
+        RedirectResponse("/", status_code=303),
+        login_failure_rate_limiter.check(client_id),
+        scope="failed-login",
+    )
 
 
 @app.post("/logout")
@@ -460,9 +480,7 @@ def _dashboard_units(
 ) -> tuple[list[Unit], dict[str, int | bool], dict[str, int]]:
     total = (
         db.scalar(
-            select(func.count())
-            .select_from(Unit)
-            .where(Unit.deleted_at.is_(None))
+            select(func.count()).select_from(Unit).where(Unit.deleted_at.is_(None))
         )
         or 0
     )
@@ -477,11 +495,9 @@ def _dashboard_units(
         )
     )
     with _dashboard_stats_lock:
-        cache_valid = (
-            _dashboard_stats_cache.get("engine_id") == id(db.get_bind())
-            and monotonic()
-            < float(_dashboard_stats_cache.get("expires_at", 0.0))
-        )
+        cache_valid = _dashboard_stats_cache.get("engine_id") == id(
+            db.get_bind()
+        ) and monotonic() < float(_dashboard_stats_cache.get("expires_at", 0.0))
         if cache_valid:
             stats = _dashboard_stats_cache["stats"]
             summary = _dashboard_stats_cache["summary"]
@@ -633,9 +649,7 @@ def units_list(
 ):
     total = (
         db.scalar(
-            select(func.count())
-            .select_from(Unit)
-            .where(Unit.deleted_at.is_(None))
+            select(func.count()).select_from(Unit).where(Unit.deleted_at.is_(None))
         )
         or 0
     )
@@ -738,27 +752,12 @@ async def units_create(
 ):
     raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
     try:
-        form = validate_unit_form(raw_form)
+        form = validate_unit_form(raw_form, creating=True)
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/units/new", status_code=303)
     if _port_taken(db, int(form["store_port"]), None):
         flash(request, "Essa porta de store já está em uso.", "err")
-        return RedirectResponse("/units/new", status_code=303)
-    if not form.get("token"):
-        flash(request, "Token da unidade é obrigatório.", "err")
-        return RedirectResponse("/units/new", status_code=303)
-    if len(str(form["token"])) > 64:
-        flash(request, "Token da unidade excede 64 caracteres.", "err")
-        return RedirectResponse("/units/new", status_code=303)
-    if not form.get("orders_api_token"):
-        flash(request, "Token de Integração é obrigatório.", "err")
-        return RedirectResponse("/units/new", status_code=303)
-    if len(str(form["orders_api_token"])) > 2048:
-        flash(request, "Token de Integração excede 2048 caracteres.", "err")
-        return RedirectResponse("/units/new", status_code=303)
-    if len(str(form.get("orders_api_station_id") or "")) > 64:
-        flash(request, "ID Posto excede 64 caracteres.", "err")
         return RedirectResponse("/units/new", status_code=303)
     unit = _unit_from_form(form, None)
     db.add(unit)
@@ -889,15 +888,6 @@ async def units_update(
         form = validate_unit_form(raw_form)
     except ValueError as exc:
         flash(request, str(exc), "err")
-        return RedirectResponse(f"/units/{unit_id}", status_code=303)
-    if len(str(form.get("token") or "")) > 64:
-        flash(request, "Token da unidade excede 64 caracteres.", "err")
-        return RedirectResponse(f"/units/{unit_id}", status_code=303)
-    if len(str(form.get("orders_api_token") or "")) > 2048:
-        flash(request, "Token de Integração excede 2048 caracteres.", "err")
-        return RedirectResponse(f"/units/{unit_id}", status_code=303)
-    if len(str(form.get("orders_api_station_id") or "")) > 64:
-        flash(request, "ID Posto excede 64 caracteres.", "err")
         return RedirectResponse(f"/units/{unit_id}", status_code=303)
     if _port_taken(db, int(form["store_port"]), unit_id):
         flash(request, "Essa porta de store já está em uso.", "err")
@@ -1095,9 +1085,7 @@ def rules_dicom(
 ):
     rules = _dicom_rule_views(db)
     units = list(
-        db.scalars(
-            select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.name)
-        )
+        db.scalars(select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.name))
     )
     edit_rule = next((rule for rule in rules if rule.id == edit), None)
     return templates.TemplateResponse(
@@ -1143,9 +1131,7 @@ def rules_dicom_tag_info(
 
 
 def _validated_dicom_rule_form(db: Session, form: Any) -> dict[str, Any]:
-    valid_unit_ids = set(
-        db.scalars(select(Unit.id).where(Unit.deleted_at.is_(None)))
-    )
+    valid_unit_ids = set(db.scalars(select(Unit.id).where(Unit.deleted_at.is_(None))))
     return validate_rule_payload(
         name=str(form.get("name") or ""),
         enabled=form.get("enabled") == "1",
@@ -1159,9 +1145,7 @@ def _validated_dicom_rule_form(db: Session, form: Any) -> dict[str, Any]:
         condition_operators=[
             str(value) for value in form.getlist("condition_operator")
         ],
-        condition_values=[
-            str(value) for value in form.getlist("condition_value")
-        ],
+        condition_values=[str(value) for value in form.getlist("condition_value")],
         valid_unit_ids=valid_unit_ids,
     )
 
@@ -1190,8 +1174,7 @@ def _store_dicom_rule(db: Session, rule: DicomRule, data: dict[str, Any]) -> Non
         for position, condition in enumerate(data["conditions"])
     )
     db.add_all(
-        DicomRuleUnit(rule_id=rule.id, unit_id=unit_id)
-        for unit_id in data["unit_ids"]
+        DicomRuleUnit(rule_id=rule.id, unit_id=unit_id) for unit_id in data["unit_ids"]
     )
 
 
@@ -1365,16 +1348,17 @@ def rules_retrieve_add(
     user: User = Depends(require_admin),
 ):
     try:
-        safe_modality = validate_modality(modality)
+        rule = ModalityRule()
+        _apply_retrieve_rule(
+            rule,
+            modality=modality,
+            wait_minutes=wait_minutes,
+            second_retrieve=second_retrieve,
+            second_wait_minutes=second_wait_minutes,
+        )
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/rules/retrieve", status_code=303)
-    rule = ModalityRule(
-        modality=safe_modality,
-        wait_minutes=wait_minutes,
-        second_retrieve=second_retrieve == "1",
-        second_wait_minutes=second_wait_minutes,
-    )
     db.add(rule)
     try:
         db.flush()
@@ -1410,16 +1394,16 @@ def rules_retrieve_update(
     rule = db.get(ModalityRule, rule_id)
     if rule:
         try:
-            safe_modality = validate_modality(modality)
+            _apply_retrieve_rule(
+                rule,
+                modality=modality,
+                wait_minutes=wait_minutes,
+                second_retrieve=second_retrieve,
+                second_wait_minutes=second_wait_minutes,
+            )
         except ValueError as exc:
             flash(request, str(exc), "err")
             return RedirectResponse("/rules/retrieve", status_code=303)
-        if rule.modality != "*":
-            rule.modality = safe_modality
-        rule.wait_minutes = wait_minutes
-        rule.second_retrieve = second_retrieve == "1"
-        if rule.second_retrieve:
-            rule.second_wait_minutes = second_wait_minutes
         try:
             _audit(
                 db,
@@ -1437,6 +1421,23 @@ def rules_retrieve_update(
             db.rollback()
             flash(request, "Modalidade já existe.", "err")
     return RedirectResponse("/rules/retrieve", status_code=303)
+
+
+def _apply_retrieve_rule(
+    rule: ModalityRule,
+    *,
+    modality: str,
+    wait_minutes: int,
+    second_retrieve: Literal["0", "1"],
+    second_wait_minutes: int,
+) -> None:
+    safe_modality = validate_modality(modality)
+    if rule.modality != "*":
+        rule.modality = safe_modality
+    rule.wait_minutes = wait_minutes
+    rule.second_retrieve = second_retrieve == "1"
+    if rule.second_retrieve or rule.id is None:
+        rule.second_wait_minutes = second_wait_minutes
 
 
 @app.post("/rules/retrieve/{rule_id}/delete")
@@ -1515,12 +1516,11 @@ def rules_compress_add(
     user: User = Depends(require_admin),
 ):
     try:
-        safe_modality = validate_modality(modality)
-        safe_flag = validate_jpeg_flag(jpeg_flag)
+        rule = CompressRule()
+        _apply_compress_rule(rule, modality=modality, jpeg_flag=jpeg_flag)
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/rules/compress", status_code=303)
-    rule = CompressRule(modality=safe_modality, jpeg_flag=safe_flag)
     db.add(rule)
     try:
         db.flush()
@@ -1554,14 +1554,10 @@ def rules_compress_update(
     rule = db.get(CompressRule, rule_id)
     if rule:
         try:
-            safe_modality = validate_modality(modality)
-            safe_flag = validate_jpeg_flag(jpeg_flag)
+            _apply_compress_rule(rule, modality=modality, jpeg_flag=jpeg_flag)
         except ValueError as exc:
             flash(request, str(exc), "err")
             return RedirectResponse("/rules/compress", status_code=303)
-        if rule.modality != "*":
-            rule.modality = safe_modality
-        rule.jpeg_flag = safe_flag
         try:
             _audit(
                 db,
@@ -1579,6 +1575,13 @@ def rules_compress_update(
             db.rollback()
             flash(request, "Modalidade já existe.", "err")
     return RedirectResponse("/rules/compress", status_code=303)
+
+
+def _apply_compress_rule(rule: CompressRule, *, modality: str, jpeg_flag: str) -> None:
+    safe_modality = validate_modality(modality)
+    if rule.modality != "*":
+        rule.modality = safe_modality
+    rule.jpeg_flag = validate_jpeg_flag(jpeg_flag)
 
 
 @app.post("/rules/compress/{rule_id}/delete")
@@ -1796,9 +1799,7 @@ def _orders_response(
                         filtered_orders.c.status.in_(
                             ("watching", "wait_retrieve", "wait_second")
                         )
-                        | filtered_orders.c.prior_status.in_(
-                            ("queued", "retry_wait")
-                        ),
+                        | filtered_orders.c.prior_status.in_(("queued", "retry_wait")),
                         1,
                     ),
                     else_=0,
@@ -1846,6 +1847,8 @@ def _orders_response(
     for o in rows:
         o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
         o.badge = badge_for(o.status)  # type: ignore[attr-defined]
+        o.can_reprocess = can_reprocess(o)  # type: ignore[attr-defined]
+        o.can_archive = can_archive(o)  # type: ignore[attr-defined]
         o.prior_status_label = PRIOR_STATUS_LABELS.get(  # type: ignore[attr-defined]
             o.prior_status, o.prior_status
         )
@@ -1854,17 +1857,13 @@ def _orders_response(
     if rows:
         has_prev = (
             db.scalar(
-                filt.where(Order.id > rows[0].id)
-                .with_only_columns(Order.id)
-                .limit(1)
+                filt.where(Order.id > rows[0].id).with_only_columns(Order.id).limit(1)
             )
             is not None
         )
         has_next = (
             db.scalar(
-                filt.where(Order.id < rows[-1].id)
-                .with_only_columns(Order.id)
-                .limit(1)
+                filt.where(Order.id < rows[-1].id).with_only_columns(Order.id).limit(1)
             )
             is not None
         )
@@ -1914,6 +1913,9 @@ def order_detail(
     )
     if order is None:
         return RedirectResponse("/orders", status_code=303)
+    order.can_reprocess = can_reprocess(order)  # type: ignore[attr-defined]
+    order.can_archive = can_archive(order)  # type: ignore[attr-defined]
+    order.can_cancel = can_cancel(order)  # type: ignore[attr-defined]
     total = db.scalar(select(func.count()).where(OrderEvent.order_id == order_id)) or 0
     pager = paginate(total, page, EVENTS_PAGE)
     events = list(
@@ -1955,9 +1957,7 @@ def order_detail(
                 ImageTransfer,
                 ImageTransfer.id == HistoricalImageLink.transfer_id,
             )
-            .where(
-                HistoricalImageLink.historical_study_id.in_(historical_counts)
-            )
+            .where(HistoricalImageLink.historical_study_id.in_(historical_counts))
             .group_by(
                 HistoricalImageLink.historical_study_id,
                 ImageTransfer.status,
@@ -2003,12 +2003,7 @@ def order_retry(
     user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
-    if (
-        order
-        and order.archived_at is None
-        and order.status not in ACTIVE_ORDER_STATUSES
-        and order.prior_status not in ACTIVE_PRIOR_STATUSES
-    ):
+    if order and can_reprocess(order):
         _reset_order_for_reprocess(db, order)
         _audit(
             db,
@@ -2136,11 +2131,7 @@ def order_cancel(
     user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
-    if (
-        order
-        and order.archived_at is None
-        and order.status not in ("done", "cancelled")
-    ):
+    if order and can_cancel(order):
         order.status = "cancelled"
         _audit(
             db,
@@ -2190,10 +2181,7 @@ def order_delete(
     if order.archived_at is not None:
         flash(request, "O pedido já está arquivado.", "err")
         return RedirectResponse("/orders/history", status_code=303)
-    if (
-        order.status in ACTIVE_ORDER_STATUSES
-        or order.prior_status in ACTIVE_PRIOR_STATUSES
-    ):
+    if not can_archive(order):
         flash(request, "Aguarde o processamento atual terminar para excluir.", "err")
         return RedirectResponse("/orders", status_code=303)
     unit_id = order.unit_id

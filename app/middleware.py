@@ -11,6 +11,11 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from app.config import PUBLIC_ORIGIN
 from app.observability import log_context, log_event, new_correlation_id
+from app.rate_limit import (
+    apply_rate_limit_headers,
+    client_ip,
+    global_rate_limiter,
+)
 
 log = logging.getLogger("web.request")
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -62,7 +67,22 @@ async def request_middleware(
         log_event(
             log, logging.INFO, "http.request", resource=resource, status="started"
         )
-        if not _same_origin(request):
+        global_limit = global_rate_limiter.check(client_ip(request), consume=True)
+        if not global_limit.allowed:
+            response = JSONResponse(
+                {"detail": "limite de requisições excedido; tente novamente depois"},
+                status_code=429,
+            )
+            status = "rate_limited"
+            log_event(
+                log,
+                logging.WARNING,
+                "http.rate_limit",
+                resource=resource,
+                status="rejected",
+                error_type="GlobalRateLimitExceeded",
+            )
+        elif not _same_origin(request):
             response: Response = JSONResponse(
                 {"detail": "origem da requisição não permitida"}, status_code=403
             )
@@ -100,6 +120,12 @@ async def request_middleware(
             user_id=user_id,
             http_method=request.method,
             http_status=response.status_code,
+        )
+        apply_rate_limit_headers(
+            response,
+            global_limit,
+            scope="global",
+            overwrite=False,
         )
         return apply_security_headers(request, response)
 

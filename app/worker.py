@@ -12,6 +12,7 @@ from app.db import SessionLocal, init_db
 from app.models import Unit
 from app.observability import configure_logging, log_event
 from app.pipeline import (
+    archive_completed_orders,
     claim_due_moves,
     cleanup_unmatched_orders,
     compact_unit,
@@ -98,6 +99,7 @@ def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
     with SessionLocal() as db:
         recover_stale_locks(db)
         cleanup_unmatched_orders(db)
+        archive_completed_orders(db)
         units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))
         supervisor.reconcile(units)
         for unit in units:

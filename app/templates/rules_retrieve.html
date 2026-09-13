@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 {% block title %}Tempo de retrieve · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack retrieve-rules-page">
@@ -11,18 +12,18 @@
     </div>
   </header>
 
-  <section class="retrieve-summary" aria-label="Resumo das regras">
-    <div class="retrieve-summary__item">
-      <span class="retrieve-summary__icon">{{ icon("clock") }}</span>
-      <div><strong>{% if summary.default_wait is not none %}{{ summary.default_wait }} min{% else %}—{% endif %}</strong><span>regra padrão do 1º retrieve</span></div>
+  <section class="retrieve-summary summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das regras">
+    <div class="summary-strip__item">
+      <span class="summary-strip__icon">{{ icon("clock") }}</span>
+      <div class="summary-strip__copy"><strong>{% if summary.default_wait is not none %}{{ summary.default_wait }} min{% else %}—{% endif %}</strong><span>regra padrão do 1º retrieve</span></div>
     </div>
-    <div class="retrieve-summary__item">
-      <span class="retrieve-summary__icon">{{ icon("rules") }}</span>
-      <div><strong>{{ summary.total }}</strong><span>regra{% if summary.total != 1 %}s{% endif %} configurada{% if summary.total != 1 %}s{% endif %}</span></div>
+    <div class="summary-strip__item">
+      <span class="summary-strip__icon">{{ icon("rules") }}</span>
+      <div class="summary-strip__copy"><strong>{{ summary.total }}</strong><span>regra{% if summary.total != 1 %}s{% endif %} configurada{% if summary.total != 1 %}s{% endif %}</span></div>
     </div>
-    <div class="retrieve-summary__item">
-      <span class="retrieve-summary__icon">{{ icon("retry") }}</span>
-      <div><strong>{{ summary.second_enabled }}</strong><span>modalidade{% if summary.second_enabled != 1 %}s{% endif %} com 2º retrieve</span></div>
+    <div class="summary-strip__item">
+      <span class="summary-strip__icon">{{ icon("retry") }}</span>
+      <div class="summary-strip__copy"><strong>{{ summary.second_enabled }}</strong><span>modalidade{% if summary.second_enabled != 1 %}s{% endif %} com 2º retrieve</span></div>
     </div>
   </section>
 
@@ -34,7 +35,7 @@
 
     {% for r in rules %}
     <form id="retrieve-rule-{{ r.id }}" method="post" action="/rules/retrieve/{{ r.id }}">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"></form>
+        {{ csrf_input(request) }}</form>
     {% endfor %}
 
     <div class="table-wrap">
@@ -76,7 +77,7 @@
                 <button class="action-icon" type="submit" form="retrieve-rule-{{ r.id }}" data-tooltip="Salvar regra" aria-label="Salvar regra de {{ r.modality }}">{{ icon("save") }}</button>
                 {% if r.modality != '*' %}
                 <form class="inline-form" method="post" action="/rules/retrieve/{{ r.id }}/delete" data-confirm="Excluir a regra de {{ r.modality }}? A modalidade passará a utilizar a regra padrão." data-confirm-label="Excluir regra">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
                   <button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir regra" aria-label="Excluir regra de {{ r.modality }}">{{ icon("trash") }}</button>
                 </form>
                 {% else %}
@@ -98,7 +99,7 @@
       <span class="status-badge status-badge--active">Nova regra</span>
     </div>
     <form method="post" action="/rules/retrieve" class="retrieve-new-form" data-second-rule>
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
       <div class="field"><label for="new-modality">Modalidade</label><input id="new-modality" name="modality" placeholder="Ex.: XA" maxlength="8" required><span class="field__hint">Código DICOM.</span></div>
       <div class="field"><label for="new-wait">1º Retrieve</label><div class="retrieve-time-input"><input id="new-wait" name="wait_minutes" type="number" min="0" max="1440" value="10" required><span>min</span></div></div>
       <div class="field">

@@ -2,12 +2,12 @@ import logging
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
-from app.models import AuditLog, Base, Order, Unit
+from app.models import AuditLog, Order, Unit
 from app.orders_api import AckResult, InvalidApiOrder, OrdersApiError, parse_api_order
 from app.pipeline import _last_orders_api_poll, ingest_unit
+from tests.support import DatabaseTestCase, make_unit
 
 
 class OrdersApiParsingTest(unittest.TestCase):
@@ -39,28 +39,23 @@ class OrdersApiParsingTest(unittest.TestCase):
             parse_api_order({**valid, "examDate": "2026-04-23"})
 
 
-class OrdersApiIngestionTest(unittest.TestCase):
+class OrdersApiIngestionTest(DatabaseTestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+        super().setUp()
         _last_orders_api_poll.clear()
 
     def tearDown(self):
         _last_orders_api_poll.clear()
-        self.engine.dispose()
+        super().tearDown()
 
     @staticmethod
     def _unit() -> Unit:
-        return Unit(
+        return make_unit(
             name="AXIAL",
             orders_api_url="https://integracao.example/v1/pedidos",
             orders_api_token="secret-token",
             orders_api_station_id="26",
-            pacs_aet="PACS",
-            pacs_ip="127.0.0.1",
             pacs_port=2104,
-            calling_aet="RETRIEVE",
             store_port=444,
             receive_dir="/receive",
             send_dir="/send",
@@ -98,9 +93,7 @@ class OrdersApiIngestionTest(unittest.TestCase):
                 patch("app.pipeline.fetch_orders", new=AsyncMock(return_value=payload)),
                 patch(
                     "app.pipeline.acknowledge_orders",
-                    new=AsyncMock(
-                        return_value=[AckResult("7202601300013848", True)]
-                    ),
+                    new=AsyncMock(return_value=[AckResult("7202601300013848", True)]),
                 ) as acknowledge,
             ):
                 self.assertEqual(ingest_unit(db, unit), 1)
@@ -149,9 +142,7 @@ class OrdersApiIngestionTest(unittest.TestCase):
                 patch("app.pipeline.fetch_orders", new=AsyncMock(return_value=[])),
                 patch(
                     "app.pipeline.acknowledge_orders",
-                    new=AsyncMock(
-                        return_value=[AckResult("7202601300013848", True)]
-                    ),
+                    new=AsyncMock(return_value=[AckResult("7202601300013848", True)]),
                 ),
             ):
                 self.assertEqual(ingest_unit(db, unit), 0)

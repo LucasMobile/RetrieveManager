@@ -1,4 +1,5 @@
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 <section class="operation-summary" aria-label="Resumo da operação">
   <div class="operation-summary__lead">
     <span class="operation-summary__icon">{{ icon("building") }}</span>
@@ -69,7 +70,7 @@
         {% if user.role == 'admin' %}
         <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Editar</a>
         <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
           <button class="btn btn--secondary btn--sm" type="submit">{{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar{% else %}Ativar{% endif %}</button>
         </form>
         {% endif %}

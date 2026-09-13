@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input, password_field %}
 {% block title %}{% if managed_user %}Editar {{ managed_user.username }}{% else %}Novo usuário{% endif %} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack user-form-page">
@@ -24,7 +25,7 @@
       {% if managed_user %}<span class="status-badge status-badge--{{ 'active' if managed_user.role == 'admin' else 'neutral' }}">{{ 'Administrador' if managed_user.role == 'admin' else 'Usuário' }}</span>{% endif %}
     </header>
     <form method="post" action="{% if managed_user %}/users/{{ managed_user.id }}{% else %}/users/new{% endif %}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      {{ csrf_input(request) }}
       <div class="settings-card__body">
         <div class="settings-fields-grid">
           <div class="field">
@@ -57,21 +58,8 @@
             <div><strong>Senha da própria conta</strong><span>Para sua segurança, confirme a senha atual em <a href="/account/password">Alterar minha senha</a>.</span></div>
           </div>
           {% else %}
-          <div class="field">
-            <label for="managed-password">{% if managed_user %}Nova senha{% else %}Senha inicial{% endif %}</label>
-            <div class="field__control">
-              <input id="managed-password" name="{{ 'new_password' if managed_user else 'password' }}" type="password" autocomplete="new-password" {% if not managed_user %}required{% endif %}>
-              <button class="field__action field__action--icon" type="button" data-password-toggle="managed-password" data-password-label="senha" aria-label="Mostrar senha" title="Mostrar senha" aria-pressed="false"><span data-password-show>{{ icon("eye") }}</span><span data-password-hide hidden>{{ icon("eye-off") }}</span></button>
-            </div>
-            <span class="field__hint">{% if managed_user %}Deixe em branco para manter a senha atual. {% endif %}Use entre 12 e 72 bytes.</span>
-          </div>
-          <div class="field">
-            <label for="managed-password-confirmation">Confirmar senha</label>
-            <div class="field__control">
-              <input id="managed-password-confirmation" name="password_confirmation" type="password" autocomplete="new-password" {% if not managed_user %}required{% endif %}>
-              <button class="field__action field__action--icon" type="button" data-password-toggle="managed-password-confirmation" data-password-label="confirmação da senha" aria-label="Mostrar confirmação da senha" title="Mostrar senha" aria-pressed="false"><span data-password-show>{{ icon("eye") }}</span><span data-password-hide hidden>{{ icon("eye-off") }}</span></button>
-            </div>
-          </div>
+          {{ password_field('managed-password', 'new_password' if managed_user else 'password', 'Nova senha' if managed_user else 'Senha inicial', 'senha', 'new-password', required=not managed_user, hint=('Deixe em branco para manter a senha atual. ' if managed_user else '') ~ 'Use entre 12 e 72 bytes.') }}
+          {{ password_field('managed-password-confirmation', 'password_confirmation', 'Confirmar senha', 'confirmação da senha', 'new-password', required=not managed_user) }}
           {% endif %}
         </div>
         <div class="settings-security-note">{{ icon("lock") }}<div><strong>Perfis protegidos no servidor</strong><span>Esconder opções na interface não substitui a autorização; cada rota administrativa também valida a role da sessão.</span></div></div>

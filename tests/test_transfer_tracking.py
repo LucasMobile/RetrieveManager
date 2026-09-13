@@ -2,19 +2,16 @@ import logging
 import unittest
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
 from app.dicom_rules import RuleMatch
 from app.models import (
-    Base,
     DicomRule,
     DicomRuleApplication,
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
     Order,
-    Unit,
 )
 from app.pipeline import (
     CircuitState,
@@ -23,20 +20,13 @@ from app.pipeline import (
     _record_compact_result,
     _record_send_results,
 )
+from tests.support import DatabaseTestCase, make_unit
 
 
-class TransferTrackingTest(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
-
-    def tearDown(self):
-        self.engine.dispose()
-
+class TransferTrackingTest(DatabaseTestCase):
     def test_upload_failure_is_persisted_with_backoff(self):
         with self.Session() as db:
-            unit = Unit(
+            unit = make_unit(
                 name="unit",
                 orders_api_url="https://integracao.example/v1/pedidos",
                 orders_api_token="integration-token",
@@ -99,7 +89,7 @@ class TransferTrackingTest(unittest.TestCase):
 
     def test_retrieved_image_reuses_transfer_with_new_correlation(self):
         with self.Session() as db:
-            unit = Unit(
+            unit = make_unit(
                 name="unit",
                 orders_api_url="https://integracao.example/v1/pedidos",
                 orders_api_token="integration-token",
@@ -150,7 +140,7 @@ class TransferTrackingTest(unittest.TestCase):
 
     def test_historical_image_is_grouped_by_study_uid(self):
         with self.Session() as db:
-            unit = Unit(
+            unit = make_unit(
                 name="unit",
                 orders_api_url="https://integracao.example/v1/pedidos",
                 orders_api_token="integration-token",
@@ -216,7 +206,7 @@ class TransferTrackingTest(unittest.TestCase):
 
     def test_applied_dicom_rule_is_audited_on_transfer(self):
         with self.Session() as db:
-            unit = Unit(
+            unit = make_unit(
                 name="unit",
                 orders_api_url="https://integracao.example/v1/pedidos",
                 orders_api_token="integration-token",
@@ -250,9 +240,7 @@ class TransferTrackingTest(unittest.TestCase):
                     "",
                     "1.2.3",
                     "discarded_rule",
-                    rule_matches=(
-                        RuleMatch(dicom_rule.id, dicom_rule.name, "delete"),
-                    ),
+                    rule_matches=(RuleMatch(dicom_rule.id, dicom_rule.name, "delete"),),
                 ),
             )
             db.commit()

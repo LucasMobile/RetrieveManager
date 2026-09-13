@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 {% block title %}{% if unit %}{{ unit.name }}{% else %}Nova unidade{% endif %} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack unit-form-page">
@@ -43,7 +44,7 @@
 
     <div class="unit-form-main">
       <form class="form-stack" method="post" action="{% if unit %}/units/{{ unit.id }}{% else %}/units/new{% endif %}" data-unit-form>
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
         <section class="form-section" aria-labelledby="identity-title">
           <div class="form-section__header">
             <span class="form-section__number">01</span>
@@ -253,11 +254,11 @@
         </div>
         <div class="button-group">
           <form class="inline-form" method="post" action="/units/{{ unit.id }}/retry-errors">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
             <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar erros</button>
           </form>
           <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Arquivar esta unidade? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
             <button class="btn btn--danger" type="submit">{{ icon("trash") }} Arquivar unidade</button>
           </form>
         </div>

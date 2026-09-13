@@ -8,8 +8,7 @@ from pydicom.uid import (
     SecondaryCaptureImageStorage,
     generate_uid,
 )
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
 from app.dicom_rules import (
     RuleConditionSpec,
@@ -22,7 +21,6 @@ from app.dicom_rules import (
     validate_rule_payload,
 )
 from app.models import (
-    Base,
     DicomRule,
     DicomRuleCondition,
     DicomRuleUnit,
@@ -30,6 +28,7 @@ from app.models import (
     Unit,
 )
 from app.pipeline import _compact_one
+from tests.support import DatabaseTestCase, make_unit
 
 
 def rule(
@@ -50,25 +49,14 @@ def rule(
     )
 
 
-class DicomRulesTest(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
-
-    def tearDown(self):
-        self.engine.dispose()
-
+class DicomRulesTest(DatabaseTestCase):
     @staticmethod
     def _unit(name: str) -> Unit:
-        return Unit(
+        return make_unit(
             name=name,
             orders_api_url="https://integracao.example/v1/pedidos",
             orders_api_token="integration-token",
-            pacs_aet="PACS",
-            pacs_ip="127.0.0.1",
             pacs_port=2104,
-            calling_aet="RETRIEVE",
             store_port=444,
             receive_dir="/receive",
             send_dir="/send",
@@ -106,9 +94,7 @@ class DicomRulesTest(unittest.TestCase):
         )
 
     def test_legacy_prefix_preserves_numeric_suffix_behavior(self):
-        condition = RuleConditionSpec(
-            "0020,0010", "starts_with_digits", "SLRX"
-        )
+        condition = RuleConditionSpec("0020,0010", "starts_with_digits", "SLRX")
         for value in ("SLRX1", "slrx123ABC"):
             image = Dataset()
             image.StudyID = value
@@ -278,9 +264,7 @@ class DicomRulesTest(unittest.TestCase):
             )
             for item in (high, low):
                 item.conditions.append(
-                    DicomRuleCondition(
-                        tag="0008,0060", operator="equals", value="CT"
-                    )
+                    DicomRuleCondition(tag="0008,0060", operator="equals", value="CT")
                 )
                 item.unit_links.append(DicomRuleUnit(unit_id=first.id))
             db.add_all([low, high])

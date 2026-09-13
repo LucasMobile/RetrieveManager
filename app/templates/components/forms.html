@@ -1,0 +1,23 @@
+{% from "icons.html" import icon %}
+
+{% macro csrf_input(request) -%}
+<input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+{%- endmacro %}
+
+{% macro post_action(request, url, button_class, aria_label, icon_name='', text='', tooltip='', confirm='', confirm_label='') -%}
+<form class="inline-form" method="post" action="{{ url }}"{% if confirm %} data-confirm="{{ confirm }}"{% endif %}{% if confirm_label %} data-confirm-label="{{ confirm_label }}"{% endif %}>
+  {{ csrf_input(request) }}
+  <button class="{{ button_class }}" type="submit" aria-label="{{ aria_label }}"{% if tooltip %} data-tooltip="{{ tooltip }}" title="{{ tooltip }}"{% endif %}>{% if icon_name %}{{ icon(icon_name) }}{% endif %}{% if text %} {{ text }}{% endif %}</button>
+</form>
+{%- endmacro %}
+
+{% macro password_field(id, name, label, password_label, autocomplete, required=true, hint='') -%}
+<div class="field">
+  <label for="{{ id }}">{{ label }}</label>
+  <div class="field__control">
+    <input id="{{ id }}" name="{{ name }}" type="password" autocomplete="{{ autocomplete }}"{% if required %} required{% endif %}>
+    <button class="field__action field__action--icon" type="button" data-password-toggle="{{ id }}" data-password-label="{{ password_label }}" aria-label="Mostrar {{ password_label }}" title="Mostrar senha" aria-pressed="false"><span data-password-show>{{ icon("eye") }}</span><span data-password-hide hidden>{{ icon("eye-off") }}</span></button>
+  </div>
+  {% if hint %}<span class="field__hint">{{ hint }}</span>{% endif %}
+</div>
+{%- endmacro %}

@@ -222,6 +222,13 @@ class Order(Base):
             "prior_status",
             "unit_id",
         ),
+        Index(
+            "ix_orders_completed_retention",
+            "archived_at",
+            "status",
+            "done_at",
+            "id",
+        ),
         Index("ix_orders_archive_date_id", "archived_at", "id"),
         Index("ix_orders_acc", "acc"),
         Index("ix_orders_pat_id", "pat_id"),

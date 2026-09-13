@@ -12,7 +12,7 @@ from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import (
@@ -50,10 +50,10 @@ from app.models import (
     HistoricalStudy,
     ImageTransfer,
     Order,
-    OrderEvent,
     Unit,
 )
 from app.observability import log_context, log_event, new_correlation_id
+from app.order_state import ACTIVE_ORDER_STATUSES, ACTIVE_PRIOR_STATUSES
 from app.orders_api import (
     InvalidApiOrder,
     OrdersApiError,
@@ -61,8 +61,8 @@ from app.orders_api import (
     fetch_orders,
     parse_api_order,
 )
-from app.retention import archive_order
 from app.parse import parse_findscu_output
+from app.retention import archive_order
 from app.rules import drop_codes, schedule_from_now
 
 log = logging.getLogger("worker")
@@ -70,6 +70,8 @@ STALE_LOCK = timedelta(minutes=20)
 PRIOR_RETRY_DELAYS = (60, 300)
 UNMATCHED_ORDER_RETENTION = timedelta(days=1)
 UNMATCHED_ORDER_CLEANUP_BATCH = 500
+COMPLETED_ORDER_RETENTION = timedelta(weeks=2)
+COMPLETED_ORDER_CLEANUP_BATCH = 500
 
 
 @dataclass(frozen=True)
@@ -123,7 +125,7 @@ def recover_stale_locks(db: Session) -> None:
         db.scalars(
             select(Order).where(
                 Order.archived_at.is_(None),
-                Order.status.in_(("retrieving", "retrieving_second")),
+                Order.status.in_(ACTIVE_ORDER_STATUSES),
                 (Order.heartbeat_at.is_(None)) | (Order.heartbeat_at < cutoff),
             )
         )
@@ -415,15 +417,32 @@ def cleanup_unmatched_orders(db: Session, now: datetime | None = None) -> int:
             .limit(UNMATCHED_ORDER_CLEANUP_BATCH)
         )
     )
+    return _archive_order_batch(
+        db,
+        orders,
+        archived_at=current_time,
+        reason="Nenhum exame localizado pelo C-FIND após 24 horas.",
+        audit_summary=(
+            "Pedido arquivado automaticamente após 24 horas sem exame "
+            "localizado pelo C-FIND; histórico preservado."
+        ),
+        event_name="order.unmatched.archive",
+        cutoff=cutoff,
+    )
+
+
+def _archive_order_batch(
+    db: Session,
+    orders: list[Order],
+    *,
+    archived_at: datetime,
+    reason: str,
+    audit_summary: str,
+    event_name: str,
+    cutoff: datetime,
+) -> int:
     for order in orders:
-        order_id = order.id
-        accession = order.acc
-        archive_order(
-            db,
-            order,
-            reason="Nenhum exame localizado pelo C-FIND após 24 horas.",
-            archived_at=current_time,
-        )
+        archive_order(db, order, reason=reason, archived_at=archived_at)
         db.add(
             AuditLog(
                 actor_id=None,
@@ -431,27 +450,56 @@ def cleanup_unmatched_orders(db: Session, now: datetime | None = None) -> int:
                 actor_role="system",
                 action="archive",
                 resource_type="order",
-                resource_id=str(order_id),
-                resource_name=accession,
-                summary=(
-                    "Pedido arquivado automaticamente após 24 horas sem exame "
-                    "localizado pelo C-FIND; histórico preservado."
-                ),
+                resource_id=str(order.id),
+                resource_name=order.acc,
+                summary=audit_summary,
                 ip_address="",
             )
         )
-    if orders:
-        db.commit()
-        log_event(
-            log,
-            logging.INFO,
-            "order.unmatched.archive",
-            resource="orders",
-            status="success",
-            archived_count=len(orders),
-            cutoff=cutoff.isoformat(),
-        )
+    if not orders:
+        return 0
+    db.commit()
+    log_event(
+        log,
+        logging.INFO,
+        event_name,
+        resource="orders",
+        status="success",
+        archived_count=len(orders),
+        cutoff=cutoff.isoformat(),
+    )
     return len(orders)
+
+
+def archive_completed_orders(db: Session, now: datetime | None = None) -> int:
+    current_time = now or datetime.now()
+    cutoff = current_time - COMPLETED_ORDER_RETENTION
+    orders = list(
+        db.scalars(
+            select(Order)
+            .where(
+                Order.archived_at.is_(None),
+                Order.status == "done",
+                Order.done_at.is_not(None),
+                Order.done_at <= cutoff,
+                Order.prior_status.in_(("disabled", "done")),
+            )
+            .order_by(Order.done_at, Order.id)
+            .limit(COMPLETED_ORDER_CLEANUP_BATCH)
+        )
+    )
+    return _archive_order_batch(
+        db,
+        orders,
+        archived_at=current_time,
+        reason="Pedido concluído há 14 dias.",
+        audit_summary=(
+            "Pedido arquivado automaticamente 14 dias após a conclusão; "
+            "histórico preservado."
+        ),
+        event_name="order.completed.archive",
+        cutoff=cutoff,
+    )
 
 
 def find_pending(db: Session, unit: Unit) -> None:
@@ -601,7 +649,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             select(func.count()).where(
                 Order.unit_id == unit.id,
                 Order.archived_at.is_(None),
-                Order.status.in_(("retrieving", "retrieving_second")),
+                Order.status.in_(ACTIVE_ORDER_STATUSES),
             )
         )
         or 0
@@ -628,7 +676,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.unit_id == unit.id,
                 Order.archived_at.is_(None),
                 Order.status == "wait_retrieve",
-                Order.prior_status.notin_(("queued", "retry_wait", "retrieving")),
+                Order.prior_status.notin_(ACTIVE_PRIOR_STATUSES),
                 Order.retrieve_at.is_not(None),
                 Order.retrieve_at <= now,
             )
@@ -642,7 +690,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.unit_id == unit.id,
                 Order.archived_at.is_(None),
                 Order.status == "wait_second",
-                Order.prior_status.notin_(("queued", "retry_wait", "retrieving")),
+                Order.prior_status.notin_(ACTIVE_PRIOR_STATUSES),
                 Order.second_retrieve_at.is_not(None),
                 Order.second_retrieve_at <= now,
             )
@@ -660,13 +708,11 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             )
         )
     )
-    candidates = [
-        (order.retrieve_at, 1, order.id, "first", order) for order in first
-    ] + [
-        (order.second_retrieve_at, 2, order.id, "second", order) for order in second
-    ] + [
-        (order.prior_due_at, 0, order.id, "prior", order) for order in prior
-    ]
+    candidates = (
+        [(order.retrieve_at, 1, order.id, "first", order) for order in first]
+        + [(order.second_retrieve_at, 2, order.id, "second", order) for order in second]
+        + [(order.prior_due_at, 0, order.id, "prior", order) for order in prior]
+    )
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
     for _due_at, _priority, _order_id, kind, order in candidates[:slots]:
         if kind == "first":
@@ -876,36 +922,51 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
         )
 
 
+def _settled_files(
+    directory: Path, settle_seconds: int, *, timestamp: float | None = None
+) -> tuple[list[Path], list[tuple[Path, OSError]]]:
+    """Return visible files whose modification time is at least the settle age."""
+    if not directory.is_dir():
+        return [], []
+    current_timestamp = (
+        timestamp if timestamp is not None else datetime.now().timestamp()
+    )
+    paths: list[Path] = []
+    errors: list[tuple[Path, OSError]] = []
+    for path in directory.iterdir():
+        if path.name.startswith("."):
+            continue
+        try:
+            if (
+                path.is_file()
+                and current_timestamp - path.stat().st_mtime >= settle_seconds
+            ):
+                paths.append(path)
+        except OSError as exc:
+            errors.append((path, exc))
+    return paths, errors
+
+
 def compact_unit(db: Session, unit: Unit) -> None:
     origin = Path(unit.receive_dir)
     dest_dir = Path(unit.send_dir)
     error_dir = Path(unit.error_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     error_dir.mkdir(parents=True, exist_ok=True)
-    if not origin.is_dir():
-        return
     drops = drop_codes(db)
     dicom_rules = load_rule_specs(db, unit.id)
     settle = unit.file_settle_seconds
-    now = datetime.now().timestamp()
-    jobs: list[Path] = []
-    for path in origin.iterdir():
-        try:
-            if not path.is_file() or path.name.startswith("."):
-                continue
-            if now - path.stat().st_mtime < settle:
-                continue
-            jobs.append(path)
-        except OSError as exc:
-            log_event(
-                log,
-                logging.ERROR,
-                "dicom.file.inspect",
-                resource=f"unit:{unit.id}",
-                status="failure",
-                error=exc,
-                unit_id=unit.id,
-            )
+    jobs, inspection_errors = _settled_files(origin, settle)
+    for _path, exc in inspection_errors:
+        log_event(
+            log,
+            logging.ERROR,
+            "dicom.file.inspect",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error=exc,
+            unit_id=unit.id,
+        )
     if not jobs:
         return
     batch_correlation = new_correlation_id()
@@ -1208,25 +1269,17 @@ def _associate_historical_transfer(
 
 def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
     origin = Path(unit.send_dir)
-    if not origin.is_dir() or not cloud_url:
+    if not cloud_url:
         return
     circuit = _cloud_circuits.setdefault(cloud_url, CircuitState())
     current_time = datetime.now()
     if circuit.open_until and current_time < circuit.open_until:
         return
 
-    timestamp = current_time.timestamp()
-    paths: dict[str, Path] = {}
-    for path in origin.iterdir():
-        try:
-            if (
-                path.is_file()
-                and not path.name.startswith(".")
-                and timestamp - path.stat().st_mtime > settle
-            ):
-                paths[path.name] = path
-        except OSError:
-            continue
+    settled, _inspection_errors = _settled_files(
+        origin, settle, timestamp=current_time.timestamp()
+    )
+    paths = {path.name: path for path in settled}
     if not paths:
         return
 

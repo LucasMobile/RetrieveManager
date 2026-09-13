@@ -1,4 +1,5 @@
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 <!doctype html>
 <html lang="pt-BR">
 <head>
@@ -72,7 +73,7 @@
         {{ icon("chevron-down", "account__chevron") }}
       </button>
       <form method="post" action="/logout">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
         <button class="icon-button icon-button--inverse" type="submit" aria-label="Sair da conta" title="Sair">
           {{ icon("log-out") }}
         </button>

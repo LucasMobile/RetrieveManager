@@ -3,19 +3,17 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
 from app.main import rules_compress_delete, rules_retrieve_delete
-from app.models import Base, CompressRule, ModalityRule
+from app.models import CompressRule, ModalityRule
 from app.rules import retrieve_rule_for, schedule_from_now
+from tests.support import DatabaseTestCase
 
 
-class RulesTest(unittest.TestCase):
+class RulesTest(DatabaseTestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine)
+        super().setUp()
         with self.Session() as db:
             db.add_all(
                 [
@@ -42,9 +40,6 @@ class RulesTest(unittest.TestCase):
                 ]
             )
             db.commit()
-
-    def tearDown(self):
-        self.engine.dispose()
 
     def test_ct_and_default(self):
         with self.Session() as db:

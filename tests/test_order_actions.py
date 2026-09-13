@@ -1,45 +1,32 @@
 import unittest
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
 from app.main import (
-    ACTIVE_ORDER_STATUSES,
     _delete_order_record,
     _reset_order_for_reprocess,
 )
 from app.models import (
     AuditLog,
-    Base,
     ImageTransfer,
     ModalityRule,
     Order,
     OrderEvent,
     Unit,
 )
-from app.pipeline import cleanup_unmatched_orders
+from app.order_state import ACTIVE_ORDER_STATUSES
+from app.pipeline import archive_completed_orders, cleanup_unmatched_orders
+from tests.support import DatabaseTestCase, make_unit
 
 
-class OrderActionsTest(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
-
-    def tearDown(self):
-        self.engine.dispose()
-
+class OrderActionsTest(DatabaseTestCase):
     @staticmethod
     def _unit() -> Unit:
-        return Unit(
-            name="unit",
+        return make_unit(
             orders_api_url="https://integracao.example/v1/pedidos",
             orders_api_token="integration-token",
-            pacs_aet="PACS",
-            pacs_ip="127.0.0.1",
             pacs_port=2104,
-            calling_aet="RETRIEVE",
             store_port=444,
             receive_dir="/receive",
             send_dir="/send",
@@ -240,6 +227,81 @@ class OrderActionsTest(unittest.TestCase):
             )
             self.assertEqual(audit.actor_username, "Sistema")
             self.assertIn("24 horas", audit.summary)
+
+    def test_completed_orders_are_archived_after_two_weeks(self):
+        now = datetime(2026, 9, 12, 12, 0, 0)
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            eligible = Order(
+                unit_id=unit.id,
+                acc="completed-old",
+                birth_date="20000101",
+                status="done",
+                done_at=now - timedelta(days=14, seconds=1),
+            )
+            protected = [
+                Order(
+                    unit_id=unit.id,
+                    acc="completed-recent",
+                    birth_date="20000101",
+                    status="done",
+                    done_at=now - timedelta(days=13),
+                ),
+                Order(
+                    unit_id=unit.id,
+                    acc="prior-error",
+                    birth_date="20000101",
+                    status="done",
+                    done_at=now - timedelta(days=30),
+                    prior_status="error",
+                ),
+                Order(
+                    unit_id=unit.id,
+                    acc="missing-completion-date",
+                    birth_date="20000101",
+                    status="done",
+                    done_at=None,
+                ),
+                Order(
+                    unit_id=unit.id,
+                    acc="still-processing",
+                    birth_date="20000101",
+                    status="receiving",
+                    done_at=now - timedelta(days=30),
+                ),
+            ]
+            db.add_all([eligible, *protected])
+            db.commit()
+            eligible_id = eligible.id
+
+            self.assertEqual(archive_completed_orders(db, now), 1)
+            archived = db.get(Order, eligible_id)
+            self.assertEqual(archived.archived_at, now)
+            self.assertIn("14 dias", archived.archive_reason)
+            self.assertEqual(
+                {
+                    order.acc
+                    for order in db.scalars(
+                        select(Order).where(Order.archived_at.is_(None))
+                    )
+                },
+                {
+                    "completed-recent",
+                    "prior-error",
+                    "missing-completion-date",
+                    "still-processing",
+                },
+            )
+            event = db.scalar(
+                select(OrderEvent).where(OrderEvent.order_id == eligible_id)
+            )
+            self.assertEqual(event.message, "Pedido arquivado")
+            audit = db.scalar(
+                select(AuditLog).where(AuditLog.resource_id == str(eligible_id))
+            )
+            self.assertIn("14 dias", audit.summary)
 
 
 if __name__ == "__main__":

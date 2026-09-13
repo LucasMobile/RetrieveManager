@@ -17,6 +17,11 @@ from app.config import BASE_DIR, DEFAULT_CLOUD_URL
 from app.main import app, get_db
 from app.middleware import _same_origin
 from app.models import AuditLog, Base, DicomRule, Order, Settings, Unit, User
+from app.rate_limit import (
+    global_rate_limiter,
+    login_failure_rate_limiter,
+    reset_rate_limiters,
+)
 from app.security import hash_password, verify_password
 from app.validation import validate_cloud_url
 
@@ -28,6 +33,7 @@ class SecurityTest(unittest.TestCase):
         cls.password_hash = hash_password(cls.password)
 
     def setUp(self):
+        reset_rate_limiters()
         self.engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
@@ -61,6 +67,7 @@ class SecurityTest(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+        reset_rate_limiters()
         app.dependency_overrides.clear()
         app.dependency_overrides.update(self.previous_overrides)
         self.engine.dispose()
@@ -86,6 +93,80 @@ class SecurityTest(unittest.TestCase):
 
     def login(self):
         return self.login_credentials("tester", self.password)
+
+    def test_failed_login_is_blocked_after_five_attempts_for_the_ip(self):
+        token = self.token()
+        self.assertEqual(login_failure_rate_limiter.limit, 5)
+        for expected_remaining in range(4, -1, -1):
+            response = self.client.post(
+                "/login",
+                data={
+                    "username": "tester",
+                    "password": "senha-incorreta",
+                    "csrf_token": token,
+                },
+            )
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.headers["x-ratelimit-limit"], "5")
+            self.assertEqual(
+                response.headers["x-ratelimit-remaining"], str(expected_remaining)
+            )
+            self.assertEqual(response.headers["x-ratelimit-scope"], "failed-login")
+
+        blocked = self.client.post(
+            "/login",
+            data={
+                "username": "tester",
+                "password": self.password,
+                "csrf_token": token,
+            },
+        )
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked.headers["x-ratelimit-remaining"], "0")
+        self.assertIn("retry-after", blocked.headers)
+
+    def test_successful_login_does_not_erase_the_ip_failure_window(self):
+        token = self.token()
+        for _ in range(2):
+            self.client.post(
+                "/login",
+                data={
+                    "username": "tester",
+                    "password": "senha-incorreta",
+                    "csrf_token": token,
+                },
+            )
+        response = self.client.post(
+            "/login",
+            data={
+                "username": "tester",
+                "password": self.password,
+                "csrf_token": token,
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["x-ratelimit-remaining"], "3")
+
+    def test_global_rate_limit_returns_429_and_standard_headers(self):
+        previous_limit = global_rate_limiter.limit
+        global_rate_limiter.limit = 2
+        try:
+            first = self.client.get("/health/live")
+            second = self.client.get("/health/live")
+            blocked = self.client.get("/health/live")
+        finally:
+            global_rate_limiter.limit = previous_limit
+            global_rate_limiter.reset()
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.headers["x-ratelimit-limit"], "2")
+        self.assertEqual(first.headers["x-ratelimit-remaining"], "1")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.headers["x-ratelimit-remaining"], "0")
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked.headers["x-ratelimit-scope"], "global")
+        self.assertEqual(blocked.headers["retry-after"], "60")
 
     def unit_form_data(self, **overrides):
         root = str(BASE_DIR)
@@ -180,9 +261,7 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(edit_page.text.count('placeholder="••••••••••••"'), 2)
         self.assertNotIn('value="integration-token"', edit_page.text)
         self.assertNotIn('value="unit-token"', edit_page.text)
-        self.assertNotIn(
-            "Deixe em branco para manter o token atual.", edit_page.text
-        )
+        self.assertNotIn("Deixe em branco para manter o token atual.", edit_page.text)
 
         token = self.token(f"/units/{unit_id}")
         update_data = self.unit_form_data(
@@ -402,9 +481,7 @@ class SecurityTest(unittest.TestCase):
         self.assertIn("tester", users_page.text)
         new_user_page = self.client.get("/users/new")
         self.assertIn('option value="user" selected', new_user_page.text)
-        token = re.search(
-            r'name="csrf_token" value="([^"]+)"', users_page.text
-        )[1]
+        token = re.search(r'name="csrf_token" value="([^"]+)"', users_page.text)[1]
         initial_password = "initial-password-123"
         response = self.client.post(
             "/users/new",
@@ -423,7 +500,9 @@ class SecurityTest(unittest.TestCase):
             self.assertIsNotNone(managed_user)
             managed_user_id = managed_user.id
             self.assertEqual(managed_user.role, "user")
-            self.assertTrue(verify_password(initial_password, managed_user.password_hash))
+            self.assertTrue(
+                verify_password(initial_password, managed_user.password_hash)
+            )
 
         updated_password = "updated-password-123"
         response = self.client.post(
@@ -440,8 +519,12 @@ class SecurityTest(unittest.TestCase):
         with self.Session() as db:
             managed_user = db.get(User, managed_user_id)
             self.assertEqual(managed_user.role, "admin")
-            self.assertTrue(verify_password(updated_password, managed_user.password_hash))
-            current_user_id = db.scalar(select(User.id).where(User.username == "tester"))
+            self.assertTrue(
+                verify_password(updated_password, managed_user.password_hash)
+            )
+            current_user_id = db.scalar(
+                select(User.id).where(User.username == "tester")
+            )
 
         self.client.post(
             f"/users/{current_user_id}",
@@ -452,9 +535,7 @@ class SecurityTest(unittest.TestCase):
                 "password_confirmation": "",
             },
         )
-        self.client.post(
-            f"/users/{current_user_id}/delete", data={"csrf_token": token}
-        )
+        self.client.post(f"/users/{current_user_id}/delete", data={"csrf_token": token})
         bypass_password = "bypass-password-123"
         self.client.post(
             f"/users/{current_user_id}",
@@ -674,13 +755,20 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn("evil.example", response.text)
 
     def test_templates_have_one_token_in_each_post_form(self):
+        forms_component = (BASE_DIR / "app/templates/components/forms.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(forms_component.count('name="csrf_token"'), 1)
         for path in (BASE_DIR / "app/templates").glob("*.html"):
             for form in re.findall(
                 r"<form\b.*?</form>", path.read_text(encoding="utf-8"), re.S
             ):
                 if 'method="post"' in form:
                     with self.subTest(template=path.name):
-                        self.assertEqual(form.count('name="csrf_token"'), 1)
+                        token_sources = form.count('name="csrf_token"') + form.count(
+                            "csrf_input(request)"
+                        )
+                        self.assertEqual(token_sources, 1)
 
     def test_origin_compares_scheme_host_and_port(self):
         def request(origin):

@@ -1,4 +1,5 @@
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 <!doctype html>
 <html lang="pt-BR">
 <head>
@@ -30,7 +31,7 @@
       {% endif %}
 
       <form class="form-stack" id="login-form" method="post" action="/login">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
         <div class="field">
           <label for="username">Usuário</label>
           <input id="username" name="username" maxlength="80" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>

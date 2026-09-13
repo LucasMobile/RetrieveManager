@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 {% block title %}Usuários · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack users-page">
@@ -46,7 +47,7 @@
               <div class="table-actions">
                 <a class="action-icon" href="/users/{{ managed_user.id }}" data-tooltip="Editar usuário" title="Editar usuário" aria-label="Editar usuário">{{ icon("edit") }}</a>
                 <form class="inline-form" method="post" action="/users/{{ managed_user.id }}/delete" data-confirm="Excluir o usuário {{ managed_user.username }}? Essa pessoa perderá o acesso ao sistema." data-confirm-label="Excluir usuário">
-                  <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                  {{ csrf_input(request) }}
                   <button class="action-icon action-icon--danger{% if managed_user.id == user.id %} is-disabled{% endif %}" type="submit" data-tooltip="{{ 'Não é possível excluir a própria conta' if managed_user.id == user.id else 'Excluir usuário' }}" title="Excluir usuário" aria-label="Excluir usuário" {% if managed_user.id == user.id %}disabled{% endif %}>{{ icon("trash") }}</button>
                 </form>
               </div>

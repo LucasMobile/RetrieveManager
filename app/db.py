@@ -72,7 +72,7 @@ if DATABASE_URL.startswith("sqlite"):
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-def get_db() -> Generator[Session, None, None]:
+def get_db() -> Generator[Session]:
     db = SessionLocal()
     try:
         yield db
@@ -86,6 +86,22 @@ def init_db() -> None:
     _ensure_postgresql_indexes()
     with SessionLocal() as db:
         _seed(db)
+
+
+def _add_missing_sqlite_columns(table: str, additions: dict[str, str]) -> set[str]:
+    columns = {column["name"] for column in inspect(engine).get_columns(table)}
+    missing = [
+        (name, definition)
+        for name, definition in additions.items()
+        if name not in columns
+    ]
+    if missing:
+        with engine.begin() as connection:
+            for name, definition in missing:
+                connection.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                )
+    return columns
 
 
 def _migrate_schema() -> None:
@@ -103,9 +119,6 @@ def _migrate_schema() -> None:
         if "dest_aet" in unit_columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE units DROP COLUMN dest_aet"))
-        unit_columns = {
-            column["name"] for column in inspect(engine).get_columns("units")
-        }
         unit_additions = {
             "orders_api_url": "VARCHAR(500) NOT NULL DEFAULT ''",
             "orders_api_token": "VARCHAR(2048) NOT NULL DEFAULT ''",
@@ -116,25 +129,11 @@ def _migrate_schema() -> None:
             "deleted_by_user_id": "INTEGER",
             "deleted_by_username": "VARCHAR(80) NOT NULL DEFAULT ''",
         }
-        with engine.begin() as connection:
-            for name, definition in unit_additions.items():
-                if name not in unit_columns:
-                    connection.execute(
-                        text(f"ALTER TABLE units ADD COLUMN {name} {definition}")
-                    )
+        _add_missing_sqlite_columns("units", unit_additions)
     if "orders" not in table_names:
         return
-    columns = {column["name"] for column in inspector.get_columns("orders")}
-    if "correlation_id" not in columns:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "ALTER TABLE orders ADD COLUMN correlation_id "
-                    "VARCHAR(64) NOT NULL DEFAULT ''"
-                )
-            )
-    columns = {column["name"] for column in inspect(engine).get_columns("orders")}
     order_additions = {
+        "correlation_id": "VARCHAR(64) NOT NULL DEFAULT ''",
         "source_id": "VARCHAR(64) NOT NULL DEFAULT ''",
         "api_read_status": "VARCHAR(16) NOT NULL DEFAULT 'confirmed'",
         "api_read_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -155,12 +154,8 @@ def _migrate_schema() -> None:
         "archived_by_user_id": "INTEGER",
         "archived_by_username": "VARCHAR(80) NOT NULL DEFAULT ''",
     }
+    columns = _add_missing_sqlite_columns("orders", order_additions)
     with engine.begin() as connection:
-        for name, definition in order_additions.items():
-            if name not in columns:
-                connection.execute(
-                    text(f"ALTER TABLE orders ADD COLUMN {name} {definition}")
-                )
         if "source_id" not in columns and "filename" in columns:
             connection.execute(
                 text("UPDATE orders SET source_id = filename WHERE source_id = ''")
@@ -234,6 +229,9 @@ def _ensure_postgresql_indexes() -> None:
         "ON orders (created_at, id) WHERE archived_at IS NULL "
         "AND status = 'watching' AND study_uid = '' "
         "AND last_find_at IS NOT NULL AND attempts > 0",
+        "CREATE INDEX IF NOT EXISTS ix_orders_completed_retention_partial "
+        "ON orders (done_at, id) WHERE archived_at IS NULL "
+        "AND status = 'done' AND prior_status IN ('disabled', 'done')",
         "CREATE INDEX IF NOT EXISTS ix_orders_archived_at_id_partial "
         "ON orders (archived_at DESC, id DESC) WHERE archived_at IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS ix_orders_acc_trgm "

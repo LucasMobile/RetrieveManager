@@ -2,10 +2,9 @@ import unittest
 from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
-from app.models import Base, Order, OrderEvent, Unit
+from app.models import Order, OrderEvent
 from app.pipeline import (
     _find_one,
     _run_prior_move,
@@ -13,27 +12,16 @@ from app.pipeline import (
     prior_date_range,
     recover_stale_locks,
 )
+from tests.support import DatabaseTestCase, make_unit
 
 
-class PriorRetrieveTest(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
-
-    def tearDown(self):
-        self.engine.dispose()
-
+class PriorRetrieveTest(DatabaseTestCase):
     @staticmethod
     def _unit(max_parallel_moves=1):
-        return Unit(
-            name="unit",
+        return make_unit(
             orders_api_url="https://integracao.example/v1/pedidos",
             orders_api_token="integration-token",
-            pacs_aet="PACS",
-            pacs_ip="127.0.0.1",
             pacs_port=2104,
-            calling_aet="RETRIEVE",
             store_port=444,
             receive_dir="/receive",
             send_dir="/send",

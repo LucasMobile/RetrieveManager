@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 {% block title %}Unidades · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack units-page">
@@ -14,18 +15,18 @@
     </div>
   </header>
 
-  <section class="units-summary" aria-label="Resumo das unidades">
-    <div class="units-summary__item">
-      <span class="units-summary__icon">{{ icon("building") }}</span>
-      <div><strong>{{ summary.total }}</strong><span>unidade{% if summary.total != 1 %}s{% endif %} cadastrada{% if summary.total != 1 %}s{% endif %}</span></div>
+  <section class="units-summary summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das unidades">
+    <div class="summary-strip__item">
+      <span class="summary-strip__icon">{{ icon("building") }}</span>
+      <div class="summary-strip__copy"><strong>{{ summary.total }}</strong><span>unidade{% if summary.total != 1 %}s{% endif %} cadastrada{% if summary.total != 1 %}s{% endif %}</span></div>
     </div>
-    <div class="units-summary__item">
-      <span class="units-summary__icon">{{ icon("check") }}</span>
-      <div><strong>{{ summary.enabled }}</strong><span>unidade{% if summary.enabled != 1 %}s{% endif %} ativa{% if summary.enabled != 1 %}s{% endif %}</span></div>
+    <div class="summary-strip__item">
+      <span class="summary-strip__icon">{{ icon("check") }}</span>
+      <div class="summary-strip__copy"><strong>{{ summary.enabled }}</strong><span>unidade{% if summary.enabled != 1 %}s{% endif %} ativa{% if summary.enabled != 1 %}s{% endif %}</span></div>
     </div>
-    <div class="units-summary__item">
-      <span class="units-summary__icon">{{ icon("pause") }}</span>
-      <div><strong>{{ summary.paused }}</strong><span>unidade{% if summary.paused != 1 %}s{% endif %} pausada{% if summary.paused != 1 %}s{% endif %}</span></div>
+    <div class="summary-strip__item">
+      <span class="summary-strip__icon">{{ icon("pause") }}</span>
+      <div class="summary-strip__copy"><strong>{{ summary.paused }}</strong><span>unidade{% if summary.paused != 1 %}s{% endif %} pausada{% if summary.paused != 1 %}s{% endif %}</span></div>
     </div>
   </section>
 
@@ -92,11 +93,11 @@
               <div class="table-actions units-table__actions">
                 <a class="action-icon" href="/units/{{ u.id }}" data-tooltip="Editar unidade" aria-label="Editar unidade">{{ icon("edit") }}</a>
                 <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
                   <button class="action-icon" type="submit" data-tooltip="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}" aria-label="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}">{{ icon("pause" if u.enabled else "play") }}</button>
                 </form>
                 <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Arquivar a unidade {{ u.name }}? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        {{ csrf_input(request) }}
                   <button class="action-icon action-icon--danger" type="submit" data-tooltip="Arquivar unidade" aria-label="Arquivar unidade">{{ icon("trash") }}</button>
                 </form>
               </div>

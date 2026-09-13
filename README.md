@@ -67,6 +67,25 @@ Configure um proxy reverso HTTPS para o serviço web na porta 8080 e defina
 Abra a URL HTTPS configurada; a porta 8080 deve ficar acessível apenas ao proxy.
 Para testes sem domínio, use a configuração HTTP por IP descrita abaixo.
 
+O middleware limita cada IP a 100 requisições por minuto. No login, cinco falhas
+em quinze minutos bloqueiam temporariamente novas tentativas daquele IP. Todas as
+respostas incluem `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+`X-RateLimit-Reset`, `X-RateLimit-Window` e `X-RateLimit-Scope`; respostas `429`
+também incluem `Retry-After`.
+
+O endereço considerado é o cliente validado pelo Uvicorn. Atrás de proxy reverso,
+configure `FORWARDED_ALLOW_IPS` com o IP ou a sub-rede **somente do proxy** para
+que `X-Forwarded-For` seja aceito com segurança. Não use `*` se a porta 8080 puder
+ser alcançada diretamente, pois clientes poderiam falsificar o IP e contornar o
+limite.
+
+O Compose atual executa um único processo web, portanto a janela em memória é
+consistente nessa implantação. Se forem adicionados múltiplos workers ou réplicas,
+o estado do rate limit deve ser movido para Redis ou aplicado no gateway/proxy.
+Para ataques volumétricos, mantenha também limitação no proxy, WAF ou provedor de
+borda; o middleware protege os recursos da aplicação, mas não substitui defesa de
+rede.
+
 Login inicial (se o banco estiver vazio):
 
 - usuário: `admin` (ou `RETRIEVE_ADMIN_USER`)
@@ -179,7 +198,9 @@ Sem os binários DCMTK no PATH o worker registra erro no pedido e a tela continu
 Pedidos não são apagados fisicamente. A ação **Arquivar** remove o registro da
 fila operacional e o mantém, com eventos e vínculos de arquivos, em **Histórico
 de pedidos**. Pedidos sem resultado no C-FIND após 24 horas também são arquivados
-automaticamente. Unidades removidas seguem a mesma regra de preservação.
+automaticamente. Pedidos concluídos são arquivados 14 dias após a data de
+conclusão, desde que não exista retrieve histórico pendente ou com erro. Unidades
+removidas seguem a mesma regra de preservação.
 
 A fila usa paginação por cursor, sem o custo crescente de `OFFSET`. O PostgreSQL
 recebe índices parciais para registros ativos, histórico e limpeza automática,

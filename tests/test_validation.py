@@ -47,8 +47,16 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(result["orders_api_station_id"], "48")
         self.assertTrue(result["retrieve_prior_enabled"])
         self.assertEqual(result["move_timeout_prior"], 1800)
-        self.assertEqual(result["cloud_url"], "https://idr.mobilemed.com.br/api/router/send-image")
+        self.assertEqual(
+            result["cloud_url"], "https://idr.mobilemed.com.br/api/router/send-image"
+        )
         self.assertEqual(result["file_settle_seconds"], 0)
+
+        editable_form = {**form, "token": "", "orders_api_token": ""}
+        result = validate_unit_form(editable_form)
+        self.assertEqual(result["token"], "")
+        with self.assertRaisesRegex(ValueError, "Token da unidade é obrigatório"):
+            validate_unit_form(editable_form, creating=True)
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):

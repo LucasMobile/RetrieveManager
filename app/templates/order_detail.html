@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input, post_action %}
 {% block title %}Pedido {{ order.acc }} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack">
@@ -17,21 +18,12 @@
     </div>
     <div class="page-header__actions">
       {% if user.role == 'admin' and not order.archived_at %}
-      {% if order.status not in ('retrieving', 'retrieving_second', 'receiving') and order.prior_status not in ('queued', 'retry_wait', 'retrieving') %}
-      <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry" data-confirm="Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem." data-confirm-label="Reprocessar pedido">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <button class="btn btn--primary" type="submit">{{ icon("retry") }} Reprocessar</button>
-      </form>
-      <form class="inline-form" method="post" action="/orders/{{ order.id }}/delete" data-confirm="Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados." data-confirm-label="Arquivar pedido">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <button class="btn btn--danger" type="submit">{{ icon("trash") }} Arquivar</button>
-      </form>
+      {% if order.can_reprocess and order.can_archive %}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/retry', 'btn btn--primary', 'Reprocessar pedido', icon_name='retry', text='Reprocessar', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/delete', 'btn btn--danger', 'Arquivar pedido', icon_name='trash', text='Arquivar', confirm='Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados.', confirm_label='Arquivar pedido') }}
       {% endif %}
-      {% if order.status not in ('done', 'cancelled') %}
-      <form class="inline-form" method="post" action="/orders/{{ order.id }}/cancel" data-confirm="Cancelar este pedido? O processamento atual será interrompido." data-confirm-label="Cancelar pedido">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <button class="btn btn--secondary" type="submit">Cancelar</button>
-      </form>
+      {% if order.can_cancel %}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/cancel', 'btn btn--secondary', 'Cancelar pedido', text='Cancelar', confirm='Cancelar este pedido? O processamento atual será interrompido.', confirm_label='Cancelar pedido') }}
       {% endif %}
       {% endif %}
       <a class="btn btn--secondary" href="{{ '/orders/history' if order.archived_at else '/orders' }}">{{ icon("arrow-left") }} Voltar</a>
@@ -83,7 +75,7 @@
         {% if order.prior_last_error %}<div class="order-error"><strong>Último erro do histórico</strong><span>{{ order.prior_last_error }}</span></div>{% endif %}
         {% if user.role == 'admin' and not order.archived_at and order.prior_status in ('done', 'error') %}
         <form method="post" action="/orders/{{ order.id }}/retry-prior" data-confirm="Executar novamente o retrieve de exames anteriores?" data-confirm-label="Reprocessar histórico">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+          {{ csrf_input(request) }}
           <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar histórico</button>
         </form>
         {% endif %}

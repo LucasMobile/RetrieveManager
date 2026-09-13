@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
+{% from "components/forms.html" import csrf_input %}
 {% block title %}Regras DICOM · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack dicom-rules-page">
@@ -43,8 +44,8 @@
         </div>
         <div class="dicom-rule-card__actions">
           <a class="action-icon" href="/rules?edit={{ rule.id }}#rule-editor" data-tooltip="Editar regra" aria-label="Editar {{ rule.name }}">{{ icon("edit") }}</a>
-          <form method="post" action="/rules/dicom/{{ rule.id }}/toggle"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon" type="submit" data-tooltip="{{ 'Desativar' if rule.enabled else 'Ativar' }} regra" aria-label="{{ 'Desativar' if rule.enabled else 'Ativar' }} {{ rule.name }}">{{ icon("pause" if rule.enabled else "play") }}</button></form>
-          <form method="post" action="/rules/dicom/{{ rule.id }}/delete" data-confirm="Excluir a regra {{ rule.name }}? O histórico das aplicações já realizadas será preservado." data-confirm-label="Excluir regra"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir regra" aria-label="Excluir {{ rule.name }}">{{ icon("trash") }}</button></form>
+          <form method="post" action="/rules/dicom/{{ rule.id }}/toggle">{{ csrf_input(request) }}<button class="action-icon" type="submit" data-tooltip="{{ 'Desativar' if rule.enabled else 'Ativar' }} regra" aria-label="{{ 'Desativar' if rule.enabled else 'Ativar' }} {{ rule.name }}">{{ icon("pause" if rule.enabled else "play") }}</button></form>
+          <form method="post" action="/rules/dicom/{{ rule.id }}/delete" data-confirm="Excluir a regra {{ rule.name }}? O histórico das aplicações já realizadas será preservado." data-confirm-label="Excluir regra">{{ csrf_input(request) }}<button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir regra" aria-label="Excluir {{ rule.name }}">{{ icon("trash") }}</button></form>
         </div>
       </article>
       {% endfor %}
@@ -61,7 +62,7 @@
       {% if edit_rule %}<a class="btn btn--quiet btn--sm" href="/rules#rule-editor">Cancelar edição</a>{% else %}<span class="status-badge status-badge--active">Nova configuração</span>{% endif %}
     </header>
     <form class="dicom-rule-form" method="post" action="{{ '/rules/dicom/' ~ edit_rule.id if edit_rule else '/rules' }}" data-dicom-rule-form>
-      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      {{ csrf_input(request) }}
       <section class="dicom-rule-form__section" aria-labelledby="rule-basic-title">
         <header class="dicom-rule-form__section-header"><span>01</span><div><h3 id="rule-basic-title">Configuração básica</h3><p>Identifique e ordene a execução da regra.</p></div></header>
         <div class="dicom-rule-form__section-body dicom-rule-form__grid">

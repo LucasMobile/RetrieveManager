@@ -4,35 +4,28 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
 from app.main import _dashboard_units
-from app.models import Base, Order, Unit
+from app.models import Order, Unit
+from tests.support import DatabaseTestCase, make_unit
 
 
-class DashboardTest(unittest.TestCase):
+class DashboardTest(DatabaseTestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+        super().setUp()
         self.temp_dir = tempfile.TemporaryDirectory()
 
     def tearDown(self):
         self.temp_dir.cleanup()
-        self.engine.dispose()
+        super().tearDown()
 
     def _unit(self, name: str, *, enabled: bool) -> Unit:
         path = self.temp_dir.name
-        return Unit(
+        return make_unit(
             name=name,
             enabled=enabled,
             orders_api_url="https://integracao.example/v1/pedidos",
             orders_api_token="integration-token",
-            pacs_aet="PACS",
-            pacs_ip="127.0.0.1",
             pacs_port=2104,
-            calling_aet="RETRIEVE",
             store_port=444,
             receive_dir=path,
             send_dir=path,

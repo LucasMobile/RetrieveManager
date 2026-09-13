@@ -1,27 +1,16 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from app.models import Base, Unit
 from app.worker import _tick
+from tests.support import DatabaseTestCase, make_unit
 
 
-class UnitCloudSettingsTest(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
-
-    def tearDown(self):
-        self.engine.dispose()
-
+class UnitCloudSettingsTest(DatabaseTestCase):
     def test_worker_uses_each_units_cloud_destination_and_zero_settle(self):
         with self.Session() as db:
             db.add_all(
                 [
-                    Unit(
+                    make_unit(
                         name="Unidade A",
                         enabled=True,
                         orders_api_url="https://example.test/orders",
@@ -38,7 +27,7 @@ class UnitCloudSettingsTest(unittest.TestCase):
                         cloud_url="https://cloud.example/send",
                         file_settle_seconds=0,
                     ),
-                    Unit(
+                    make_unit(
                         name="Unidade B",
                         enabled=True,
                         orders_api_url="https://example.test/orders-b",
