@@ -7,8 +7,10 @@ from app.dicom_tools import (
     echoscu_cmd,
     findscu_cmd,
     movescu_cmd,
-    prior_movescu_cmd,
+    prior_findscu_cmd,
+    prior_series_movescu_cmd,
     redact_dicom_output,
+    series_body_part_findscu_cmd,
     storescp_cmd,
 )
 
@@ -71,9 +73,9 @@ class DicomCmdTest(unittest.TestCase):
         self.assertIn("-aec", cmd)
         self.assertIn("srvpacsFIR", cmd)
 
-    def test_prior_move_uses_series_filters(self):
-        cmd = prior_movescu_cmd(
-            "/opt/dcmtk/bin/movescu",
+    def test_prior_find_uses_series_filters_and_requests_uids(self):
+        cmd = prior_findscu_cmd(
+            "/opt/dcmtk/bin/findscu",
             "mob",
             "srvpacsFIR",
             "10.20.0.31",
@@ -85,12 +87,43 @@ class DicomCmdTest(unittest.TestCase):
             "20230911-20260910",
         )
         self.assertIn("0008,0052=SERIES", cmd)
+        self.assertIn("0020,000D=", cmd)
+        self.assertIn("0020,000E=", cmd)
         self.assertIn("0018,0015=ABDOMEN", cmd)
         self.assertIn("0008,0060=MR", cmd)
         self.assertIn("0010,0020=30211738*", cmd)
         self.assertIn("0010,0030=19691027", cmd)
         self.assertIn("0008,0020=20230911-20260910", cmd)
         self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
+
+    def test_prior_move_targets_one_discovered_series(self):
+        cmd = prior_series_movescu_cmd(
+            "/opt/dcmtk/bin/movescu",
+            "mob",
+            "srvpacsFIR",
+            "10.20.0.31",
+            2104,
+            "1.2.study",
+            "1.2.series",
+        )
+        self.assertIn("0008,0052=SERIES", cmd)
+        self.assertIn("0020,000D=1.2.study", cmd)
+        self.assertIn("0020,000E=1.2.series", cmd)
+        self.assertEqual(cmd[-2:], ["10.20.0.31", "2104"])
+
+    def test_series_body_part_find_targets_current_study(self):
+        cmd = series_body_part_findscu_cmd(
+            "/opt/dcmtk/bin/findscu",
+            "mob",
+            "srvpacsFIR",
+            "10.20.0.31",
+            2104,
+            "1.2.current",
+        )
+        self.assertIn("0008,0052=SERIES", cmd)
+        self.assertIn("0020,000D=1.2.current", cmd)
+        self.assertIn("0020,000E=", cmd)
+        self.assertIn("0018,0015=", cmd)
 
     def test_storescp_and_jpeg_unchanged(self):
         scp = storescp_cmd("/opt/dcmtk/bin/storescp", "mob", 444, "/data/in")

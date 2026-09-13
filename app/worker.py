@@ -33,19 +33,20 @@ def _stop(*_args) -> None:
     stop_event.set()
 
 
-def _move_job(order_id: int, kind: str) -> None:
+def _move_job(resource_id: int, kind: str) -> None:
     with SessionLocal() as db:
         try:
-            run_claimed_move(db, order_id, kind)
+            run_claimed_move(db, resource_id, kind)
         except Exception as exc:
             log_event(
                 log,
                 logging.ERROR,
                 "dicom.move.job",
-                resource=f"order:{order_id}",
+                resource=f"{kind}:{resource_id}",
                 status="failure",
                 error=exc,
-                order_id=order_id,
+                resource_id=resource_id,
+                move_kind=kind,
             )
 
 
@@ -107,8 +108,8 @@ def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
                 continue
             ingest_unit(db, unit)
             find_pending(db, unit)
-            for order_id, kind in claim_due_moves(db, unit):
-                pool.submit(_move_job, order_id, kind)
+            for resource_id, kind in claim_due_moves(db, unit):
+                pool.submit(_move_job, resource_id, kind)
             compact_unit(db, unit)
             send_unit(db, unit, unit.cloud_url, unit.file_settle_seconds)
 

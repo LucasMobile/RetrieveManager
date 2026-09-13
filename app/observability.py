@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -10,11 +11,25 @@ from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import APP_ENV, LOG_LEVEL, SERVICE_NAME
 
 correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="-")
 user_id_var: ContextVar[int | None] = ContextVar("user_id", default=None)
+
+
+def _resolve_log_timezone():
+    timezone_name = os.getenv("TZ", "").strip()
+    if timezone_name:
+        try:
+            return ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            pass
+    return datetime.now().astimezone().tzinfo or UTC
+
+
+LOG_TIMEZONE = _resolve_log_timezone()
 
 _STANDARD_FIELDS = {
     "name",
@@ -47,7 +62,9 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "timestamp": datetime.fromtimestamp(
+                record.created, LOG_TIMEZONE
+            ).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "correlation_id": getattr(

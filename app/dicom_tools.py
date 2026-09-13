@@ -113,7 +113,7 @@ def movescu_cmd(
     ]
 
 
-def prior_movescu_cmd(
+def prior_findscu_cmd(
     bin_path: str,
     calling_aet: str,
     pacs_aet: str,
@@ -125,7 +125,80 @@ def prior_movescu_cmd(
     birth_date: str,
     date_range: str,
 ) -> list[str]:
-    """Build the Series-level C-MOVE used for prior patient examinations."""
+    """Build a SERIES query that discovers the exact historical studies."""
+    return [
+        bin_path,
+        "-v",
+        "-S",
+        "-k",
+        "0008,0052=SERIES",
+        "-k",
+        "0020,000D=",
+        "-k",
+        "0020,000E=",
+        "-k",
+        "0008,0050=",
+        "-k",
+        "0008,1030=",
+        "-k",
+        f"0018,0015={body_part}",
+        "-k",
+        f"0008,0060={modality}",
+        "-k",
+        f"0010,0020={patient_id}*",
+        "-k",
+        f"0010,0030={birth_date}",
+        "-k",
+        f"0008,0020={date_range}",
+        "-aet",
+        calling_aet,
+        "-aec",
+        pacs_aet,
+        pacs_ip,
+        str(pacs_port),
+    ]
+
+
+def series_body_part_findscu_cmd(
+    bin_path: str,
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    study_uid: str,
+) -> list[str]:
+    """Build a SERIES query used to find a non-empty BodyPartExamined."""
+    return [
+        bin_path,
+        "-v",
+        "-S",
+        "-k",
+        "0008,0052=SERIES",
+        "-k",
+        f"0020,000D={study_uid}",
+        "-k",
+        "0020,000E=",
+        "-k",
+        "0018,0015=",
+        "-aet",
+        calling_aet,
+        "-aec",
+        pacs_aet,
+        pacs_ip,
+        str(pacs_port),
+    ]
+
+
+def prior_series_movescu_cmd(
+    bin_path: str,
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    study_uid: str,
+    series_uid: str,
+) -> list[str]:
+    """Build an exact SERIES-level C-MOVE for a discovered historical series."""
     return [
         bin_path,
         "-v",
@@ -139,15 +212,9 @@ def prior_movescu_cmd(
         "-k",
         "0008,0052=SERIES",
         "-k",
-        f"0018,0015={body_part}",
+        f"0020,000D={study_uid}",
         "-k",
-        f"0008,0060={modality}",
-        "-k",
-        f"0010,0020={patient_id}*",
-        "-k",
-        f"0010,0030={birth_date}",
-        "-k",
-        f"0008,0020={date_range}",
+        f"0020,000E={series_uid}",
         pacs_ip,
         str(pacs_port),
     ]
@@ -203,6 +270,28 @@ def c_echo(
     )
 
 
+def c_find_series_body_part(
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    study_uid: str,
+    timeout: int = 60,
+) -> tuple[int, str]:
+    bin_path = _require(FINDSCU, "findscu")
+    return _run(
+        series_body_part_findscu_cmd(
+            bin_path,
+            calling_aet,
+            pacs_aet,
+            pacs_ip,
+            pacs_port,
+            study_uid,
+        ),
+        timeout,
+    )
+
+
 def c_move(
     calling_aet: str,
     pacs_aet: str,
@@ -225,7 +314,7 @@ def c_move(
     )
 
 
-def c_move_prior(
+def c_find_prior(
     calling_aet: str,
     pacs_aet: str,
     pacs_ip: str,
@@ -237,9 +326,9 @@ def c_move_prior(
     date_range: str,
     timeout: int,
 ) -> tuple[int, str]:
-    bin_path = _require(MOVESCU, "movescu")
+    bin_path = _require(FINDSCU, "findscu")
     return _run(
-        prior_movescu_cmd(
+        prior_findscu_cmd(
             bin_path,
             calling_aet,
             pacs_aet,
@@ -250,6 +339,30 @@ def c_move_prior(
             patient_id,
             birth_date,
             date_range,
+        ),
+        timeout,
+    )
+
+
+def c_move_prior_series(
+    calling_aet: str,
+    pacs_aet: str,
+    pacs_ip: str,
+    pacs_port: int,
+    study_uid: str,
+    series_uid: str,
+    timeout: int,
+) -> tuple[int, str]:
+    bin_path = _require(MOVESCU, "movescu")
+    return _run(
+        prior_series_movescu_cmd(
+            bin_path,
+            calling_aet,
+            pacs_aet,
+            pacs_ip,
+            pacs_port,
+            study_uid,
+            series_uid,
         ),
         timeout,
     )

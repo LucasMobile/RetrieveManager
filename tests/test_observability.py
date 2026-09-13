@@ -1,6 +1,8 @@
 import json
 import logging
 import unittest
+from datetime import timedelta, timezone
+from unittest.mock import patch
 
 from app.observability import JsonFormatter, log_context, log_event
 
@@ -28,6 +30,18 @@ class ObservabilityTest(unittest.TestCase):
         self.assertEqual(payload["action"], "cloud.upload")
         self.assertIn("timestamp", payload)
         self.assertIn("error_type", payload)
+
+    def test_json_log_uses_configured_timezone(self):
+        record = logging.LogRecord(
+            "worker", logging.INFO, __file__, 1, "test", (), None
+        )
+        record.created = 1789328029.174766
+        with patch(
+            "app.observability.LOG_TIMEZONE", timezone(timedelta(hours=-3))
+        ):
+            payload = json.loads(JsonFormatter().format(record))
+
+        self.assertTrue(payload["timestamp"].endswith("-03:00"))
 
     def test_reserved_log_fields_are_safely_prefixed(self):
         records = []

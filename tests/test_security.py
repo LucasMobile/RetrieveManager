@@ -16,7 +16,16 @@ from starlette.testclient import TestClient
 from app.config import BASE_DIR, DEFAULT_CLOUD_URL
 from app.main import app, get_db
 from app.middleware import _same_origin
-from app.models import AuditLog, Base, DicomRule, Order, Settings, Unit, User
+from app.models import (
+    AuditLog,
+    Base,
+    DicomRule,
+    ManualMoveRequest,
+    Order,
+    Settings,
+    Unit,
+    User,
+)
 from app.rate_limit import (
     global_rate_limiter,
     login_failure_rate_limiter,
@@ -695,6 +704,55 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(history.status_code, 200)
         self.assertIn("archived-only", history.text)
         self.assertNotIn("active-41", history.text)
+
+    def test_order_page_can_queue_manual_current_retrieve(self):
+        self.login()
+        with self.Session() as db:
+            unit = Unit(
+                name="Manual move",
+                orders_api_url="https://example.test/orders",
+                orders_api_token="token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir=str(BASE_DIR),
+                send_dir=str(BASE_DIR),
+                error_dir=str(BASE_DIR),
+                token="unit-token",
+            )
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                acc="manual-current",
+                birth_date="20000101",
+                study_uid="1.2.current",
+                modality="CT",
+                status="wait_retrieve",
+                prior_status="disabled",
+            )
+            db.add(order)
+            db.commit()
+            order_id = order.id
+
+        page = self.client.get(f"/orders/{order_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Retrieve agora", page.text)
+        self.assertIn("Atualizar", page.text)
+        token = re.search(r'name="csrf_token" value="([^"]+)"', page.text)[1]
+        response = self.client.post(
+            f"/orders/{order_id}/retrieve-now",
+            data={"csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            move_request = db.scalar(select(ManualMoveRequest))
+            self.assertIsNotNone(move_request)
+            self.assertEqual(move_request.order_id, order_id)
+            self.assertEqual(move_request.status, "queued")
 
     def test_archiving_unit_preserves_unit_and_orders(self):
         self.login()

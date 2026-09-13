@@ -242,14 +242,25 @@ Pedidos com `mirthReaded=true` são ignorados. O `PUT` de confirmação só ocor
 depois do commit no banco local; se falhar, fica pendente e é repetido sem criar
 outro pedido para o mesmo accession.
 
-Quando o retrieve de exames anteriores está ativo, o C-FIND também obtém
-`BodyPartExamined (0018,0015)`. Assim que encontra o exame atual, o worker agenda
-um C-MOVE em nível de série usando paciente, nascimento, modalidade, body part e
-o intervalo entre três anos atrás e ontem. O Patient ID é consultado com `*` no
-final e body part vazio é permitido. Esse movimento compartilha o limite de
-paralelismo da unidade e termina (ou esgota três tentativas) antes do primeiro
-retrieve do exame atual. O exame atual continua sendo recuperado pelo Study UID;
-seus tempos e eventual segundo retrieve não se aplicam aos exames anteriores.
+Quando o retrieve de exames anteriores está ativo, o C-FIND do exame atual também
+obtém `BodyPartExamined (0018,0015)`. Se esse atributo vier vazio, o worker consulta
+as séries do Study UID localizado e usa o primeiro Body Part preenchido. Em seguida,
+o worker executa outro C-FIND em
+nível de série usando paciente, nascimento, modalidade, body part e o intervalo
+entre três anos atrás e ontem. O Patient ID é consultado com `*` no final e body
+part vazio é permitido. Os Study UIDs encontrados são registrados antes da
+transferência, e cada série é recuperada por seus Study UID e Series UID exatos.
+Se a consulta não encontrar exames anteriores, o histórico termina com sucesso e
+nenhum C-MOVE é executado. O processo compartilha o limite de paralelismo da
+unidade e termina (ou esgota três tentativas) antes do primeiro retrieve do exame
+atual. O exame atual continua sendo recuperado pelo Study UID; seus tempos e
+eventual segundo retrieve não se aplicam aos exames anteriores.
+
+Na página do pedido, **Retrieve agora** cria uma solicitação persistente para um
+C-MOVE adicional apenas do Study UID do exame atual. A solicitação só fica
+disponível depois que o C-FIND encontra o estudo, respeita o limite de movimentos
+paralelos da unidade e não substitui os horários normais do primeiro e do segundo
+retrieve. O botão **Atualizar** recarrega o estado e os eventos da página.
 
 ## Regras padrão (editáveis na tela)
 

@@ -49,6 +49,7 @@ from app.models import (
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
+    ManualMoveRequest,
     ModalityRule,
     Order,
     OrderEvent,
@@ -1900,6 +1901,26 @@ def _orders_response(
     )
 
 
+def _image_status_summary(counts: dict[str, int]) -> dict[str, int]:
+    return {
+        "total": sum(counts.values()),
+        "uploaded": counts.get("uploaded", 0),
+        "compressed": counts.get("compressed", 0),
+        "errors": sum(
+            counts.get(status, 0)
+            for status in ("compression_error", "upload_error", "rule_error")
+        ),
+        "discarded": sum(
+            counts.get(status, 0)
+            for status in (
+                "discarded_modality",
+                "discarded_study",
+                "discarded_rule",
+            )
+        ),
+    }
+
+
 @app.get("/orders/{order_id}", response_class=HTMLResponse)
 def order_detail(
     order_id: int,
@@ -1916,6 +1937,21 @@ def order_detail(
     order.can_reprocess = can_reprocess(order)  # type: ignore[attr-defined]
     order.can_archive = can_archive(order)  # type: ignore[attr-defined]
     order.can_cancel = can_cancel(order)  # type: ignore[attr-defined]
+    manual_move_active = bool(
+        db.scalar(
+            select(func.count()).where(
+                ManualMoveRequest.order_id == order_id,
+                ManualMoveRequest.status.in_(("queued", "running")),
+            )
+        )
+    )
+    can_manual_move = bool(
+        order.study_uid
+        and order.archived_at is None
+        and order.status not in ACTIVE_ORDER_STATUSES
+        and order.status != "cancelled"
+        and not manual_move_active
+    )
     total = db.scalar(select(func.count()).where(OrderEvent.order_id == order_id)) or 0
     pager = paginate(total, page, EVENTS_PAGE)
     events = list(
@@ -1930,12 +1966,24 @@ def order_detail(
     transfer_stats = list(
         db.execute(
             select(ImageTransfer.status, func.count())
-            .where(ImageTransfer.order_id == order_id)
+            .where(
+                ImageTransfer.order_id == order_id,
+                ~ImageTransfer.id.in_(
+                    select(HistoricalImageLink.transfer_id)
+                    .join(
+                        HistoricalStudy,
+                        HistoricalStudy.id
+                        == HistoricalImageLink.historical_study_id,
+                    )
+                    .where(HistoricalStudy.order_id == order_id)
+                ),
+            )
             .group_by(ImageTransfer.status)
             .order_by(ImageTransfer.status)
         )
     )
     transfer_counts = dict(transfer_stats)
+    image_summary = _image_status_summary(transfer_counts)
     historical_studies = list(
         db.scalars(
             select(HistoricalStudy)
@@ -1969,8 +2017,8 @@ def order_detail(
     for study in historical_studies:
         counts = historical_counts[study.id]
         study.image_counts = counts  # type: ignore[attr-defined]
-        study.image_total = sum(counts.values())  # type: ignore[attr-defined]
-        historical_total_images += study.image_total  # type: ignore[attr-defined]
+        study.image_summary = _image_status_summary(counts)  # type: ignore[attr-defined]
+        historical_total_images += study.image_summary["total"]  # type: ignore[attr-defined]
     return templates.TemplateResponse(
         request=request,
         name="order_detail.html",
@@ -1982,8 +2030,10 @@ def order_detail(
             events=events,
             status_label=STATUSES.get(order.status, order.status),
             badge=badge_for(order.status),
-            transfer_stats=transfer_stats,
             transfer_counts=transfer_counts,
+            image_summary=image_summary,
+            can_manual_move=can_manual_move,
+            manual_move_active=manual_move_active,
             historical_studies=historical_studies,
             historical_total_images=historical_total_images,
             prior_status_label=PRIOR_STATUS_LABELS.get(
@@ -1993,6 +2043,77 @@ def order_detail(
             qs="",
         ),
     )
+
+
+@app.post("/orders/{order_id}/retrieve-now")
+def order_retrieve_now(
+    order_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    order = db.get(Order, order_id)
+    if order is None:
+        flash(request, "Pedido não encontrado.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    if order.archived_at is not None:
+        flash(request, "Pedidos arquivados são somente para consulta.", "err")
+    elif not order.study_uid:
+        flash(request, "Aguarde o C-FIND localizar o exame atual.", "err")
+    elif order.status in ACTIVE_ORDER_STATUSES:
+        flash(request, "Já existe um C-MOVE do exame atual em andamento.", "err")
+    elif order.status == "cancelled":
+        flash(request, "O pedido está cancelado.", "err")
+    elif db.scalar(
+        select(ManualMoveRequest.id).where(
+            ManualMoveRequest.order_id == order.id,
+            ManualMoveRequest.status.in_(("queued", "running")),
+        )
+    ):
+        flash(request, "O C-MOVE manual já está na fila ou em andamento.", "err")
+    else:
+        correlation_id = new_correlation_id()
+        db.add(
+            ManualMoveRequest(
+                order_id=order.id,
+                unit_id=order.unit_id,
+                requested_by_user_id=user.id,
+                requested_by_username=user.username,
+                correlation_id=correlation_id,
+                status="queued",
+            )
+        )
+        db.add(
+            OrderEvent(
+                order_id=order.id,
+                level="info",
+                message="C-MOVE manual do exame atual solicitado",
+            )
+        )
+        _audit(
+            db,
+            request,
+            user,
+            action="retry",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary="C-MOVE manual do exame atual colocado na fila.",
+        )
+        db.commit()
+        log_event(
+            log,
+            logging.INFO,
+            "order.current_move.request",
+            resource=f"order:{order.id}",
+            status="success",
+            order_id=order.id,
+            unit_id=order.unit_id,
+            user_id=user.id,
+            correlation_id=correlation_id,
+        )
+        flash(request, "C-MOVE do exame atual colocado na fila imediata.")
+    return RedirectResponse(f"/orders/{order_id}", status_code=303)
 
 
 @app.post("/orders/{order_id}/retry")

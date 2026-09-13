@@ -308,6 +308,28 @@ class OrderEvent(Base):
     order: Mapped[Order] = relationship(back_populates="events")
 
 
+class ManualMoveRequest(Base):
+    """Persistent request for an extra current-study C-MOVE."""
+
+    __tablename__ = "manual_move_requests"
+    __table_args__ = (
+        Index("ix_manual_move_unit_status_created", "unit_id", "status", "created_at"),
+        Index("ix_manual_move_order_status", "order_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
+    requested_by_user_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    requested_by_username: Mapped[str] = mapped_column(String(80), default="")
+    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+
 class HistoricalStudy(Base):
     __tablename__ = "historical_studies"
     __table_args__ = (

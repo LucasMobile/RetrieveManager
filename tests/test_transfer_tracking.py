@@ -204,6 +204,54 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertIsNotNone(link)
             self.assertEqual(link.historical_study_id, study.id)
 
+    def test_discovered_historical_study_is_linked_without_metadata_guessing(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit", retrieve_prior_enabled=True)
+            db.add(unit)
+            db.flush()
+            observed_at = datetime.now()
+            order = Order(
+                unit_id=unit.id,
+                source_id="order-id",
+                acc="current",
+                pat_id="3685917",
+                birth_date="20040116",
+                study_uid="1.2.current",
+                modality="CT",
+                prior_status="retrieving",
+                prior_date_from="20230913",
+                prior_date_to="20260912",
+                prior_started_at=observed_at - timedelta(seconds=5),
+            )
+            db.add(order)
+            db.flush()
+            study = HistoricalStudy(
+                order_id=order.id,
+                unit_id=unit.id,
+                study_uid="1.2.historical",
+                study_date="20250110",
+                modality="CT",
+            )
+            db.add(study)
+            db.commit()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "historical-file",
+                    "historical-file.dcm",
+                    "1.2.historical",
+                    "compressed",
+                    observed_at=observed_at,
+                ),
+            )
+            db.commit()
+
+            link = db.scalar(select(HistoricalImageLink))
+            self.assertIsNotNone(link)
+            self.assertEqual(link.historical_study_id, study.id)
+
     def test_applied_dicom_rule_is_audited_on_transfer(self):
         with self.Session() as db:
             unit = make_unit(

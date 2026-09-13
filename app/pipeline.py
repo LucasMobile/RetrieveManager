@@ -36,8 +36,10 @@ from app.dicom_rules import (
 from app.dicom_tools import (
     ToolMissing,
     c_find,
+    c_find_prior,
+    c_find_series_body_part,
     c_move,
-    c_move_prior,
+    c_move_prior_series,
     dcmcjpeg,
     redact_dicom_output,
 )
@@ -49,6 +51,7 @@ from app.models import (
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
+    ManualMoveRequest,
     Order,
     Unit,
 )
@@ -61,7 +64,12 @@ from app.orders_api import (
     fetch_orders,
     parse_api_order,
 )
-from app.parse import parse_findscu_output
+from app.parse import (
+    PriorSeriesResult,
+    parse_findscu_output,
+    parse_prior_findscu_output,
+    parse_series_body_part,
+)
 from app.retention import archive_order
 from app.rules import drop_codes, schedule_from_now
 
@@ -183,6 +191,27 @@ def recover_stale_locks(db: Session) -> None:
             level="warn",
         )
     if prior_rows:
+        db.commit()
+
+    manual_candidates = list(
+        db.execute(
+            select(ManualMoveRequest, Unit.move_timeout_first)
+            .join(Unit, Unit.id == ManualMoveRequest.unit_id)
+            .where(ManualMoveRequest.status == "running")
+        )
+    )
+    manual_rows = [
+        request
+        for request, timeout in manual_candidates
+        if request.started_at is None
+        or request.started_at
+        < now - timedelta(seconds=max(int(timeout), 60) + 120)
+    ]
+    for request in manual_rows:
+        request.status = "queued"
+        request.started_at = None
+        request.last_error = "lock órfão do C-MOVE manual recuperado"
+    if manual_rows:
         db.commit()
 
 
@@ -568,8 +597,25 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             return
 
         study_uid, modalities, patient_name, body_part = parse_findscu_output(output)
+        diagnostic_output = output
+        if study_uid and not body_part:
+            try:
+                series_code, series_output = c_find_series_body_part(
+                    unit.calling_aet,
+                    unit.pacs_aet,
+                    unit.pacs_ip,
+                    unit.pacs_port,
+                    study_uid,
+                )
+            except ToolMissing as exc:
+                series_code, series_output = 127, str(exc)
+            diagnostic_output = (
+                f"{output}\n\nC-FIND complementar de séries:\n{series_output}"
+            )
+            if series_code == 0:
+                body_part = parse_series_body_part(series_output)
         order.attempts += 1
-        safe_output = redact_dicom_output(output)
+        safe_output = redact_dicom_output(diagnostic_output)
         if not study_uid:
             add_event(
                 db,
@@ -664,11 +710,42 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         )
         or 0
     )
-    slots = max(1, unit.max_parallel_moves) - current_inflight - prior_inflight
+    manual_inflight = (
+        db.scalar(
+            select(func.count()).where(
+                ManualMoveRequest.unit_id == unit.id,
+                ManualMoveRequest.status == "running",
+            )
+        )
+        or 0
+    )
+    slots = (
+        max(1, unit.max_parallel_moves)
+        - current_inflight
+        - prior_inflight
+        - manual_inflight
+    )
     claimed: list[tuple[int, str]] = []
     if slots <= 0:
         return claimed
 
+    active_manual_order_ids = select(ManualMoveRequest.order_id).where(
+        ManualMoveRequest.status.in_(("queued", "running"))
+    )
+    manual = list(
+        db.scalars(
+            select(ManualMoveRequest)
+            .join(Order, Order.id == ManualMoveRequest.order_id)
+            .where(
+                ManualMoveRequest.unit_id == unit.id,
+                ManualMoveRequest.status == "queued",
+                Order.archived_at.is_(None),
+                Order.study_uid != "",
+                Order.status.notin_(ACTIVE_ORDER_STATUSES),
+            )
+            .order_by(ManualMoveRequest.created_at, ManualMoveRequest.id)
+        )
+    )
     first = list(
         db.scalars(
             select(Order)
@@ -676,6 +753,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.unit_id == unit.id,
                 Order.archived_at.is_(None),
                 Order.status == "wait_retrieve",
+                Order.id.notin_(active_manual_order_ids),
                 Order.prior_status.notin_(ACTIVE_PRIOR_STATUSES),
                 Order.retrieve_at.is_not(None),
                 Order.retrieve_at <= now,
@@ -690,6 +768,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.unit_id == unit.id,
                 Order.archived_at.is_(None),
                 Order.status == "wait_second",
+                Order.id.notin_(active_manual_order_ids),
                 Order.prior_status.notin_(ACTIVE_PRIOR_STATUSES),
                 Order.second_retrieve_at.is_not(None),
                 Order.second_retrieve_at <= now,
@@ -709,29 +788,43 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         )
     )
     candidates = (
-        [(order.retrieve_at, 1, order.id, "first", order) for order in first]
+        [
+            (request.created_at, -1, request.id, "manual", request)
+            for request in manual
+        ]
+        + [(order.retrieve_at, 1, order.id, "first", order) for order in first]
         + [(order.second_retrieve_at, 2, order.id, "second", order) for order in second]
         + [(order.prior_due_at, 0, order.id, "prior", order) for order in prior]
     )
-    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-    for _due_at, _priority, _order_id, kind, order in candidates[:slots]:
+    candidates.sort(
+        key=lambda item: (item[3] != "manual", item[0], item[1], item[2])
+    )
+    for _due_at, _priority, _resource_id, kind, resource in candidates[:slots]:
+        if kind == "manual":
+            resource.status = "running"
+            resource.started_at = now
+            claimed.append((resource.id, kind))
+            continue
         if kind == "first":
-            order.status = "retrieving"
-            order.heartbeat_at = now
+            resource.status = "retrieving"
+            resource.heartbeat_at = now
         elif kind == "second":
-            order.status = "retrieving_second"
-            order.heartbeat_at = now
+            resource.status = "retrieving_second"
+            resource.heartbeat_at = now
         else:
-            order.prior_status = "retrieving"
-            order.prior_heartbeat_at = now
-        claimed.append((order.id, kind))
+            resource.prior_status = "retrieving"
+            resource.prior_heartbeat_at = now
+        claimed.append((resource.id, kind))
     if claimed:
         db.commit()
     return claimed
 
 
-def run_claimed_move(db: Session, order_id: int, kind: str) -> None:
-    order = db.get(Order, order_id)
+def run_claimed_move(db: Session, resource_id: int, kind: str) -> None:
+    if kind == "manual":
+        _run_manual_move(db, resource_id)
+        return
+    order = db.get(Order, resource_id)
     if order is None:
         return
     unit = db.get(Unit, order.unit_id)
@@ -743,9 +836,136 @@ def run_claimed_move(db: Session, order_id: int, kind: str) -> None:
         _run_move(db, unit, order, kind == "second")
 
 
+def _run_manual_move(db: Session, request_id: int) -> None:
+    move_request = db.get(ManualMoveRequest, request_id)
+    if move_request is None:
+        return
+    order = db.get(Order, move_request.order_id)
+    unit = db.get(Unit, move_request.unit_id)
+    if order is None or unit is None or order.archived_at or not order.study_uid:
+        move_request.status = "error"
+        move_request.completed_at = datetime.now()
+        move_request.last_error = "Pedido indisponível para C-MOVE manual"
+        db.commit()
+        return
+
+    started_at = perf_counter()
+    with log_context(move_request.correlation_id):
+        log_event(
+            log,
+            logging.INFO,
+            "dicom.move.manual",
+            resource=f"order:{order.id}",
+            status="started",
+            order_id=order.id,
+            unit_id=unit.id,
+            manual_move_request_id=move_request.id,
+        )
+        try:
+            code, output = c_move(
+                unit.calling_aet,
+                unit.pacs_aet,
+                unit.pacs_ip,
+                unit.pacs_port,
+                order.study_uid,
+                unit.move_timeout_first,
+            )
+        except ToolMissing as exc:
+            code, output = 127, str(exc)
+        move_request.completed_at = datetime.now()
+        safe_output = redact_dicom_output(output)
+        if code == 0:
+            move_request.status = "done"
+            move_request.last_error = ""
+            add_event(
+                db,
+                order,
+                "C-MOVE manual do exame atual concluído",
+                safe_output,
+            )
+            event_level = logging.INFO
+            event_status = "success"
+        else:
+            move_request.status = "error"
+            move_request.last_error = f"C-MOVE manual exit {code}"
+            add_event(
+                db,
+                order,
+                f"C-MOVE manual do exame atual falhou (exit {code})",
+                safe_output,
+                "error",
+            )
+            event_level = logging.ERROR
+            event_status = "failure"
+        db.commit()
+        log_event(
+            log,
+            event_level,
+            "dicom.move.manual",
+            resource=f"order:{order.id}",
+            status=event_status,
+            started_at=started_at,
+            order_id=order.id,
+            unit_id=unit.id,
+            manual_move_request_id=move_request.id,
+            command_status=code,
+        )
+
+
+def _register_prior_studies(
+    db: Session,
+    unit: Unit,
+    order: Order,
+    series_results: tuple[PriorSeriesResult, ...],
+) -> tuple[PriorSeriesResult, ...]:
+    """Persist valid historical studies before requesting their images."""
+    valid_series = tuple(
+        result
+        for result in series_results
+        if result.study_uid != order.study_uid
+        and result.study_date
+        and order.prior_date_from <= result.study_date <= order.prior_date_to
+    )
+    studies: dict[str, PriorSeriesResult] = {}
+    for result in valid_series:
+        current = studies.get(result.study_uid)
+        if current is None or (not current.body_part and result.body_part):
+            studies[result.study_uid] = result
+
+    for study_uid, result in studies.items():
+        study = db.scalar(
+            select(HistoricalStudy).where(
+                HistoricalStudy.order_id == order.id,
+                HistoricalStudy.study_uid == study_uid,
+            )
+        )
+        if study is None:
+            db.add(
+                HistoricalStudy(
+                    order_id=order.id,
+                    unit_id=unit.id,
+                    study_uid=study_uid,
+                    accession=result.accession,
+                    study_date=result.study_date,
+                    modality=result.modality,
+                    body_part=result.body_part,
+                    description=result.description,
+                )
+            )
+            continue
+        study.accession = result.accession or study.accession
+        study.study_date = result.study_date or study.study_date
+        study.modality = result.modality or study.modality
+        study.body_part = result.body_part or study.body_part
+        study.description = result.description or study.description
+    db.flush()
+    return valid_series
+
+
 def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
     correlation_id = _ensure_order_correlation(order)
     started_at = perf_counter()
+    deadline = monotonic() + max(unit.move_timeout_prior, 1)
     now = datetime.now()
     order.prior_status = "retrieving"
     if order.prior_started_at is None:
@@ -764,8 +984,10 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
             unit_id=unit.id,
             attempt=order.prior_attempts,
         )
+        operation = "C-FIND histórico"
+        outputs: list[str] = []
         try:
-            code, output = c_move_prior(
+            code, output = c_find_prior(
                 unit.calling_aet,
                 unit.pacs_aet,
                 unit.pacs_ip,
@@ -775,29 +997,84 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
                 order.pat_id,
                 order.birth_date,
                 f"{order.prior_date_from}-{order.prior_date_to}",
-                unit.move_timeout_prior,
+                max(1, int(deadline - monotonic())),
             )
         except ToolMissing as exc:
             code, output = 127, str(exc)
-        safe_output = redact_dicom_output(output)
+        outputs.append(f"C-FIND histórico:\n{output}")
+        discovered_studies = 0
+        discovered_series = 0
+        if code == 0:
+            parsed_series = parse_prior_findscu_output(output)
+            if "(Pending)" in output and not parsed_series:
+                code = 69
+                outputs.append(
+                    "O PACS respondeu ao C-FIND sem StudyInstanceUID/SeriesInstanceUID."
+                )
+            else:
+                valid_series = _register_prior_studies(
+                    db, unit, order, parsed_series
+                )
+                discovered_series = len(valid_series)
+                discovered_studies = len(
+                    {result.study_uid for result in valid_series}
+                )
+                # Torna os UIDs visíveis na página enquanto os C-MOVEs executam.
+                db.commit()
+                operation = "C-MOVE histórico"
+                for result in valid_series:
+                    remaining = int(deadline - monotonic())
+                    if remaining <= 0:
+                        code = 124
+                        outputs.append("C-MOVE histórico: TIMEOUT global")
+                        break
+                    try:
+                        move_code, move_output = c_move_prior_series(
+                            unit.calling_aet,
+                            unit.pacs_aet,
+                            unit.pacs_ip,
+                            unit.pacs_port,
+                            result.study_uid,
+                            result.series_uid,
+                            remaining,
+                        )
+                    except ToolMissing as exc:
+                        move_code, move_output = 127, str(exc)
+                    outputs.append(
+                        "C-MOVE histórico "
+                        f"StudyUID={result.study_uid} SeriesUID={result.series_uid}:\n"
+                        f"{move_output}"
+                    )
+                    if move_code != 0 and code == 0:
+                        code = move_code
+        safe_output = redact_dicom_output("\n\n".join(outputs))
         finished_at = datetime.now()
         order.prior_heartbeat_at = finished_at
         if code == 0:
             order.prior_status = "done"
             order.prior_completed_at = finished_at
             order.prior_last_error = ""
-            add_event(db, order, "C-MOVE histórico concluído", safe_output)
+            if discovered_series:
+                message = (
+                    "Retrieve histórico concluído: "
+                    f"{discovered_studies} exame(s), {discovered_series} série(s)"
+                )
+            else:
+                message = (
+                    "Retrieve histórico concluído: nenhum exame anterior localizado"
+                )
+            add_event(db, order, message, safe_output)
             event_level = logging.INFO
             event_status = "success"
         elif order.prior_attempts < 3:
             delay = PRIOR_RETRY_DELAYS[order.prior_attempts - 1]
             order.prior_status = "retry_wait"
             order.prior_due_at = finished_at + timedelta(seconds=delay)
-            order.prior_last_error = f"C-MOVE histórico exit {code}"
+            order.prior_last_error = f"{operation} exit {code}"
             add_event(
                 db,
                 order,
-                f"C-MOVE histórico falhou (exit {code}); nova tentativa agendada",
+                f"{operation} falhou (exit {code}); nova tentativa agendada",
                 safe_output,
                 "warn",
             )
@@ -806,11 +1083,11 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
         else:
             order.prior_status = "error"
             order.prior_completed_at = finished_at
-            order.prior_last_error = f"C-MOVE histórico exit {code}"
+            order.prior_last_error = f"{operation} exit {code}"
             add_event(
                 db,
                 order,
-                f"C-MOVE histórico falhou após 3 tentativas (exit {code})",
+                f"{operation} falhou após 3 tentativas (exit {code})",
                 safe_output,
                 "error",
             )
@@ -1158,6 +1435,7 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
     else:
         transfer.order_id = order.id if order else transfer.order_id
         transfer.correlation_id = correlation_id
+        transfer.study_uid = result.study_uid or transfer.study_uid
         transfer.attempts = 0
         transfer.next_attempt_at = None
         transfer.last_http_status = None
@@ -1203,6 +1481,30 @@ def _associate_historical_transfer(
 ) -> None:
     if not result.study_uid or result.observed_at is None:
         return
+    known_studies = list(
+        db.scalars(
+            select(HistoricalStudy)
+            .join(Order, Order.id == HistoricalStudy.order_id)
+            .where(
+                HistoricalStudy.unit_id == unit.id,
+                HistoricalStudy.study_uid == result.study_uid,
+                Order.archived_at.is_(None),
+                Order.prior_status != "disabled",
+                Order.prior_started_at.is_not(None),
+                Order.prior_started_at <= result.observed_at,
+                or_(
+                    Order.prior_completed_at.is_(None),
+                    Order.prior_completed_at
+                    >= result.observed_at - timedelta(minutes=1),
+                ),
+            )
+        )
+    )
+    if known_studies:
+        for study in known_studies:
+            _link_historical_transfer(db, study, transfer, result)
+        return
+
     candidates = list(
         db.scalars(
             select(Order).where(
@@ -1252,19 +1554,33 @@ def _associate_historical_transfer(
             )
             db.add(study)
             db.flush()
-        link = db.scalar(
-            select(HistoricalImageLink).where(
-                HistoricalImageLink.historical_study_id == study.id,
-                HistoricalImageLink.transfer_id == transfer.id,
+        _link_historical_transfer(db, study, transfer, result)
+
+
+def _link_historical_transfer(
+    db: Session,
+    study: HistoricalStudy,
+    transfer: ImageTransfer,
+    result: CompactResult,
+) -> None:
+    study.accession = study.accession or result.accession
+    study.study_date = study.study_date or result.study_date
+    study.modality = study.modality or result.modality
+    study.body_part = study.body_part or result.body_part
+    study.description = study.description or result.description
+    link = db.scalar(
+        select(HistoricalImageLink).where(
+            HistoricalImageLink.historical_study_id == study.id,
+            HistoricalImageLink.transfer_id == transfer.id,
+        )
+    )
+    if link is None:
+        db.add(
+            HistoricalImageLink(
+                historical_study_id=study.id,
+                transfer_id=transfer.id,
             )
         )
-        if link is None:
-            db.add(
-                HistoricalImageLink(
-                    historical_study_id=study.id,
-                    transfer_id=transfer.id,
-                )
-            )
 
 
 def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
