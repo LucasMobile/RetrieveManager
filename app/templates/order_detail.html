@@ -25,24 +25,30 @@
       </div>
       <p class="page-header__description mono">Origem API{% if order.source_id %} · {{ order.source_id }}{% endif %}</p>
     </div>
-    <div class="page-header__actions">
-      <a class="btn btn--secondary" href="/orders/{{ order.id }}">{{ icon("retry") }} Atualizar</a>
+    <div class="page-header__actions order-detail-actions">
+      <div class="order-detail-actions__group" aria-label="Navegação e atualização">
+        <a class="action-icon order-action-icon" href="{{ '/orders/history' if order.archived_at else '/orders' }}" aria-label="Voltar" data-tooltip="Voltar" title="Voltar">{{ icon("arrow-left") }}</a>
+        <a class="action-icon order-action-icon" href="/orders/{{ order.id }}" aria-label="Atualizar informações" data-tooltip="Atualizar informações" title="Atualizar informações">{{ icon("refresh") }}</a>
+      </div>
       {% if user.role == 'admin' and not order.archived_at %}
+      <div class="order-detail-actions__group order-detail-actions__group--operations" aria-label="Ações do pedido">
       {% if order.study_uid %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/retrieve-now" data-confirm="Executar um C-MOVE adicional do exame atual agora? O agendamento normal será mantido." data-confirm-label="Executar retrieve agora">
         {{ csrf_input(request) }}
-        <button class="btn btn--primary" type="submit"{% if not can_manual_move %} disabled title="{{ 'C-MOVE manual já solicitado' if manual_move_active else 'Aguarde o C-MOVE atual terminar' }}"{% endif %}>{{ icon("play") }} Retrieve agora</button>
+        <button class="action-icon order-action-icon order-action-icon--primary{% if not can_manual_move %} is-disabled{% endif %}" type="submit" aria-label="Retrieve agora" data-tooltip="{{ 'Retrieve agora' if can_manual_move else ('C-MOVE manual já solicitado' if manual_move_active else 'Aguarde o C-MOVE atual terminar') }}" title="{{ 'Retrieve agora' if can_manual_move else ('C-MOVE manual já solicitado' if manual_move_active else 'Aguarde o C-MOVE atual terminar') }}"{% if not can_manual_move %} disabled{% endif %}>{{ icon("play") }}</button>
       </form>
       {% endif %}
       {% if order.can_reprocess and order.can_archive %}
-      {{ post_action(request, '/orders/' ~ order.id ~ '/retry', 'btn btn--primary', 'Reprocessar pedido', icon_name='retry', text='Reprocessar', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
-      {{ post_action(request, '/orders/' ~ order.id ~ '/delete', 'btn btn--danger', 'Arquivar pedido', icon_name='trash', text='Arquivar', confirm='Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados.', confirm_label='Arquivar pedido') }}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/retry', 'action-icon order-action-icon order-action-icon--primary', 'Reprocessar pedido', icon_name='retry', tooltip='Reprocessar pedido', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
       {% endif %}
       {% if order.can_cancel %}
-      {{ post_action(request, '/orders/' ~ order.id ~ '/cancel', 'btn btn--secondary', 'Cancelar pedido', text='Cancelar', confirm='Cancelar este pedido? O processamento atual será interrompido.', confirm_label='Cancelar pedido') }}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/cancel', 'action-icon order-action-icon', 'Cancelar pedido', icon_name='x-circle', tooltip='Cancelar pedido', confirm='Cancelar este pedido? O processamento atual será interrompido.', confirm_label='Cancelar pedido') }}
       {% endif %}
+      {% if order.can_reprocess and order.can_archive %}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/delete', 'action-icon action-icon--danger order-action-icon', 'Arquivar pedido', icon_name='trash', tooltip='Arquivar pedido', confirm='Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados.', confirm_label='Arquivar pedido') }}
       {% endif %}
-      <a class="btn btn--secondary" href="{{ '/orders/history' if order.archived_at else '/orders' }}">{{ icon("arrow-left") }} Voltar</a>
+      </div>
+      {% endif %}
     </div>
   </header>
 
@@ -122,31 +128,49 @@
   <section class="surface order-panel order-history-panel" aria-labelledby="prior-title">
     <header class="order-panel__header">
       <div><h2 id="prior-title">Exames anteriores</h2><p>Histórico de três anos solicitado ao PACS.</p></div>
-      <span class="chip">{{ prior_status_label }}</span>
+      <div class="order-panel__header-actions">
+        <span class="chip">{{ prior_status_label }}</span>
+        {% if user.role == 'admin' and not order.archived_at and order.prior_status in ('done', 'error') %}
+        <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry-prior" data-confirm="Executar novamente o retrieve de exames anteriores?" data-confirm-label="Reprocessar histórico">
+          {{ csrf_input(request) }}
+          <button class="action-icon order-action-icon" type="submit" aria-label="Reprocessar histórico" data-tooltip="Reprocessar histórico" title="Reprocessar histórico">{{ icon("retry") }}</button>
+        </form>
+        {% endif %}
+      </div>
     </header>
     {% if order.prior_status == 'disabled' %}
     <p class="muted small order-history-panel__empty">O retrieve histórico estava desativado para esta unidade.</p>
     {% else %}
-    <dl class="order-data-list order-history-summary">
-      <div><dt>Período</dt><dd class="mono">{{ order.prior_date_from }}–{{ order.prior_date_to }}</dd></div>
-      <div><dt>Filtro</dt><dd>{{ order.modality or '—' }} · {{ order.body_part or 'Body Part vazio' }}</dd></div>
-      <div><dt>Paciente</dt><dd class="mono">{{ order.pat_id }}*</dd></div>
-      <div><dt>Tentativas</dt><dd>{{ order.prior_attempts }}</dd></div>
-      <div><dt>Exames encontrados</dt><dd>{{ historical_studies|length }}</dd></div>
-      <div><dt>Imagens associadas</dt><dd>{{ historical_total_images }}</dd></div>
-    </dl>
+    <div class="order-history-summary" aria-label="Resumo do histórico">
+      <div class="history-metric">
+        <span class="history-metric__icon">{{ icon("clock") }}</span>
+        <div class="history-metric__content"><span class="history-metric__label">Período consultado</span><strong class="history-metric__value mono">{{ order.prior_date_from }}–{{ order.prior_date_to }}</strong><span class="history-metric__hint">Janela histórica configurada</span></div>
+      </div>
+      <div class="history-metric">
+        <span class="history-metric__icon">{{ icon("search") }}</span>
+        <div class="history-metric__content"><span class="history-metric__label">Filtro aplicado</span><strong class="history-metric__value"><span class="modality-mark">{{ order.modality or '—' }}</span><span>{{ order.body_part or 'Body Part vazio' }}</span></strong><span class="history-metric__hint">Modalidade e região anatômica</span></div>
+      </div>
+      <div class="history-metric">
+        <span class="history-metric__icon">{{ icon("users") }}</span>
+        <div class="history-metric__content"><span class="history-metric__label">Paciente</span><strong class="history-metric__value mono">{{ order.pat_id }}*</strong><span class="history-metric__hint">Busca por identificador parcial</span></div>
+      </div>
+      <div class="history-metric">
+        <span class="history-metric__icon">{{ icon("retry") }}</span>
+        <div class="history-metric__content"><span class="history-metric__label">Tentativas</span><strong class="history-metric__value history-metric__number">{{ order.prior_attempts }}</strong><span class="history-metric__hint">Consultas executadas no PACS</span></div>
+      </div>
+      <div class="history-metric">
+        <span class="history-metric__icon">{{ icon("file") }}</span>
+        <div class="history-metric__content"><span class="history-metric__label">Exames encontrados</span><strong class="history-metric__value history-metric__number">{{ historical_studies|length }}</strong><span class="history-metric__hint">Studies anteriores localizados</span></div>
+      </div>
+      <div class="history-metric">
+        <span class="history-metric__icon">{{ icon("image") }}</span>
+        <div class="history-metric__content"><span class="history-metric__label">Imagens associadas</span><strong class="history-metric__value history-metric__number">{{ historical_total_images }}</strong><span class="history-metric__hint">Arquivos vinculados ao histórico</span></div>
+      </div>
+    </div>
     {% if order.prior_status == 'done' and not historical_studies %}
     <p class="muted small order-history-panel__empty">Nenhum exame anterior foi localizado para o paciente dentro do período e dos filtros configurados.</p>
     {% endif %}
     {% if order.prior_last_error %}<div class="order-error"><strong>Último erro do histórico</strong><span>{{ order.prior_last_error }}</span></div>{% endif %}
-    {% if user.role == 'admin' and not order.archived_at and order.prior_status in ('done', 'error') %}
-    <div class="order-history-panel__actions">
-      <form method="post" action="/orders/{{ order.id }}/retry-prior" data-confirm="Executar novamente o retrieve de exames anteriores?" data-confirm-label="Reprocessar histórico">
-        {{ csrf_input(request) }}
-        <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar histórico</button>
-      </form>
-    </div>
-    {% endif %}
     {% if historical_studies %}
     <div class="table-wrap order-history-table">
       <table class="data-table">
