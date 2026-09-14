@@ -24,6 +24,8 @@ from app.models import (
     Order,
     Settings,
     Unit,
+    UnitCompressRule,
+    UnitDropModality,
     User,
 )
 from app.rate_limit import (
@@ -321,6 +323,71 @@ class SecurityTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_cloud_url(DEFAULT_CLOUD_URL + "x" * 500)
 
+    def test_compression_settings_are_saved_per_unit(self):
+        self.login()
+        token = self.token("/units/new")
+        data = self.unit_form_data(
+            csrf_token=token,
+            compress_lossless="MR",
+            compress_lossy_8="CT",
+            compress_lossy_12="US",
+            drop_modalities="US,SR",
+        )
+        response = self.client.post(
+            "/units/new", data=data, follow_redirects=False
+        )
+        self.assertEqual(response.status_code, 303)
+
+        with self.Session() as db:
+            unit = db.scalar(select(Unit))
+            rules = {
+                row.modality: row.jpeg_flag
+                for row in db.scalars(
+                    select(UnitCompressRule).where(
+                        UnitCompressRule.unit_id == unit.id
+                    )
+                )
+            }
+            drops = {
+                row.code
+                for row in db.scalars(
+                    select(UnitDropModality).where(
+                        UnitDropModality.unit_id == unit.id
+                    )
+                )
+            }
+            self.assertEqual(rules, {"CT": "+eb", "MR": "+e1"})
+            self.assertEqual(drops, {"SR", "US"})
+            unit_id = unit.id
+
+        edit_page = self.client.get(f"/units/{unit_id}")
+        self.assertEqual(edit_page.status_code, 200)
+        self.assertIn('name="compress_lossy_8" value="CT"', edit_page.text)
+        self.assertNotIn("/rules/compress", edit_page.text)
+
+        token = self.token(f"/units/{unit_id}")
+        invalid = self.unit_form_data(
+            csrf_token=token,
+            orders_api_token="",
+            token="",
+            compress_lossless="CT",
+            compress_lossy_8="CT",
+        )
+        response = self.client.post(
+            f"/units/{unit_id}", data=invalid, follow_redirects=False
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            rules = {
+                row.modality: row.jpeg_flag
+                for row in db.scalars(
+                    select(UnitCompressRule).where(
+                        UnitCompressRule.unit_id == unit_id
+                    )
+                )
+            }
+            self.assertEqual(rules, {"CT": "+eb", "MR": "+e1"})
+
     def test_dicom_rule_page_create_and_static_rule_routes(self):
         self.login()
         with self.Session() as db:
@@ -478,10 +545,50 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(logs.status_code, 200)
         self.assertIn("Unidade de teste", logs.text)
         self.assertIn("Unidade adicionada ao sistema.", logs.text)
+        self.assertIn('<option value="30" selected>', logs.text)
+        self.assertEqual(
+            self.client.get("/logs", params={"page_size": 10}).status_code,
+            200,
+        )
         self.assertEqual(
             self.client.get("/logs", params={"resource": "invalid"}).status_code,
             422,
         )
+        self.assertEqual(
+            self.client.get("/logs", params={"page_size": 25}).status_code,
+            422,
+        )
+
+    def test_audit_logs_use_cursor_backed_pages(self):
+        self.login()
+        with self.Session() as db:
+            db.add_all(
+                AuditLog(
+                    actor_username="tester",
+                    actor_role="admin",
+                    action="create",
+                    resource_type="unit",
+                    resource_id=str(index),
+                    resource_name=f"Log {index:02d}",
+                    summary="Evento de teste",
+                )
+                for index in range(42)
+            )
+            db.commit()
+
+        first = self.client.get("/logs")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.text.count('class="log-date"'), 30)
+        cursor = re.search(r"before=(\d+)&amp;page=2", first.text)[1]
+
+        second = self.client.get("/logs", params={"before": cursor, "page": 2})
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.text.count('class="log-date"'), 12)
+        self.assertIn("Página 2 de 2", second.text)
+
+        ten_per_page = self.client.get("/logs", params={"page_size": 10})
+        self.assertEqual(ten_per_page.text.count('class="log-date"'), 10)
+        self.assertRegex(ten_per_page.text, r"before=\d+&amp;page=3")
 
     def test_admin_can_create_update_and_delete_users_with_self_protection(self):
         self.login()
@@ -654,7 +761,9 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn("<img src=x", response.text)
         self.assertIn("&lt;img", response.text)
 
-    def test_orders_use_cursor_and_archived_orders_have_separate_history(self):
+    def test_orders_use_cursor_backed_pages_and_separate_archived_history(
+        self,
+    ):
         self.login()
         with self.Session() as db:
             unit = Unit(
@@ -694,11 +803,21 @@ class SecurityTest(unittest.TestCase):
 
         first = self.client.get("/orders")
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(first.text.count('class="order-date"'), 40)
+        self.assertEqual(first.text.count('class="order-date"'), 30)
         self.assertNotIn("archived-only", first.text)
-        cursor = re.search(r"before=(\d+)", first.text)[1]
-        second = self.client.get("/orders", params={"before": cursor})
-        self.assertEqual(second.text.count('class="order-date"'), 2)
+        self.assertIn('aria-label="Primeira página"', first.text)
+        self.assertIn('aria-label="Última página"', first.text)
+        self.assertIn("Página 1 de 2", first.text)
+
+        cursor = re.search(r"before=(\d+)&amp;page=2", first.text)[1]
+        second = self.client.get("/orders", params={"before": cursor, "page": 2})
+        self.assertEqual(second.text.count('class="order-date"'), 12)
+        self.assertIn("Página 2 de 2", second.text)
+
+        ten_per_page = self.client.get("/orders", params={"page_size": 10})
+        self.assertEqual(ten_per_page.text.count('class="order-date"'), 10)
+        self.assertIn('<option value="10" selected>', ten_per_page.text)
+        self.assertRegex(ten_per_page.text, r"before=\d+&amp;page=3")
 
         history = self.client.get("/orders/history")
         self.assertEqual(history.status_code, 200)

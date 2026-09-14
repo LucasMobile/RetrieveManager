@@ -33,8 +33,9 @@
         <a href="#orders-api-title"><span>03</span><strong>Pedidos PLERES</strong></a>
         <a href="#prior-title"><span>04</span><strong>Exames anteriores</strong></a>
         <a href="#storage-title"><span>05</span><strong>Store e pastas</strong></a>
-        <a href="#cloud-title"><span>06</span><strong>Envio para a nuvem</strong></a>
-        <a href="#limits-title"><span>07</span><strong>Processamento</strong></a>
+        <a href="#compression-title"><span>06</span><strong>Compactação</strong></a>
+        <a href="#cloud-title"><span>07</span><strong>Envio para a nuvem</strong></a>
+        <a href="#limits-title"><span>08</span><strong>Processamento</strong></a>
       </nav>
       <div class="unit-form-nav__note">
         <strong>Antes de salvar</strong>
@@ -173,11 +174,6 @@
                 <span class="field__hint">Use uma porta publicada pelo container e liberada no host.</span>
               </div>
               <div class="field">
-                <label for="unit-token">Token da unidade</label>
-                <input id="unit-token" name="token" type="password" maxlength="64" value=""{% if unit and unit.token %} placeholder="••••••••••••"{% endif %} autocomplete="off" {% if not unit %}required{% endif %}>
-                <span class="field__hint">Tag DICOM 0008,1040.</span>
-              </div>
-              <div class="field">
                 <label for="receive-dir">Recebimento DICOM</label>
                 <input id="receive-dir" class="mono" name="receive_dir" value="{{ unit.receive_dir if unit else '' }}" spellcheck="false" required>
               </div>
@@ -194,9 +190,101 @@
           </div>
         </section>
 
-        <section class="form-section" aria-labelledby="cloud-title">
+        <section class="form-section" aria-labelledby="compression-title" data-unit-compression>
           <div class="form-section__header">
             <span class="form-section__number">06</span>
+            <div><h2 id="compression-title">Compactação</h2><p>Token, perfil JPEG e descarte configurados exclusivamente para esta unidade.</p></div>
+          </div>
+          <div class="form-section__body">
+            <div class="form-grid form-grid--2">
+              <div class="field field--full">
+                <label for="unit-token">Token da unidade</label>
+                <input id="unit-token" name="token" type="password" maxlength="64" value=""{% if unit and unit.token %} placeholder="••••••••••••"{% endif %} autocomplete="off" {% if not unit %}required{% endif %}>
+                <span class="field__hint">Gravado na tag DICOM 0008,1040 antes da compactação.</span>
+              </div>
+
+              <div class="field field--full">
+                <span class="field-label">Tipos de compactação</span>
+                <p class="compression-field-description">Selecione as modalidades de cada perfil. Uma modalidade só pode pertencer a um perfil por vez.</p>
+                <div class="unit-compression-profiles">
+                  {% for profile, label, description in [
+                    ('lossless', 'JPEG Lossless', 'Sem perda de qualidade'),
+                    ('lossy_8', 'JPEG Lossy 8 Bits', 'Compressão com perda em 8 bits'),
+                    ('lossy_12', 'JPEG Lossy 12 Bits', 'Compressão com perda em 12 bits')
+                  ] %}
+                  <article class="unit-compression-profile" data-profile-card="{{ profile }}">
+                    <input type="hidden" name="compress_{{ profile }}" value="{{ compression_settings.profiles[profile] | sort | join(',') }}" data-profile-input="{{ profile }}">
+                    <div class="unit-compression-profile__header">
+                      <span class="unit-compression-profile__icon">{{ icon('compress') }}</span>
+                      <div><strong>{{ label }}</strong><small>{{ description }}</small></div>
+                    </div>
+                    <div class="unit-compression-profile__selection" data-profile-chips="{{ profile }}"></div>
+                    <button class="btn btn--secondary unit-compression-profile__button" type="button" data-compression-open="{{ profile }}">
+                      Selecionar modalidades
+                      <span class="unit-compression-profile__count" data-profile-count="{{ profile }}">{{ compression_settings.profiles[profile] | length }}</span>
+                    </button>
+                  </article>
+                  {% endfor %}
+                </div>
+                <span class="field__hint">Modalidades não selecionadas utilizam JPEG Lossless automaticamente.</span>
+              </div>
+
+              <div class="field field--full">
+                <label for="drop-modality-input">Descarte no recebimento</label>
+                <p class="compression-field-description">Arquivos destas modalidades serão removidos antes das regras e da compactação.</p>
+                <input type="hidden" name="drop_modalities" value="{{ compression_settings.drops | sort | join(',') }}" data-drop-value>
+                <div class="modality-chip-input" data-drop-chip-input>
+                  <div class="modality-chip-input__chips" data-drop-chips></div>
+                  <input id="drop-modality-input" type="text" maxlength="8" placeholder="Digite a modalidade e pressione Enter" aria-describedby="drop-modality-hint" data-drop-input autocomplete="off" spellcheck="false">
+                </div>
+                <span class="field__hint" id="drop-modality-hint">Enter ou vírgula adiciona uma modalidade. Ao descartar, ela sai automaticamente dos perfis de compactação.</span>
+              </div>
+            </div>
+            <div class="settings-note">
+              {{ icon("info") }}
+              <span>As alterações serão aplicadas somente aos próximos arquivos recebidos por esta unidade.</span>
+            </div>
+          </div>
+
+          {% for profile, label in [
+            ('lossless', 'JPEG Lossless'),
+            ('lossy_8', 'JPEG Lossy 8 Bits'),
+            ('lossy_12', 'JPEG Lossy 12 Bits')
+          ] %}
+          <dialog class="compression-dialog" data-compression-dialog="{{ profile }}" aria-labelledby="compression-dialog-title-{{ profile }}">
+            <header class="compression-dialog__header">
+              <div>
+                <p class="eyebrow">Perfil de compactação</p>
+                <h3 id="compression-dialog-title-{{ profile }}">{{ label }}</h3>
+                <p>Selecione as modalidades que utilizarão este perfil.</p>
+              </div>
+              <button class="action-icon" type="button" data-compression-close aria-label="Fechar janela">{{ icon('close') }}</button>
+            </header>
+            <div class="compression-dialog__body">
+              <label class="compression-modality-option compression-modality-option--all">
+                <input type="checkbox" data-profile-select-all="{{ profile }}">
+                <span>Selecionar todas</span>
+              </label>
+              <div class="compression-modality-grid">
+                {% for modality in compression_modalities %}
+                <label class="compression-modality-option">
+                  <input type="checkbox" value="{{ modality }}" data-profile-option="{{ profile }}" {% if modality in compression_settings.profiles[profile] %}checked{% endif %}>
+                  <span>{{ modality }}</span>
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+            <footer class="compression-dialog__footer">
+              <span><strong data-dialog-count="{{ profile }}">{{ compression_settings.profiles[profile] | length }}</strong> selecionada(s)</span>
+              <button class="btn btn--primary" type="button" data-compression-close>{{ icon('check') }} Concluir</button>
+            </footer>
+          </dialog>
+          {% endfor %}
+        </section>
+
+        <section class="form-section" aria-labelledby="cloud-title">
+          <div class="form-section__header">
+            <span class="form-section__number">07</span>
             <div><h2 id="cloud-title">Envio para a nuvem</h2><p>Destino e intervalo de segurança usados exclusivamente por esta unidade.</p></div>
           </div>
           <div class="form-section__body">
@@ -222,7 +310,7 @@
 
         <section class="form-section" aria-labelledby="limits-title">
           <div class="form-section__header">
-            <span class="form-section__number">07</span>
+            <span class="form-section__number">08</span>
             <div><h2 id="limits-title">Limites de processamento</h2><p>Timeouts, paralelismo e frequência de busca desta unidade.</p></div>
           </div>
           <div class="form-section__body">

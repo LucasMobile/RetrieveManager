@@ -106,6 +106,13 @@ def new_correlation_id() -> str:
     return str(uuid4())
 
 
+def safe_error_detail(error: BaseException, limit: int = 500) -> str:
+    """Return a compact driver/root-cause message without SQL or multiline noise."""
+    original = getattr(error, "orig", None)
+    detail = str(original or error or type(error).__name__).replace("\x00", " ")
+    return " ".join(detail.splitlines())[:limit]
+
+
 @contextmanager
 def log_context(correlation_id: str, *, user_id: int | None = None) -> Iterator[None]:
     correlation_token = correlation_id_var.set(correlation_id)

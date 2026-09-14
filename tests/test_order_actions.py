@@ -183,6 +183,17 @@ class OrderActionsTest(DatabaseTestCase):
                     last_find_at=now - timedelta(days=1),
                     created_at=now - timedelta(days=2),
                 ),
+                Order(
+                    unit_id=unit.id,
+                    acc="technical-retry",
+                    birth_date="20000101",
+                    status="watching",
+                    study_uid="",
+                    attempts=0,
+                    last_find_at=now - timedelta(days=1),
+                    last_error="C-FIND falhou (exit 124)",
+                    created_at=now - timedelta(days=2),
+                ),
             ]
             db.add_all([eligible, *protected])
             db.flush()
@@ -210,7 +221,13 @@ class OrderActionsTest(DatabaseTestCase):
                         select(Order).where(Order.archived_at.is_(None))
                     )
                 },
-                {"recent", "never-searched", "found", "technical-error"},
+                {
+                    "recent",
+                    "never-searched",
+                    "found",
+                    "technical-error",
+                    "technical-retry",
+                },
             )
             self.assertEqual(db.get(ImageTransfer, transfer_id).order_id, eligible_id)
             self.assertEqual(

@@ -23,6 +23,13 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.compression import (
+    compression_form_for_unit,
+    compression_modalities_for_form,
+    legacy_unit_compression_form,
+    save_unit_compression_settings,
+    validate_unit_compression_form,
+)
 from app.config import BASE_DIR, DEFAULT_CLOUD_URL, SECRET_KEY, SESSION_HTTPS_ONLY
 from app.db import get_db, init_db
 from app.dicom_rules import (
@@ -47,6 +54,7 @@ from app.models import (
     DicomRuleUnit,
     DropModality,
     HistoricalImageLink,
+    HistoricalSeries,
     HistoricalStudy,
     ImageTransfer,
     ManualMoveRequest,
@@ -65,7 +73,7 @@ from app.order_state import (
     can_cancel,
     can_reprocess,
 )
-from app.pager import paginate, query_keep
+from app.pager import cursor_page_links, paginate, query_keep
 from app.pipeline import folder_counts
 from app.rate_limit import (
     apply_rate_limit_headers,
@@ -87,11 +95,11 @@ from app.validation import (
     validate_unit_form,
 )
 
-ORDERS_PAGE = 40
 EVENTS_PAGE = 10
-AUDIT_LOGS_PAGE = 50
 UNITS_PAGE = 20
 DASH_PAGE = 8
+PAGE_SIZE_OPTIONS = (10, 20, 30, 40, 50)
+DEFAULT_PAGE_SIZE = 30
 USER_ROLES = frozenset({"admin", "user"})
 PRIOR_STATUS_LABELS = {
     "disabled": "Desativado",
@@ -100,6 +108,7 @@ PRIOR_STATUS_LABELS = {
     "retry_wait": "Aguardando nova tentativa",
     "done": "Concluído",
     "error": "Erro",
+    "cancelled": "Cancelado",
 }
 AUDIT_ACTION_LABELS = {
     "create": "Adição",
@@ -691,11 +700,20 @@ def units_list(
 def units_new(
     request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
+    compression_settings = legacy_unit_compression_form(db)
     return templates.TemplateResponse(
         request=request,
         name="units_form.html",
         context=ctx(
-            request, db, "units", unit=None, default_cloud_url=DEFAULT_CLOUD_URL
+            request,
+            db,
+            "units",
+            unit=None,
+            default_cloud_url=DEFAULT_CLOUD_URL,
+            compression_settings=compression_settings,
+            compression_modalities=compression_modalities_for_form(
+                compression_settings
+            ),
         ),
     )
 
@@ -754,6 +772,7 @@ async def units_create(
     raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
     try:
         form = validate_unit_form(raw_form, creating=True)
+        compression_settings = validate_unit_compression_form(raw_form)
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/units/new", status_code=303)
@@ -764,6 +783,7 @@ async def units_create(
     db.add(unit)
     try:
         db.flush()
+        save_unit_compression_settings(db, unit, compression_settings)
         migrate_legacy_study_rule(db)
         _audit(
             db,
@@ -865,11 +885,20 @@ def units_edit(
     unit = db.get(Unit, unit_id)
     if unit is None or unit.deleted_at is not None:
         return RedirectResponse("/units", status_code=303)
+    compression_settings = compression_form_for_unit(db, unit.id)
     return templates.TemplateResponse(
         request=request,
         name="units_form.html",
         context=ctx(
-            request, db, "units", unit=unit, default_cloud_url=DEFAULT_CLOUD_URL
+            request,
+            db,
+            "units",
+            unit=unit,
+            default_cloud_url=DEFAULT_CLOUD_URL,
+            compression_settings=compression_settings,
+            compression_modalities=compression_modalities_for_form(
+                compression_settings
+            ),
         ),
     )
 
@@ -887,6 +916,7 @@ async def units_update(
     raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
     try:
         form = validate_unit_form(raw_form)
+        compression_settings = validate_unit_compression_form(raw_form)
     except ValueError as exc:
         flash(request, str(exc), "err")
         return RedirectResponse(f"/units/{unit_id}", status_code=303)
@@ -895,6 +925,7 @@ async def units_update(
         return RedirectResponse(f"/units/{unit_id}", status_code=303)
     _unit_from_form(form, unit)
     try:
+        save_unit_compression_settings(db, unit, compression_settings)
         _audit(
             db,
             request,
@@ -1482,30 +1513,9 @@ def rules_retrieve_delete(
     return RedirectResponse("/rules/retrieve", status_code=303)
 
 
-@app.get("/rules/compress", response_class=HTMLResponse)
-def rules_compress(
-    request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
-):
-    compress = list(db.scalars(select(CompressRule).order_by(CompressRule.modality)))
-    drops = list(db.scalars(select(DropModality).order_by(DropModality.code)))
-    default_rule = next((rule for rule in compress if rule.modality == "*"), None)
-    compression_summary = {
-        "profiles": len(compress),
-        "default_flag": default_rule.jpeg_flag if default_rule else "—",
-        "drops": len(drops),
-    }
-    return templates.TemplateResponse(
-        request=request,
-        name="rules_compress.html",
-        context=ctx(
-            request,
-            db,
-            "compress",
-            compress=compress,
-            drops=drops,
-            compression_summary=compression_summary,
-        ),
-    )
+@app.get("/rules/compress")
+def rules_compress(user: User = Depends(require_admin)):
+    return RedirectResponse("/units", status_code=303)
 
 
 @app.post("/rules/compress")
@@ -1718,7 +1728,9 @@ def orders_list(
     q: str = Query("", max_length=200),
     before: int | None = Query(None, ge=1),
     after: int | None = Query(None, ge=1),
-    page: int | None = Query(None, ge=1),
+    last: bool = False,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
@@ -1730,6 +1742,9 @@ def orders_list(
         q=q,
         before=before,
         after=after,
+        last=last,
+        page=page,
+        page_size=page_size,
         history=False,
     )
 
@@ -1742,7 +1757,9 @@ def orders_history(
     q: str = Query("", max_length=200),
     before: int | None = Query(None, ge=1),
     after: int | None = Query(None, ge=1),
-    page: int | None = Query(None, ge=1),
+    last: bool = False,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -1754,6 +1771,9 @@ def orders_history(
         q=q,
         before=before,
         after=after,
+        last=last,
+        page=page,
+        page_size=page_size,
         history=True,
     )
 
@@ -1767,11 +1787,16 @@ def _orders_response(
     q: str,
     before: int | None,
     after: int | None,
+    last: bool,
+    page: int,
+    page_size: int,
     history: bool,
 ):
     if status and status not in STATUSES:
         raise StarletteHTTPException(422, "Status inválido")
-    if before and after:
+    if page_size not in PAGE_SIZE_OPTIONS:
+        raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
+    if sum((before is not None, after is not None, last)) > 1:
         raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
     archived_filter = (
         Order.archived_at.is_not(None) if history else Order.archived_at.is_(None)
@@ -1834,16 +1859,26 @@ def _orders_response(
         "running": int(order_status_counts[1] or 0),
         "done": int(order_status_counts[2] or 0),
     }
+    pages = max(1, (total + page_size - 1) // page_size)
+    if last:
+        page = pages
+    elif before is None and after is None:
+        page = 1
+    pager = paginate(total, page, page_size)
+    pager["size_options"] = PAGE_SIZE_OPTIONS
+    pager["keep"] = {"unit_id": unit_id, "status": status, "q": q}
     stmt = filt.options(selectinload(Order.unit))
-    if before:
+    if last:
+        stmt = stmt.order_by(Order.id.asc())
+    elif before is not None:
         stmt = stmt.where(Order.id < before).order_by(Order.id.desc())
-    elif after:
+    elif after is not None:
         stmt = stmt.where(Order.id > after).order_by(Order.id.asc())
     else:
         stmt = stmt.order_by(Order.id.desc())
-    stmt = stmt.limit(ORDERS_PAGE)
+    stmt = stmt.limit(pager["size"])
     rows = list(db.scalars(stmt))
-    if after:
+    if after is not None or last:
         rows.reverse()
     for o in rows:
         o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
@@ -1868,17 +1903,48 @@ def _orders_response(
             )
             is not None
         )
-    pager = {
-        "cursor": True,
-        "total": total,
-        "count": len(rows),
-        "has_prev": has_prev,
-        "has_next": has_next,
-        "prev_cursor": rows[0].id if rows else None,
-        "next_cursor": rows[-1].id if rows else None,
-    }
+    pager.update(
+        cursor=True,
+        has_prev=has_prev,
+        has_next=has_next,
+        prev_cursor=rows[0].id if rows else None,
+        next_cursor=rows[-1].id if rows else None,
+    )
+
+    page_three_cursor: int | None = None
+    page_before_last_cursor: int | None = None
+    if rows and pager["page"] == 1 and pager["pages"] > 2:
+        page_two_ids = list(
+            db.scalars(
+                filt.where(Order.id < rows[-1].id)
+                .with_only_columns(Order.id)
+                .order_by(Order.id.desc())
+                .limit(page_size)
+            )
+        )
+        if page_two_ids:
+            page_three_cursor = page_two_ids[-1]
+    elif rows and pager["page"] == pager["pages"] and pager["pages"] > 2:
+        page_before_last_ids = list(
+            db.scalars(
+                filt.where(Order.id > rows[0].id)
+                .with_only_columns(Order.id)
+                .order_by(Order.id.asc())
+                .limit(page_size)
+            )
+        )
+        if page_before_last_ids:
+            page_before_last_cursor = page_before_last_ids[-1]
+
+    pager["page_links"] = cursor_page_links(
+        pager,
+        prev_cursor=pager["prev_cursor"],
+        next_cursor=pager["next_cursor"],
+        page_three_cursor=page_three_cursor,
+        page_before_last_cursor=page_before_last_cursor,
+    )
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
-    qs = query_keep(unit_id=unit_id, status=status, q=q)
+    qs = query_keep(unit_id=unit_id, status=status, q=q, page_size=page_size)
     return templates.TemplateResponse(
         request=request,
         name="orders.html",
@@ -2180,6 +2246,9 @@ def order_retry_prior(
     else:
         for study in list(order.historical_studies):
             db.delete(study)
+        db.execute(
+            delete(HistoricalSeries).where(HistoricalSeries.order_id == order.id)
+        )
         order.prior_status = "queued"
         order.prior_due_at = datetime.now()
         order.prior_started_at = None
@@ -2225,6 +2294,17 @@ def _reset_order_for_reprocess(db: Session, order: Order) -> None:
     order.done_at = None
     order.heartbeat_at = None
     order.last_error = ""
+    if order.prior_status == "cancelled":
+        if order.unit.retrieve_prior_enabled:
+            order.prior_status = "queued"
+            order.prior_due_at = datetime.now()
+            order.prior_started_at = None
+            order.prior_completed_at = None
+            order.prior_heartbeat_at = None
+            order.prior_attempts = 0
+            order.prior_last_error = ""
+        else:
+            order.prior_status = "disabled"
     if order.study_uid:
         order.status = "wait_retrieve"
         order.retrieve_at = datetime.now()
@@ -2252,7 +2332,32 @@ def order_cancel(
     user: User = Depends(require_admin),
 ):
     order = db.get(Order, order_id)
-    if order and can_cancel(order):
+    running_manual = bool(
+        order
+        and db.scalar(
+            select(ManualMoveRequest.id).where(
+                ManualMoveRequest.order_id == order.id,
+                ManualMoveRequest.status == "running",
+            )
+        )
+    )
+    if order and can_cancel(order) and not running_manual:
+        queued_manual = list(
+            db.scalars(
+                select(ManualMoveRequest).where(
+                    ManualMoveRequest.order_id == order.id,
+                    ManualMoveRequest.status == "queued",
+                )
+            )
+        )
+        for move_request in queued_manual:
+            move_request.status = "cancelled"
+            move_request.completed_at = datetime.now()
+            move_request.last_error = "Cancelado junto com o pedido"
+        if order.prior_status in {"queued", "retry_wait"}:
+            order.prior_status = "cancelled"
+            order.prior_completed_at = datetime.now()
+            order.prior_last_error = "Cancelado junto com o pedido"
         order.status = "cancelled"
         _audit(
             db,
@@ -2266,6 +2371,12 @@ def order_cancel(
         )
         db.commit()
         flash(request, "Pedido cancelado.")
+    elif order:
+        flash(
+            request,
+            "Aguarde o retrieve atual terminar antes de cancelar.",
+            "err",
+        )
     return RedirectResponse(
         request.headers.get("referer") or "/orders", status_code=303
     )
@@ -2370,7 +2481,11 @@ def audit_logs(
     action: str = Query("", max_length=32),
     resource: str = Query("", max_length=32),
     q: str = Query("", max_length=120),
-    page: int = 1,
+    before: int | None = Query(None, ge=1),
+    after: int | None = Query(None, ge=1),
+    last: bool = False,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -2378,6 +2493,10 @@ def audit_logs(
         raise StarletteHTTPException(422, "Ação de auditoria inválida")
     if resource and resource not in AUDIT_RESOURCE_LABELS:
         raise StarletteHTTPException(422, "Tipo de recurso inválido")
+    if page_size not in PAGE_SIZE_OPTIONS:
+        raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
+    if sum((before is not None, after is not None, last)) > 1:
+        raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
 
     filtered = select(AuditLog)
     if action:
@@ -2397,13 +2516,85 @@ def audit_logs(
         )
 
     count_query = select(func.count()).select_from(filtered.subquery())
-    pager = paginate(int(db.scalar(count_query) or 0), page, AUDIT_LOGS_PAGE)
-    entries = list(
-        db.scalars(
-            filtered.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-            .offset(pager["offset"])
-            .limit(pager["size"])
+    total = int(db.scalar(count_query) or 0)
+    pages = max(1, (total + page_size - 1) // page_size)
+    if last:
+        page = pages
+    elif before is None and after is None:
+        page = 1
+    pager = paginate(total, page, page_size)
+    pager["size_options"] = PAGE_SIZE_OPTIONS
+    pager["keep"] = {"action": action, "resource": resource, "q": search}
+    stmt = filtered
+    if last:
+        stmt = stmt.order_by(AuditLog.id.asc())
+    elif before is not None:
+        stmt = stmt.where(AuditLog.id < before).order_by(AuditLog.id.desc())
+    elif after is not None:
+        stmt = stmt.where(AuditLog.id > after).order_by(AuditLog.id.asc())
+    else:
+        stmt = stmt.order_by(AuditLog.id.desc())
+    entries = list(db.scalars(stmt.limit(pager["size"])))
+    if after is not None or last:
+        entries.reverse()
+
+    has_prev = False
+    has_next = False
+    if entries:
+        has_prev = (
+            db.scalar(
+                filtered.where(AuditLog.id > entries[0].id)
+                .with_only_columns(AuditLog.id)
+                .limit(1)
+            )
+            is not None
         )
+        has_next = (
+            db.scalar(
+                filtered.where(AuditLog.id < entries[-1].id)
+                .with_only_columns(AuditLog.id)
+                .limit(1)
+            )
+            is not None
+        )
+    pager.update(
+        cursor=True,
+        has_prev=has_prev,
+        has_next=has_next,
+        prev_cursor=entries[0].id if entries else None,
+        next_cursor=entries[-1].id if entries else None,
+    )
+
+    page_three_cursor: int | None = None
+    page_before_last_cursor: int | None = None
+    if entries and pager["page"] == 1 and pager["pages"] > 2:
+        page_two_ids = list(
+            db.scalars(
+                filtered.where(AuditLog.id < entries[-1].id)
+                .with_only_columns(AuditLog.id)
+                .order_by(AuditLog.id.desc())
+                .limit(page_size)
+            )
+        )
+        if page_two_ids:
+            page_three_cursor = page_two_ids[-1]
+    elif entries and pager["page"] == pager["pages"] and pager["pages"] > 2:
+        page_before_last_ids = list(
+            db.scalars(
+                filtered.where(AuditLog.id > entries[0].id)
+                .with_only_columns(AuditLog.id)
+                .order_by(AuditLog.id.asc())
+                .limit(page_size)
+            )
+        )
+        if page_before_last_ids:
+            page_before_last_cursor = page_before_last_ids[-1]
+    pager["page_links"] = cursor_page_links(
+        pager,
+        prev_cursor=pager["prev_cursor"],
+        next_cursor=pager["next_cursor"],
+        page_three_cursor=page_three_cursor,
+        page_before_last_cursor=page_before_last_cursor,
     )
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     summary = {
@@ -2436,7 +2627,12 @@ def audit_logs(
             resource_labels=AUDIT_RESOURCE_LABELS,
             action_badges=AUDIT_ACTION_BADGES,
             pager=pager,
-            qs=query_keep(action=action, resource=resource, q=search),
+            qs=query_keep(
+                action=action,
+                resource=resource,
+                q=search,
+                page_size=page_size,
+            ),
         ),
     )
 

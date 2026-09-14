@@ -5,11 +5,19 @@ from unittest.mock import patch
 from sqlalchemy import select
 from sqlalchemy.exc import DataError
 
-from app.models import HistoricalStudy, ManualMoveRequest, Order, OrderEvent
+from app.models import (
+    HistoricalSeries,
+    HistoricalStudy,
+    ManualMoveRequest,
+    Order,
+    OrderEvent,
+)
 from app.pipeline import (
     _find_one,
+    _run_move,
     _run_prior_move,
     claim_due_moves,
+    fail_claimed_move,
     find_pending,
     prior_date_range,
     recover_stale_locks,
@@ -109,6 +117,102 @@ class PriorRetrieveTest(DatabaseTestCase):
             self.assertEqual(order.prior_date_to, "20260910")
             self.assertEqual(order.prior_due_at, found_at)
 
+    def test_find_skips_sr_series_and_uses_next_clinical_modality(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id,
+                status="watching",
+                study_uid="",
+                modality="",
+                body_part="",
+                prior_status="disabled",
+                prior_due_at=None,
+            )
+            db.add(order)
+            db.commit()
+            found_at = datetime(2026, 9, 14, 14, 0)
+            study_output = """
+(0020,000d) UI [1.2.3.current] # StudyInstanceUID
+(0008,0061) CS [SR] # ModalitiesInStudy
+(0010,0010) PN [PACIENTE^TESTE] # PatientName
+(0018,0015) CS [CHEST] # BodyPartExamined
+"""
+            series_output = """
+Find Response: 1 (Pending)
+(0008,0060) CS [SR] # Modality
+(0018,0015) CS [CHEST] # BodyPartExamined
+Find Response: 2 (Pending)
+(0008,0060) CS [MR] # Modality
+(0018,0015) CS [ABDOMEN] # BodyPartExamined
+Find Response: 3 (Pending)
+(0008,0060) CS [PR] # Modality
+Received Final Find Response (Success)
+"""
+            first_at = found_at + timedelta(minutes=15)
+
+            with (
+                patch("app.pipeline.c_find", return_value=(0, study_output)),
+                patch(
+                    "app.pipeline.c_find_series_body_part",
+                    return_value=(0, series_output),
+                ),
+                patch(
+                    "app.pipeline.schedule_from_now",
+                    return_value=("MR", first_at, None),
+                ) as schedule,
+            ):
+                _find_one(db, unit, order, found_at)
+
+            schedule.assert_called_once_with(db, "MR")
+            self.assertEqual(order.modality, "MR")
+            self.assertEqual(order.body_part, "ABDOMEN")
+            self.assertEqual(order.status, "wait_retrieve")
+
+    def test_find_keeps_watching_when_only_discarded_series_exist(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id,
+                status="watching",
+                study_uid="",
+                modality="",
+                body_part="",
+            )
+            db.add(order)
+            db.commit()
+            study_output = """
+(0020,000d) UI [1.2.3.current] # StudyInstanceUID
+(0008,0061) CS [SR] # ModalitiesInStudy
+"""
+            series_output = """
+Find Response: 1 (Pending)
+(0008,0060) CS [SR] # Modality
+Find Response: 2 (Pending)
+(0008,0060) CS [PR] # Modality
+Received Final Find Response (Success)
+"""
+
+            with (
+                patch("app.pipeline.c_find", return_value=(0, study_output)),
+                patch(
+                    "app.pipeline.c_find_series_body_part",
+                    return_value=(0, series_output),
+                ),
+                patch("app.pipeline.schedule_from_now") as schedule,
+            ):
+                _find_one(db, unit, order, datetime.now())
+
+            schedule.assert_not_called()
+            self.assertEqual(order.status, "watching")
+            self.assertEqual(order.study_uid, "")
+            self.assertEqual(order.modality, "")
+            self.assertIn("modalidade clínica válida", order.events[-1].message)
+
     def test_find_uses_another_series_when_first_body_part_is_empty(self):
         with self.Session() as db:
             unit = self._unit()
@@ -172,7 +276,7 @@ Find Response: 2 (Pending)
             db.commit()
             output = (
                 "(0020,000d) UI [1.2.3.current] # StudyInstanceUID\n"
-                "(0008,0061) CS [UNKNOWNMODALITY] # ModalitiesInStudy\n"
+                "(0008,0061) CS [MR] # ModalitiesInStudy\n"
                 f"(0010,0010) PN [{'P' * 300}] # PatientName\n"
                 f"(0018,0015) CS [{'B' * 100}] # BodyPartExamined\n"
             )
@@ -181,12 +285,12 @@ Find Response: 2 (Pending)
                 patch("app.pipeline.c_find", return_value=(0, output)),
                 patch(
                     "app.pipeline.schedule_from_now",
-                    return_value=("UNKNOWNMODALITY" * 3, datetime.now(), None),
+                    return_value=("MR", datetime.now(), None),
                 ),
             ):
                 _find_one(db, unit, order, datetime.now())
 
-            self.assertEqual(len(order.modality), 32)
+            self.assertEqual(order.modality, "MR")
             self.assertEqual(len(order.patient_name), 255)
             self.assertEqual(len(order.body_part), 64)
 
@@ -226,7 +330,71 @@ Find Response: 2 (Pending)
             self.assertEqual(first.status, "error")
             self.assertIn("banco de dados", first.last_error)
 
-    def test_prior_is_claimed_before_current_and_holds_its_order(self):
+    def test_find_command_failure_is_retried_and_not_classified_as_not_found(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id, status="watching", study_uid="", prior_status="disabled"
+            )
+            db.add(order)
+            db.commit()
+
+            with patch("app.pipeline.c_find", return_value=(124, "TIMEOUT")):
+                find_pending(db, unit)
+
+            self.assertEqual(order.status, "watching")
+            self.assertEqual(order.attempts, 0)
+            self.assertIn("exit 124", order.last_error)
+            event = db.scalar(
+                select(OrderEvent)
+                .where(OrderEvent.order_id == order.id)
+                .order_by(OrderEvent.id.desc())
+            )
+            self.assertIn("será repetida", event.message)
+
+    def test_current_move_failure_uses_bounded_retry(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id,
+                status="retrieving",
+                prior_status="disabled",
+                attempts=0,
+            )
+            db.add(order)
+            db.commit()
+
+            with patch("app.pipeline.c_move", return_value=(2, "network failure")):
+                _run_move(db, unit, order, second=False)
+
+            self.assertEqual(order.status, "wait_retrieve")
+            self.assertEqual(order.attempts, 1)
+            self.assertGreater(order.retrieve_at, datetime.now())
+
+    def test_unexpected_claimed_move_failure_is_persisted_immediately(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id,
+                status="retrieving",
+                prior_status="disabled",
+                attempts=1,
+            )
+            db.add(order)
+            db.commit()
+
+            fail_claimed_move(db, order.id, "first", RuntimeError("boom"))
+
+            self.assertEqual(order.status, "wait_retrieve")
+            self.assertIn("Falha interna", order.last_error)
+
+    def test_current_and_prior_can_progress_in_parallel_when_unit_has_capacity(self):
         with self.Session() as db:
             unit = self._unit(max_parallel_moves=2)
             db.add(unit)
@@ -235,9 +403,12 @@ Find Response: 2 (Pending)
             db.add(order)
             db.commit()
 
-            self.assertEqual(claim_due_moves(db, unit), [(order.id, "prior")])
+            self.assertEqual(
+                claim_due_moves(db, unit),
+                [(order.id, "first"), (order.id, "prior")],
+            )
             self.assertEqual(order.prior_status, "retrieving")
-            self.assertEqual(order.status, "wait_retrieve")
+            self.assertEqual(order.status, "retrieving")
 
             self.assertEqual(claim_due_moves(db, unit), [])
 
@@ -326,6 +497,59 @@ Received Final Find Response (Success)
             self.assertIsNotNone(study)
             self.assertEqual(study.study_uid, "1.2.old")
             self.assertEqual(study.accession, "OLD-1")
+            self.assertEqual(order.prior_status, "done")
+            completed_series = list(
+                db.scalars(
+                    select(HistoricalSeries).where(
+                        HistoricalSeries.status == "done"
+                    )
+                )
+            )
+            self.assertEqual(len(completed_series), 2)
+
+    def test_prior_retry_skips_series_already_completed(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(unit.id, prior_status="retrieving")
+            db.add(order)
+            db.commit()
+            output = """
+Find Response: 1 (Pending)
+(0008,0020) DA [20250110] # StudyDate
+(0008,0060) CS [MR] # Modality
+(0020,000d) UI [1.2.old] # StudyInstanceUID
+(0020,000e) UI [1.2.old.series.1] # SeriesInstanceUID
+Find Response: 2 (Pending)
+(0008,0020) DA [20250110] # StudyDate
+(0008,0060) CS [MR] # Modality
+(0020,000d) UI [1.2.old] # StudyInstanceUID
+(0020,000e) UI [1.2.old.series.2] # SeriesInstanceUID
+Received Final Find Response (Success)
+"""
+            with (
+                patch("app.pipeline.c_find_prior", return_value=(0, output)),
+                patch(
+                    "app.pipeline.c_move_prior_series",
+                    side_effect=[(0, "ok"), (2, "fail")],
+                ),
+            ):
+                _run_prior_move(db, unit, order)
+            self.assertEqual(order.prior_status, "retry_wait")
+
+            order.prior_status = "retrieving"
+            db.commit()
+            with (
+                patch("app.pipeline.c_find_prior", return_value=(0, output)),
+                patch(
+                    "app.pipeline.c_move_prior_series", return_value=(0, "ok")
+                ) as move,
+            ):
+                _run_prior_move(db, unit, order)
+
+            move.assert_called_once()
+            self.assertEqual(move.call_args.args[5], "1.2.old.series.2")
             self.assertEqual(order.prior_status, "done")
 
     def test_prior_find_discards_current_study_outside_history_range(self):

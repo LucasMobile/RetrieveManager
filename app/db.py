@@ -204,6 +204,13 @@ def _migrate_schema() -> None:
                     "ON order_events (order_id, id)"
                 )
             )
+        if "audit_logs" in table_names:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_audit_logs_resource_action_id "
+                    "ON audit_logs (resource_type, action, id)"
+                )
+            )
         if "image_transfers" in table_names:
             connection.execute(
                 text(
@@ -225,10 +232,10 @@ def _ensure_postgresql_indexes() -> None:
         "ON orders (unit_id, status, id DESC) WHERE archived_at IS NULL",
         "CREATE INDEX IF NOT EXISTS ix_orders_active_prior_status_unit_partial "
         "ON orders (prior_status, unit_id) WHERE archived_at IS NULL",
-        "CREATE INDEX IF NOT EXISTS ix_orders_unmatched_cleanup_partial "
+        "CREATE INDEX IF NOT EXISTS ix_orders_unmatched_cleanup_v2_partial "
         "ON orders (created_at, id) WHERE archived_at IS NULL "
         "AND status = 'watching' AND study_uid = '' "
-        "AND last_find_at IS NOT NULL AND attempts > 0",
+        "AND last_find_at IS NOT NULL AND last_error = ''",
         "CREATE INDEX IF NOT EXISTS ix_orders_completed_retention_partial "
         "ON orders (done_at, id) WHERE archived_at IS NULL "
         "AND status = 'done' AND prior_status IN ('disabled', 'done')",
@@ -240,6 +247,8 @@ def _ensure_postgresql_indexes() -> None:
         "ON orders USING gin (pat_id gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS ix_orders_source_id_trgm "
         "ON orders USING gin (source_id gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS ix_audit_logs_resource_action_id "
+        "ON audit_logs (resource_type, action, id DESC)",
     )
     with engine.begin() as connection:
         for statement in statements:
@@ -247,6 +256,9 @@ def _ensure_postgresql_indexes() -> None:
 
 
 def _seed(db: Session) -> None:
+    if DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg://")):
+        # Web e worker podem iniciar juntos. Serializa seed/backfill no PostgreSQL.
+        db.execute(text("SELECT pg_advisory_xact_lock(847263519)"))
     if db.scalar(select(User).limit(1)) is None:
         db.add(
             User(
@@ -311,7 +323,9 @@ def _seed(db: Session) -> None:
         order.correlation_id = str(uuid4())
 
     db.flush()
+    from app.compression import migrate_legacy_unit_compression
     from app.dicom_rules import migrate_legacy_study_rule
 
     migrate_legacy_study_rule(db)
+    migrate_legacy_unit_compression(db)
     db.commit()

@@ -23,6 +23,7 @@
   </section>
 
   <form class="surface filter-bar orders-filter" method="get" action="{{ orders_path }}" aria-label="Filtros da fila">
+    <input type="hidden" name="page_size" value="{{ pager.size }}">
     <div class="filter-grid">
       <div class="field">
         <label for="filter-unit">Unidade</label>

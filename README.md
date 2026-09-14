@@ -202,11 +202,14 @@ automaticamente. Pedidos concluídos são arquivados 14 dias após a data de
 conclusão, desde que não exista retrieve histórico pendente ou com erro. Unidades
 removidas seguem a mesma regra de preservação.
 
-A fila usa paginação por cursor, sem o custo crescente de `OFFSET`. O PostgreSQL
-recebe índices parciais para registros ativos, histórico e limpeza automática,
-além de índices `pg_trgm` para busca por accession, Patient ID e ID de origem. Os
-agregados da Visão geral têm cache curto de cinco segundos para que vários
-navegadores não repitam as mesmas varreduras do banco a cada atualização.
+A fila e os Logs mantêm paginação por cursor para evitar o custo crescente de
+`OFFSET`, mas apresentam controles numerados com acesso à primeira, última,
+próxima e anterior. Nessas telas é possível exibir 10, 20, 30, 40 ou 50 itens por
+página; o padrão é 30. O PostgreSQL recebe índices parciais para registros ativos,
+histórico e limpeza automática, além de índices `pg_trgm` para busca por accession,
+Patient ID e ID de origem. Os agregados da Visão geral têm cache curto de cinco
+segundos para que vários navegadores não repitam as mesmas varreduras do banco a
+cada atualização.
 
 ## Cadastrar uma unidade
 
@@ -242,19 +245,26 @@ Pedidos com `mirthReaded=true` são ignorados. O `PUT` de confirmação só ocor
 depois do commit no banco local; se falhar, fica pendente e é repetido sem criar
 outro pedido para o mesmo accession.
 
-Quando o retrieve de exames anteriores está ativo, o C-FIND do exame atual também
-obtém `BodyPartExamined (0018,0015)`. Se esse atributo vier vazio, o worker consulta
-as séries do Study UID localizado e usa o primeiro Body Part preenchido. Em seguida,
-o worker executa outro C-FIND em
-nível de série usando paciente, nascimento, modalidade, body part e o intervalo
-entre três anos atrás e ontem. O Patient ID é consultado com `*` no final e body
-part vazio é permitido. Os Study UIDs encontrados são registrados antes da
+Quando o C-FIND encontra o estudo atual, o worker consulta suas séries e escolhe a
+primeira modalidade aceita pelo catálogo de compactação da unidade, desconsiderando
+modalidades descartadas como SR e PR. O `BodyPartExamined (0018,0015)` vem da mesma
+série selecionada; se nenhuma série clínica válida existir, o pedido continua em
+observação e a consulta é repetida. Quando o retrieve de exames anteriores está
+ativo, o worker executa outro C-FIND em nível de série usando paciente, nascimento,
+essa modalidade, body part e o intervalo entre três anos atrás e ontem. O Patient
+ID é consultado com `*` no final e body part vazio é permitido. Os Study UIDs
+encontrados são registrados antes da
 transferência, e cada série é recuperada por seus Study UID e Series UID exatos.
 Se a consulta não encontrar exames anteriores, o histórico termina com sucesso e
 nenhum C-MOVE é executado. O processo compartilha o limite de paralelismo da
-unidade e termina (ou esgota três tentativas) antes do primeiro retrieve do exame
-atual. O exame atual continua sendo recuperado pelo Study UID; seus tempos e
-eventual segundo retrieve não se aplicam aos exames anteriores.
+unidade, mas não bloqueia um retrieve atual que já esteja no horário e haja
+capacidade disponível. Cada série histórica concluída recebe um checkpoint e não
+é repetida se outra série precisar de retry. O exame atual continua sendo
+recuperado pelo Study UID; seus tempos e eventual segundo retrieve não se aplicam
+aos exames anteriores.
+
+O fluxo operacional, os limites de falha e o catálogo de logs estão detalhados em
+[`RETRIEVE_HARDENING.md`](RETRIEVE_HARDENING.md).
 
 Na página do pedido, **Retrieve agora** cria uma solicitação persistente para um
 C-MOVE adicional apenas do Study UID do exame atual. A solicitação só fica
@@ -270,7 +280,15 @@ retrieve. O botão **Atualizar** recarrega o estado e os eventos da página.
 | MR | 15 min | 90 min |
 | * (demais) | 10 min | não |
 
-Descarte no recebimento por modalidade (editável): PR, PS, SG, SR, RA, US.
+Compactação e descarte são configurados separadamente em cada unidade. Os perfis
+disponíveis são JPEG Lossless (`+e1`), JPEG Lossy 8 Bits (`+eb`) e JPEG Lossy
+12 Bits (`+ee`). Uma modalidade pode pertencer a somente um perfil; modalidades
+sem perfil explícito usam JPEG Lossless. O descarte tem precedência e remove a
+modalidade de qualquer perfil de compactação.
+
+Na primeira inicialização após a atualização, as antigas regras globais são
+copiadas para todas as unidades existentes. Novas unidades começam com esses
+mesmos padrões e podem ser configuradas independentemente.
 
 ## Regras DICOM
 
@@ -288,4 +306,5 @@ arquivo. As aplicações ficam associadas ao registro da imagem para auditoria.
 Na primeira inicialização após a atualização, o prefixo de Study ID configurado
 anteriormente é convertido em uma regra para as unidades existentes. Para `SLRX`,
 o comportamento preservado corresponde a Study IDs iniciados por `SLRX` e seguidos
-por números. O descarte simples por modalidade permanece em **Compactação**.
+por números. O descarte simples por modalidade fica no card **Compactação** do
+cadastro de cada unidade.

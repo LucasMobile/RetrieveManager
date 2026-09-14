@@ -1,6 +1,8 @@
 import logging
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -24,6 +26,32 @@ from tests.support import DatabaseTestCase, make_unit
 
 
 class TransferTrackingTest(DatabaseTestCase):
+    def test_success_is_persisted_before_local_file_cleanup(self):
+        with tempfile.TemporaryDirectory() as send_dir, self.Session() as db:
+            unit = make_unit(name="unit", send_dir=send_dir)
+            db.add(unit)
+            db.flush()
+            transfer = ImageTransfer(
+                unit_id=unit.id,
+                filename="image.dcm",
+                correlation_id="corr-1",
+                status="compressed",
+            )
+            db.add(transfer)
+            db.commit()
+            path = Path(send_dir) / transfer.filename
+            path.write_bytes(b"DICOM")
+
+            _record_send_results(
+                db,
+                unit,
+                [SendResult(transfer.id, "corr-1", True, http_status=200)],
+                CircuitState(),
+            )
+
+            self.assertEqual(transfer.status, "uploaded")
+            self.assertFalse(path.exists())
+
     def test_upload_failure_is_persisted_with_backoff(self):
         with self.Session() as db:
             unit = make_unit(

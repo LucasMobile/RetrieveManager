@@ -23,4 +23,8 @@ def can_archive(order: Order) -> bool:
 
 
 def can_cancel(order: Order) -> bool:
-    return order.archived_at is None and order.status not in {"done", "cancelled"}
+    return (
+        order.archived_at is None
+        and order.status not in ACTIVE_ORDER_STATUSES | {"done", "cancelled"}
+        and order.prior_status != "retrieving"
+    )

@@ -123,6 +123,7 @@ class DicomCmdTest(unittest.TestCase):
         self.assertIn("0008,0052=SERIES", cmd)
         self.assertIn("0020,000D=1.2.current", cmd)
         self.assertIn("0020,000E=", cmd)
+        self.assertIn("0008,0060=", cmd)
         self.assertIn("0018,0015=", cmd)
 
     def test_storescp_and_jpeg_unchanged(self):

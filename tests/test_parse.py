@@ -5,6 +5,8 @@ from app.parse import (
     parse_findscu_output,
     parse_prior_findscu_output,
     parse_series_body_part,
+    parse_series_metadata,
+    series_response_has_modality,
 )
 
 
@@ -76,6 +78,33 @@ Find Response: 2 (Pending)
 (0018,0015) CS [ABDOMEN] # BodyPartExamined
 """
         self.assertEqual(parse_series_body_part(output), "ABDOMEN")
+
+    def test_series_metadata_skips_non_clinical_first_series(self):
+        output = """
+(0008,0060) CS (no value available) # Modality from request dataset
+Find Response: 1 (Pending)
+(0008,0060) CS [SR] # Modality
+(0018,0015) CS [ABDOMEN] # BodyPartExamined
+Find Response: 2 (Pending)
+(0008,0060) CS [MR] # Modality
+(0018,0015) CS [ABDOMEN] # BodyPartExamined
+Find Response: 3 (Pending)
+(0008,0060) CS [PR] # Modality
+Received Final Find Response (Success)
+"""
+        self.assertEqual(
+            parse_series_metadata(output, frozenset({"CT", "MR"})),
+            ("MR", "ABDOMEN"),
+        )
+        self.assertTrue(series_response_has_modality(output))
+
+    def test_empty_request_modality_is_not_a_series_modality(self):
+        output = """
+(0008,0060) CS (no value available) # Modality from request dataset
+Find Response: 1 (Pending)
+(0018,0015) CS [ABDOMEN] # BodyPartExamined
+"""
+        self.assertFalse(series_response_has_modality(output))
 
 
 if __name__ == "__main__":

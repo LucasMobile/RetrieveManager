@@ -167,7 +167,7 @@ def series_body_part_findscu_cmd(
     pacs_port: int,
     study_uid: str,
 ) -> list[str]:
-    """Build a SERIES query used to find a non-empty BodyPartExamined."""
+    """Build a SERIES query used to select valid modality metadata."""
     return [
         bin_path,
         "-v",
@@ -178,6 +178,8 @@ def series_body_part_findscu_cmd(
         f"0020,000D={study_uid}",
         "-k",
         "0020,000E=",
+        "-k",
+        "0008,0060=",
         "-k",
         "0018,0015=",
         "-aet",

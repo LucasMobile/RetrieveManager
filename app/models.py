@@ -31,6 +31,9 @@ class AuditLog(Base):
     __table_args__ = (
         Index("ix_audit_logs_created_at", "created_at"),
         Index("ix_audit_logs_resource_action", "resource_type", "action"),
+        Index(
+            "ix_audit_logs_resource_action_id", "resource_type", "action", "id"
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -108,6 +111,17 @@ class Unit(Base):
     dicom_rule_links: Mapped[list["DicomRuleUnit"]] = relationship(
         back_populates="unit", cascade="all, delete-orphan"
     )
+    compression_settings: Mapped["UnitCompressionSettings | None"] = relationship(
+        back_populates="unit",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    compression_rules: Mapped[list["UnitCompressRule"]] = relationship(
+        back_populates="unit", cascade="all, delete-orphan"
+    )
+    drop_modalities: Mapped[list["UnitDropModality"]] = relationship(
+        back_populates="unit", cascade="all, delete-orphan"
+    )
 
 
 class ModalityRule(Base):
@@ -133,6 +147,53 @@ class DropModality(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     code: Mapped[str] = mapped_column(String(8), unique=True, nullable=False)
+
+
+class UnitCompressionSettings(Base):
+    __tablename__ = "unit_compression_settings"
+
+    unit_id: Mapped[int] = mapped_column(
+        ForeignKey("units.id", ondelete="CASCADE"), primary_key=True
+    )
+    default_jpeg_flag: Mapped[str] = mapped_column(
+        String(8), default="+e1", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+    unit: Mapped["Unit"] = relationship(back_populates="compression_settings")
+
+
+class UnitCompressRule(Base):
+    __tablename__ = "unit_compress_rules"
+    __table_args__ = (
+        UniqueConstraint("unit_id", "modality", name="uq_unit_compress_modality"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    unit_id: Mapped[int] = mapped_column(
+        ForeignKey("units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    modality: Mapped[str] = mapped_column(String(16), nullable=False)
+    jpeg_flag: Mapped[str] = mapped_column(String(8), nullable=False)
+
+    unit: Mapped["Unit"] = relationship(back_populates="compression_rules")
+
+
+class UnitDropModality(Base):
+    __tablename__ = "unit_drop_modalities"
+    __table_args__ = (
+        UniqueConstraint("unit_id", "code", name="uq_unit_drop_modality"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    unit_id: Mapped[int] = mapped_column(
+        ForeignKey("units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(8), nullable=False)
+
+    unit: Mapped["Unit"] = relationship(back_populates="drop_modalities")
 
 
 class DicomRule(Base):
@@ -292,6 +353,9 @@ class Order(Base):
     historical_studies: Mapped[list["HistoricalStudy"]] = relationship(
         back_populates="order", cascade="all, delete-orphan"
     )
+    historical_series: Mapped[list["HistoricalSeries"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan"
+    )
 
 
 class OrderEvent(Base):
@@ -352,6 +416,34 @@ class HistoricalStudy(Base):
     image_links: Mapped[list["HistoricalImageLink"]] = relationship(
         back_populates="study", cascade="all, delete-orphan"
     )
+
+
+class HistoricalSeries(Base):
+    """Checkpoint persistente de cada série do retrieve histórico."""
+
+    __tablename__ = "historical_series"
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id", "series_uid", name="uq_historical_order_series"
+        ),
+        Index("ix_historical_series_order_status", "order_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
+    study_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    series_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    completed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+    order: Mapped[Order] = relationship(back_populates="historical_series")
 
 
 class HistoricalImageLink(Base):

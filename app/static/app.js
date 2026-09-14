@@ -232,6 +232,181 @@
     }
   });
 
+  const compressionPanel = unitForm?.querySelector("[data-unit-compression]");
+  if (compressionPanel) {
+    const profileInputs = Array.from(
+      compressionPanel.querySelectorAll("[data-profile-input]"),
+    );
+    const profileSets = new Map(
+      profileInputs.map((input) => [
+        input.dataset.profileInput,
+        new Set(input.value.split(",").map((value) => value.trim()).filter(Boolean)),
+      ]),
+    );
+    const dropValue = compressionPanel.querySelector("[data-drop-value]");
+    const dropInput = compressionPanel.querySelector("[data-drop-input]");
+    const dropChips = compressionPanel.querySelector("[data-drop-chips]");
+    const drops = new Set(
+      (dropValue?.value || "").split(",").map((value) => value.trim()).filter(Boolean),
+    );
+
+    const sorted = (values) => Array.from(values).sort((left, right) => left.localeCompare(right));
+    const makeChip = (value, removable = false) => {
+      const chip = document.createElement("span");
+      chip.className = "modality-selection-chip";
+      chip.textContent = value;
+      if (removable) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `Remover ${value} do descarte`);
+        remove.textContent = "×";
+        remove.addEventListener("click", () => {
+          drops.delete(value);
+          renderCompressionSettings();
+        });
+        chip.append(remove);
+      }
+      return chip;
+    };
+
+    const renderCompressionSettings = () => {
+      profileInputs.forEach((input) => {
+        const profile = input.dataset.profileInput;
+        const values = profileSets.get(profile) || new Set();
+        input.value = sorted(values).join(",");
+        const container = compressionPanel.querySelector(`[data-profile-chips="${profile}"]`);
+        const count = compressionPanel.querySelector(`[data-profile-count="${profile}"]`);
+        const dialogCount = compressionPanel.querySelector(`[data-dialog-count="${profile}"]`);
+        if (count) count.textContent = String(values.size);
+        if (dialogCount) dialogCount.textContent = String(values.size);
+        if (container) {
+          container.replaceChildren();
+          if (values.size === 0) {
+            const empty = document.createElement("span");
+            empty.className = "unit-compression-profile__empty";
+            empty.textContent = "Nenhuma modalidade específica";
+            container.append(empty);
+          } else {
+            sorted(values).forEach((value) => container.append(makeChip(value)));
+          }
+        }
+      });
+
+      compressionPanel.querySelectorAll("[data-profile-option]").forEach((option) => {
+        option.checked = profileSets.get(option.dataset.profileOption)?.has(option.value) || false;
+      });
+      compressionPanel.querySelectorAll("[data-profile-select-all]").forEach((toggle) => {
+        const options = Array.from(
+          compressionPanel.querySelectorAll(
+            `[data-profile-option="${toggle.dataset.profileSelectAll}"]`,
+          ),
+        );
+        const selected = options.filter((option) => option.checked).length;
+        toggle.checked = options.length > 0 && selected === options.length;
+        toggle.indeterminate = selected > 0 && selected < options.length;
+      });
+
+      if (dropValue) dropValue.value = sorted(drops).join(",");
+      if (dropChips) {
+        dropChips.replaceChildren();
+        sorted(drops).forEach((value) => dropChips.append(makeChip(value, true)));
+      }
+    };
+
+    const assignProfile = (profile, modality, selected) => {
+      const target = profileSets.get(profile);
+      if (!target) return;
+      if (selected) {
+        profileSets.forEach((values, name) => {
+          if (name !== profile) values.delete(modality);
+        });
+        drops.delete(modality);
+        target.add(modality);
+      } else {
+        target.delete(modality);
+      }
+      renderCompressionSettings();
+    };
+
+    compressionPanel.querySelectorAll("[data-profile-option]").forEach((option) => {
+      option.addEventListener("change", () => {
+        assignProfile(option.dataset.profileOption, option.value, option.checked);
+      });
+    });
+    compressionPanel.querySelectorAll("[data-profile-select-all]").forEach((toggle) => {
+      toggle.addEventListener("change", () => {
+        const profile = toggle.dataset.profileSelectAll;
+        const selected = toggle.checked;
+        const target = profileSets.get(profile);
+        if (!target) return;
+        compressionPanel
+          .querySelectorAll(`[data-profile-option="${profile}"]`)
+          .forEach((option) => {
+            if (selected) {
+              profileSets.forEach((values, name) => {
+                if (name !== profile) values.delete(option.value);
+              });
+              drops.delete(option.value);
+              target.add(option.value);
+            } else {
+              target.delete(option.value);
+            }
+          });
+        renderCompressionSettings();
+      });
+    });
+
+    const addDrop = () => {
+      if (!dropInput) return true;
+      const modality = dropInput.value.trim().toUpperCase();
+      if (!modality) return true;
+      if (!/^[A-Z0-9]{1,8}$/.test(modality)) {
+        dropInput.setCustomValidity("Use um código DICOM com até 8 letras ou números.");
+        dropInput.reportValidity();
+        return false;
+      }
+      dropInput.setCustomValidity("");
+      drops.add(modality);
+      profileSets.forEach((values) => values.delete(modality));
+      dropInput.value = "";
+      renderCompressionSettings();
+      return true;
+    };
+    dropInput?.addEventListener("input", () => dropInput.setCustomValidity(""));
+    dropInput?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === ",") {
+        event.preventDefault();
+        addDrop();
+      } else if (event.key === "Backspace" && !dropInput.value && drops.size) {
+        drops.delete(sorted(drops).at(-1));
+        renderCompressionSettings();
+      }
+    });
+    dropInput?.addEventListener("blur", addDrop);
+
+    compressionPanel.querySelectorAll("[data-compression-open]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const dialog = compressionPanel.querySelector(
+          `[data-compression-dialog="${button.dataset.compressionOpen}"]`,
+        );
+        if (dialog?.showModal) dialog.showModal();
+      });
+    });
+    compressionPanel.querySelectorAll("[data-compression-dialog]").forEach((dialog) => {
+      dialog.querySelectorAll("[data-compression-close]").forEach((button) => {
+        button.addEventListener("click", () => dialog.close());
+      });
+      dialog.addEventListener("click", (event) => {
+        if (event.target === dialog) dialog.close();
+      });
+    });
+    unitForm?.addEventListener("submit", (event) => {
+      if (!addDrop()) event.preventDefault();
+      renderCompressionSettings();
+    });
+    renderCompressionSettings();
+  }
+
   document.querySelectorAll("[data-second-rule]").forEach((rule) => {
     const toggle = rule.querySelector("[data-second-toggle]");
     const value = rule.querySelector("[data-second-value]");

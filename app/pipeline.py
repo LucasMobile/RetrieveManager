@@ -16,9 +16,11 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.compression import compression_runtime_settings, find_modalities_for_unit
 from app.config import (
     CIRCUIT_BREAKER_FAILURES,
     CIRCUIT_BREAKER_SECONDS,
+    COMPACT_BATCH_SIZE,
     FIND_BATCH_SIZE,
     HTTP_CONNECT_TIMEOUT_SECONDS,
     HTTP_TOTAL_TIMEOUT_SECONDS,
@@ -47,17 +49,22 @@ from app.dicom_tools import (
 from app.events import add_event
 from app.models import (
     AuditLog,
-    CompressRule,
     DicomRuleApplication,
     HistoricalImageLink,
+    HistoricalSeries,
     HistoricalStudy,
     ImageTransfer,
     ManualMoveRequest,
     Order,
     Unit,
 )
-from app.observability import log_context, log_event, new_correlation_id
-from app.order_state import ACTIVE_ORDER_STATUSES, ACTIVE_PRIOR_STATUSES
+from app.observability import (
+    log_context,
+    log_event,
+    new_correlation_id,
+    safe_error_detail,
+)
+from app.order_state import ACTIVE_ORDER_STATUSES
 from app.orders_api import (
     InvalidApiOrder,
     OrdersApiError,
@@ -67,16 +74,20 @@ from app.orders_api import (
 )
 from app.parse import (
     PriorSeriesResult,
+    first_allowed_modality,
     parse_findscu_output,
     parse_prior_findscu_output,
     parse_series_body_part,
+    parse_series_metadata,
+    series_response_has_modality,
 )
 from app.retention import archive_order
-from app.rules import drop_codes, schedule_from_now
+from app.rules import schedule_from_now
 
 log = logging.getLogger("worker")
 STALE_LOCK = timedelta(minutes=20)
 PRIOR_RETRY_DELAYS = (60, 300)
+CURRENT_MOVE_RETRY_DELAYS = (60, 300)
 UNMATCHED_ORDER_RETENTION = timedelta(days=1)
 UNMATCHED_ORDER_CLEANUP_BATCH = 500
 COMPLETED_ORDER_RETENTION = timedelta(weeks=2)
@@ -117,7 +128,7 @@ class CircuitState:
     open_until: datetime | None = None
 
 
-_cloud_circuits: dict[str, CircuitState] = {}
+_cloud_circuits: dict[int, CircuitState] = {}
 _last_orders_api_poll: dict[int, float] = {}
 
 
@@ -125,6 +136,11 @@ def _ensure_order_correlation(order: Order) -> str:
     if not order.correlation_id:
         order.correlation_id = new_correlation_id()
     return order.correlation_id
+
+
+def _bounded_db_text(value: object, limit: int) -> str:
+    """Normalize external PACS/file text before writing bounded DB columns."""
+    return str(value or "").replace("\x00", " ").strip()[:limit]
 
 
 def recover_stale_locks(db: Session) -> None:
@@ -306,50 +322,68 @@ def ingest_unit(db: Session, unit: Unit) -> int:
             continue
         seen.add(parsed.accession_number)
 
-        exists = db.scalar(
-            select(Order).where(
-                Order.unit_id == unit.id,
-                Order.acc == parsed.accession_number,
-            )
-        )
-        if exists:
-            # A API ainda informou mirthReaded != true; torne o ACK idempotente.
-            exists.api_read_status = "pending"
-            exists.api_read_last_error = ""
-            continue
         correlation_id = new_correlation_id()
-        order = Order(
-            unit_id=unit.id,
-            source_id=parsed.source_id,
-            filename=parsed.accession_number,
-            pat_id=parsed.patient_id,
-            acc=parsed.accession_number,
-            birth_date=parsed.patient_birthdate,
-            exam_date=parsed.exam_date,
-            status="watching",
-            correlation_id=correlation_id,
-            api_read_status="pending",
-        )
-        db.add(order)
-        db.flush()
-        db.add(
-            AuditLog(
-                actor_id=None,
-                actor_username="Sistema",
-                actor_role="system",
-                action="create",
-                resource_type="order",
-                resource_id=str(order.id),
-                resource_name=order.acc,
-                summary=f"Pedido recebido automaticamente da unidade {unit.name}.",
-                ip_address="",
+        try:
+            with db.begin_nested():
+                exists = db.scalar(
+                    select(Order).where(
+                        Order.unit_id == unit.id,
+                        Order.acc == parsed.accession_number,
+                    )
+                )
+                if exists:
+                    # A API ainda informou mirthReaded != true; ACK idempotente.
+                    exists.api_read_status = "pending"
+                    exists.api_read_last_error = ""
+                    continue
+                order = Order(
+                    unit_id=unit.id,
+                    source_id=parsed.source_id,
+                    filename=parsed.accession_number,
+                    pat_id=parsed.patient_id,
+                    acc=parsed.accession_number,
+                    birth_date=parsed.patient_birthdate,
+                    exam_date=parsed.exam_date,
+                    status="watching",
+                    correlation_id=correlation_id,
+                    api_read_status="pending",
+                )
+                db.add(order)
+                db.flush()
+                db.add(
+                    AuditLog(
+                        actor_id=None,
+                        actor_username="Sistema",
+                        actor_role="system",
+                        action="create",
+                        resource_type="order",
+                        resource_id=str(order.id),
+                        resource_name=order.acc,
+                        summary=(
+                            "Pedido recebido automaticamente da unidade "
+                            f"{unit.name}."
+                        ),
+                        ip_address="",
+                    )
+                )
+                add_event(
+                    db,
+                    order,
+                    "Pedido recebido da API PLERES: "
+                    f"acc={parsed.accession_number}",
+                )
+        except SQLAlchemyError as exc:
+            log_event(
+                log,
+                logging.ERROR,
+                "order.api.ingest.persist",
+                resource=f"unit:{unit.id}",
+                status="rejected",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                unit_id=unit.id,
             )
-        )
-        add_event(
-            db,
-            order,
-            f"Pedido recebido da API PLERES: acc={parsed.accession_number}",
-        )
+            continue
         with log_context(correlation_id):
             log_event(
                 log,
@@ -440,7 +474,7 @@ def cleanup_unmatched_orders(db: Session, now: datetime | None = None) -> int:
                 Order.status == "watching",
                 Order.study_uid == "",
                 Order.last_find_at.is_not(None),
-                Order.attempts > 0,
+                Order.last_error == "",
                 Order.created_at <= cutoff,
             )
             .order_by(Order.created_at, Order.id)
@@ -584,6 +618,37 @@ def find_pending(db: Session, unit: Unit) -> None:
                 order_id=order_id,
                 unit_id=unit.id,
             )
+        except Exception as exc:
+            # Erros de SO/parser/programação ficam contidos neste pedido. O pedido
+            # permanece observável e elegível para uma nova consulta.
+            order_id = order.id
+            db.rollback()
+            failed_order = db.get(Order, order_id)
+            if failed_order is not None and failed_order.status == "watching":
+                failed_order.last_find_at = now
+                failed_order.heartbeat_at = None
+                failed_order.last_error = (
+                    f"Falha interna no C-FIND: {safe_error_detail(exc)}"
+                )
+                add_event(
+                    db,
+                    failed_order,
+                    "C-FIND interrompido; consulta será repetida",
+                    safe_error_detail(exc),
+                    "warn",
+                )
+                db.commit()
+            log_event(
+                log,
+                logging.ERROR,
+                "dicom.find.internal",
+                resource=f"order:{order_id}",
+                status="retry",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                order_id=order_id,
+                unit_id=unit.id,
+            )
 
 
 def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
@@ -627,10 +692,39 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 unit_id=unit.id,
             )
             return
+        except OSError as exc:
+            code, output = 126, str(exc)
+
+        if code != 0:
+            order.heartbeat_at = None
+            order.last_error = f"C-FIND falhou (exit {code})"
+            safe_output = redact_dicom_output(output)
+            add_event(
+                db,
+                order,
+                f"C-FIND falhou (exit {code}); consulta será repetida",
+                safe_output,
+                "warn",
+            )
+            db.commit()
+            log_event(
+                log,
+                logging.WARNING,
+                "dicom.find",
+                resource=f"order:{order.id}",
+                status="retry",
+                started_at=started_at,
+                order_id=order.id,
+                unit_id=unit.id,
+                command_status=code,
+            )
+            return
 
         study_uid, modalities, patient_name, body_part = parse_findscu_output(output)
+        allowed_modalities = find_modalities_for_unit(db, unit.id)
+        modality = first_allowed_modality(modalities, allowed_modalities)
         diagnostic_output = output
-        if study_uid and not body_part:
+        if study_uid:
             try:
                 series_code, series_output = c_find_series_body_part(
                     unit.calling_aet,
@@ -645,10 +739,24 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 f"{output}\n\nC-FIND complementar de séries:\n{series_output}"
             )
             if series_code == 0:
-                body_part = parse_series_body_part(series_output)
-        order.attempts += 1
+                series_modality, series_body_part = parse_series_metadata(
+                    series_output, allowed_modalities
+                )
+                if series_modality:
+                    modality = series_modality
+                    body_part = series_body_part
+                elif series_response_has_modality(series_output):
+                    # The PACS returned series, but none belongs to the accepted
+                    # compression catalog. Keep watching instead of choosing SR/PR.
+                    modality = ""
+                    body_part = ""
+                elif modality and not body_part:
+                    # Compatibility with PACS nodes that omit Modality at SERIES.
+                    body_part = parse_series_body_part(series_output)
         safe_output = redact_dicom_output(diagnostic_output)
         if not study_uid:
+            order.heartbeat_at = None
+            order.last_error = ""
             add_event(
                 db,
                 order,
@@ -669,7 +777,30 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             )
             return
 
-        modality, retrieve_at, second_at = schedule_from_now(db, modalities)
+        if not modality:
+            order.heartbeat_at = None
+            order.last_error = ""
+            add_event(
+                db,
+                order,
+                "C-FIND sem modalidade clínica válida; consulta será repetida",
+                safe_output,
+            )
+            db.commit()
+            log_event(
+                log,
+                logging.INFO,
+                "dicom.find",
+                resource=f"order:{order.id}",
+                status="not_ready",
+                started_at=started_at,
+                order_id=order.id,
+                unit_id=unit.id,
+                command_status=code,
+            )
+            return
+
+        modality, retrieve_at, second_at = schedule_from_now(db, modality)
         order.study_uid = study_uid
         order.modality = modality[:32]
         order.patient_name = patient_name[:255]
@@ -678,6 +809,9 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
         order.second_retrieve_at = second_at
         order.found_at = now
         order.status = "wait_retrieve"
+        order.heartbeat_at = None
+        # A partir daqui, attempts mede somente tentativas do C-MOVE atual.
+        order.attempts = 0
         order.last_error = ""
         if unit.retrieve_prior_enabled:
             prior_from, prior_to = prior_date_range(now.date())
@@ -721,10 +855,8 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
 
 
 def _database_error_detail(exc: SQLAlchemyError) -> str:
-    """Return the driver message without SQL text or bound DICOM parameters."""
-    original = getattr(exc, "orig", None)
-    detail = str(original or type(exc).__name__).replace("\x00", " ")
-    return " ".join(detail.splitlines())[:500]
+    """Backward-compatible alias used by existing operational logging."""
+    return safe_error_detail(exc)
 
 
 def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
@@ -783,6 +915,8 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.status.notin_(ACTIVE_ORDER_STATUSES),
             )
             .order_by(ManualMoveRequest.created_at, ManualMoveRequest.id)
+            .limit(slots)
+            .with_for_update(skip_locked=True)
         )
     )
     first = list(
@@ -793,11 +927,12 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.archived_at.is_(None),
                 Order.status == "wait_retrieve",
                 Order.id.notin_(active_manual_order_ids),
-                Order.prior_status.notin_(ACTIVE_PRIOR_STATUSES),
                 Order.retrieve_at.is_not(None),
                 Order.retrieve_at <= now,
             )
             .order_by(Order.retrieve_at)
+            .limit(slots)
+            .with_for_update(skip_locked=True)
         )
     )
     second = list(
@@ -808,11 +943,12 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.archived_at.is_(None),
                 Order.status == "wait_second",
                 Order.id.notin_(active_manual_order_ids),
-                Order.prior_status.notin_(ACTIVE_PRIOR_STATUSES),
                 Order.second_retrieve_at.is_not(None),
                 Order.second_retrieve_at <= now,
             )
             .order_by(Order.second_retrieve_at)
+            .limit(slots)
+            .with_for_update(skip_locked=True)
         )
     )
     prior = list(
@@ -824,6 +960,9 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
                 Order.prior_due_at.is_not(None),
                 Order.prior_due_at <= now,
             )
+            .order_by(Order.prior_due_at, Order.id)
+            .limit(slots)
+            .with_for_update(skip_locked=True)
         )
     )
     candidates = (
@@ -835,8 +974,9 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         + [(order.second_retrieve_at, 2, order.id, "second", order) for order in second]
         + [(order.prior_due_at, 0, order.id, "prior", order) for order in prior]
     )
+    kind_priority = {"manual": 0, "first": 1, "second": 1, "prior": 2}
     candidates.sort(
-        key=lambda item: (item[3] != "manual", item[0], item[1], item[2])
+        key=lambda item: (kind_priority[item[3]], item[0], item[1], item[2])
     )
     for _due_at, _priority, _resource_id, kind, resource in candidates[:slots]:
         if kind == "manual":
@@ -856,11 +996,24 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         claimed.append((resource.id, kind))
     if claimed:
         db.commit()
+        log_event(
+            log,
+            logging.INFO,
+            "dicom.move.claim",
+            resource=f"unit:{unit.id}",
+            status="success",
+            unit_id=unit.id,
+            claimed_count=len(claimed),
+            move_kinds=[kind for _resource_id, kind in claimed],
+        )
     return claimed
 
 
 def run_claimed_move(db: Session, resource_id: int, kind: str) -> None:
     if kind == "manual":
+        request = db.get(ManualMoveRequest, resource_id)
+        if request is None or request.status != "running":
+            return
         _run_manual_move(db, resource_id)
         return
     order = db.get(Order, resource_id)
@@ -870,9 +1023,130 @@ def run_claimed_move(db: Session, resource_id: int, kind: str) -> None:
     if unit is None:
         return
     if kind == "prior":
+        if order.prior_status != "retrieving" or order.archived_at is not None:
+            return
         _run_prior_move(db, unit, order)
     else:
+        expected = "retrieving_second" if kind == "second" else "retrieving"
+        if order.status != expected or order.archived_at is not None:
+            return
         _run_move(db, unit, order, kind == "second")
+
+
+def fail_claimed_move(
+    db: Session,
+    resource_id: int,
+    kind: str,
+    error: BaseException,
+) -> None:
+    """Persist a terminal/retry state after an unexpected executor failure."""
+    now = datetime.now()
+    detail = safe_error_detail(error)
+    if kind == "manual":
+        request = db.get(ManualMoveRequest, resource_id)
+        if request is None or request.status != "running":
+            return
+        request.status = "error"
+        request.completed_at = now
+        request.last_error = f"Falha interna no C-MOVE: {detail}"[:500]
+        order = db.get(Order, request.order_id)
+        if order is not None:
+            add_event(
+                db,
+                order,
+                "C-MOVE manual interrompido por falha interna",
+                detail,
+                "error",
+            )
+        db.commit()
+        return
+
+    order = db.get(Order, resource_id)
+    if order is None or order.archived_at is not None:
+        return
+    if kind == "prior" and order.prior_status == "retrieving":
+        order.prior_heartbeat_at = now
+        if order.prior_attempts < 3:
+            delay_index = max(0, min(order.prior_attempts - 1, 1))
+            delay = PRIOR_RETRY_DELAYS[delay_index]
+            order.prior_status = "retry_wait"
+            order.prior_due_at = now + timedelta(seconds=delay)
+            order.prior_last_error = f"Falha interna: {detail}"
+            add_event(
+                db,
+                order,
+                "Retrieve histórico interrompido; nova tentativa agendada",
+                detail,
+                "warn",
+            )
+        else:
+            order.prior_status = "error"
+            order.prior_completed_at = now
+            order.prior_last_error = f"Falha interna: {detail}"
+            add_event(
+                db,
+                order,
+                "Retrieve histórico interrompido após esgotar as tentativas",
+                detail,
+                "error",
+            )
+        db.commit()
+        return
+
+    expected = "retrieving_second" if kind == "second" else "retrieving"
+    if order.status != expected:
+        return
+    _schedule_current_move_retry(
+        db,
+        order,
+        second=kind == "second",
+        now=now,
+        error_message=f"Falha interna: {detail}",
+        event_detail=detail,
+    )
+    db.commit()
+
+
+def _schedule_current_move_retry(
+    db: Session,
+    order: Order,
+    *,
+    second: bool,
+    now: datetime,
+    error_message: str,
+    event_detail: str,
+) -> bool:
+    """Schedule a bounded C-MOVE retry; return False when exhausted."""
+    label = "2º" if second else "1º"
+    order.heartbeat_at = now
+    if order.attempts >= 3:
+        order.status = "error"
+        order.last_error = error_message
+        add_event(
+            db,
+            order,
+            f"{label} C-MOVE falhou após 3 tentativas",
+            event_detail,
+            "error",
+        )
+        return False
+    delay = CURRENT_MOVE_RETRY_DELAYS[max(0, order.attempts - 1)]
+    due_at = now + timedelta(seconds=delay)
+    if second:
+        order.status = "wait_second"
+        order.second_retrieve_at = due_at
+    else:
+        order.status = "wait_retrieve"
+        order.retrieve_at = due_at
+    order.last_error = error_message
+    add_event(
+        db,
+        order,
+        f"{label} C-MOVE falhou; nova tentativa em {delay} segundos",
+        event_detail,
+        "warn",
+    )
+    return True
 
 
 def _run_manual_move(db: Session, request_id: int) -> None:
@@ -983,22 +1257,60 @@ def _register_prior_studies(
                 HistoricalStudy(
                     order_id=order.id,
                     unit_id=unit.id,
-                    study_uid=study_uid,
-                    accession=result.accession,
-                    study_date=result.study_date,
-                    modality=result.modality,
-                    body_part=result.body_part,
-                    description=result.description,
+                    study_uid=_bounded_db_text(study_uid, 128),
+                    accession=_bounded_db_text(result.accession, 64),
+                    study_date=_bounded_db_text(result.study_date, 16),
+                    modality=_bounded_db_text(result.modality, 32),
+                    body_part=_bounded_db_text(result.body_part, 64),
+                    description=_bounded_db_text(result.description, 255),
                 )
             )
             continue
-        study.accession = result.accession or study.accession
-        study.study_date = result.study_date or study.study_date
-        study.modality = result.modality or study.modality
-        study.body_part = result.body_part or study.body_part
-        study.description = result.description or study.description
+        study.accession = _bounded_db_text(result.accession, 64) or study.accession
+        study.study_date = _bounded_db_text(result.study_date, 16) or study.study_date
+        study.modality = _bounded_db_text(result.modality, 32) or study.modality
+        study.body_part = _bounded_db_text(result.body_part, 64) or study.body_part
+        study.description = (
+            _bounded_db_text(result.description, 255) or study.description
+        )
     db.flush()
     return valid_series
+
+
+def _register_prior_series(
+    db: Session,
+    unit: Unit,
+    order: Order,
+    series_results: tuple[PriorSeriesResult, ...],
+) -> list[HistoricalSeries]:
+    """Create idempotent per-series checkpoints and return unfinished jobs."""
+    unique_results = {result.series_uid: result for result in series_results}
+    existing = {
+        series.series_uid: series
+        for series in db.scalars(
+            select(HistoricalSeries).where(HistoricalSeries.order_id == order.id)
+        )
+    }
+    for series_uid, result in unique_results.items():
+        if series_uid in existing:
+            continue
+        series = HistoricalSeries(
+            order_id=order.id,
+            unit_id=unit.id,
+            study_uid=_bounded_db_text(result.study_uid, 128),
+            series_uid=_bounded_db_text(series_uid, 128),
+        )
+        db.add(series)
+        existing[series_uid] = series
+    db.flush()
+    return [series for series in existing.values() if series.status != "done"]
+
+
+def _append_diagnostic(parts: list[str], label: str, output: str) -> None:
+    """Keep useful command tails without retaining unbounded PACS output in RAM."""
+    parts.append(f"{label}:\n{output[-4000:]}")
+    while len(parts) > 1 and sum(map(len, parts)) > 20_000:
+        parts.pop(0)
 
 
 def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
@@ -1040,7 +1352,7 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
             )
         except ToolMissing as exc:
             code, output = 127, str(exc)
-        outputs.append(f"C-FIND histórico:\n{output}")
+        _append_diagnostic(outputs, "C-FIND histórico", output)
         discovered_studies = 0
         discovered_series = 0
         if code == 0:
@@ -1058,32 +1370,62 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
                 discovered_studies = len(
                     {result.study_uid for result in valid_series}
                 )
-                # Torna os UIDs visíveis na página enquanto os C-MOVEs executam.
+                series_jobs = _register_prior_series(db, unit, order, valid_series)
+                all_series = list(
+                    db.scalars(
+                        select(HistoricalSeries).where(
+                            HistoricalSeries.order_id == order.id
+                        )
+                    )
+                )
+                discovered_series = len(all_series)
+                discovered_studies = len(
+                    {series.study_uid for series in all_series}
+                )
+                # Torna os UIDs e checkpoints visíveis enquanto os C-MOVEs executam.
                 db.commit()
                 operation = "C-MOVE histórico"
-                for result in valid_series:
+                for series_job in series_jobs:
                     remaining = int(deadline - monotonic())
                     if remaining <= 0:
                         code = 124
-                        outputs.append("C-MOVE histórico: TIMEOUT global")
+                        _append_diagnostic(
+                            outputs, "C-MOVE histórico", "TIMEOUT global"
+                        )
                         break
+                    series_job.status = "running"
+                    series_job.attempts += 1
+                    series_job.last_error = ""
+                    db.commit()
                     try:
                         move_code, move_output = c_move_prior_series(
                             unit.calling_aet,
                             unit.pacs_aet,
                             unit.pacs_ip,
                             unit.pacs_port,
-                            result.study_uid,
-                            result.series_uid,
+                            series_job.study_uid,
+                            series_job.series_uid,
                             remaining,
                         )
                     except ToolMissing as exc:
                         move_code, move_output = 127, str(exc)
-                    outputs.append(
+                    except OSError as exc:
+                        move_code, move_output = 126, str(exc)
+                    _append_diagnostic(
+                        outputs,
                         "C-MOVE histórico "
-                        f"StudyUID={result.study_uid} SeriesUID={result.series_uid}:\n"
-                        f"{move_output}"
+                        f"StudyUID={series_job.study_uid} "
+                        f"SeriesUID={series_job.series_uid}",
+                        move_output,
                     )
+                    if move_code == 0:
+                        series_job.status = "done"
+                        series_job.completed_at = datetime.now()
+                        series_job.last_error = ""
+                    else:
+                        series_job.status = "error"
+                        series_job.last_error = f"C-MOVE exit {move_code}"
+                    db.commit()
                     if move_code != 0 and code == 0:
                         code = move_code
         safe_output = redact_dicom_output("\n\n".join(outputs))
@@ -1166,6 +1508,7 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
             order_id=order.id,
             unit_id=unit.id,
             retrieve_number=2 if second else 1,
+            attempt=order.attempts,
         )
         try:
             code, output = c_move(
@@ -1193,6 +1536,8 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
                 unit_id=unit.id,
             )
             return
+        except OSError as exc:
+            code, output = 126, str(exc)
         safe_output = redact_dicom_output(output)
         if code == 0:
             if second or order.second_retrieve_at is None:
@@ -1201,6 +1546,8 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
                 add_event(db, order, f"{label} C-MOVE concluído", safe_output)
             else:
                 order.status = "wait_second"
+                # As tentativas são limitadas separadamente para cada retrieve.
+                order.attempts = 0
                 add_event(
                     db,
                     order,
@@ -1211,17 +1558,16 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
             event_level = logging.INFO
             event_status = "success"
         else:
-            order.status = "error"
-            order.last_error = f"C-MOVE exit {code}"
-            add_event(
+            retrying = _schedule_current_move_retry(
                 db,
                 order,
-                f"{label} C-MOVE falhou (exit {code})",
-                safe_output,
-                "error",
+                second=second,
+                now=datetime.now(),
+                error_message=f"C-MOVE exit {code}",
+                event_detail=safe_output,
             )
-            event_level = logging.ERROR
-            event_status = "failure"
+            event_level = logging.WARNING if retrying else logging.ERROR
+            event_status = "retry" if retrying else "failure"
         order.heartbeat_at = datetime.now()
         db.commit()
         log_event(
@@ -1249,17 +1595,21 @@ def _settled_files(
     )
     paths: list[Path] = []
     errors: list[tuple[Path, OSError]] = []
-    for path in directory.iterdir():
-        if path.name.startswith("."):
-            continue
-        try:
-            if (
-                path.is_file()
-                and current_timestamp - path.stat().st_mtime >= settle_seconds
-            ):
-                paths.append(path)
-        except OSError as exc:
-            errors.append((path, exc))
+    try:
+        entries = directory.iterdir()
+        for path in entries:
+            if path.name.startswith("."):
+                continue
+            try:
+                if (
+                    path.is_file()
+                    and current_timestamp - path.stat().st_mtime >= settle_seconds
+                ):
+                    paths.append(path)
+            except OSError as exc:
+                errors.append((path, exc))
+    except OSError as exc:
+        errors.append((directory, exc))
     return paths, errors
 
 
@@ -1269,10 +1619,11 @@ def compact_unit(db: Session, unit: Unit) -> None:
     error_dir = Path(unit.error_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     error_dir.mkdir(parents=True, exist_ok=True)
-    drops = drop_codes(db)
+    drops, compress_map = compression_runtime_settings(db, unit.id)
     dicom_rules = load_rule_specs(db, unit.id)
     settle = unit.file_settle_seconds
-    jobs, inspection_errors = _settled_files(origin, settle)
+    settled_jobs, inspection_errors = _settled_files(origin, settle)
+    jobs = sorted(settled_jobs, key=lambda path: path.name)[:COMPACT_BATCH_SIZE]
     for _path, exc in inspection_errors:
         log_event(
             log,
@@ -1297,12 +1648,11 @@ def compact_unit(db: Session, unit: Unit) -> None:
             unit_id=unit.id,
             file_count=len(jobs),
         )
-    compress_map = {}
-    for row in db.scalars(select(CompressRule)):
-        compress_map[row.modality.upper()] = row.jpeg_flag
     workers = max(1, unit.compact_workers or 8)
+    processed_count = 0
+    failed_count = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [
+        futs = {
             pool.submit(
                 _compact_one,
                 str(p),
@@ -1312,23 +1662,64 @@ def compact_unit(db: Session, unit: Unit) -> None:
                 drops,
                 compress_map,
                 dicom_rules,
-            )
+            ): p
             for p in jobs
-        ]
+        }
         for future in as_completed(futs):
-            result = future.result()
-            _record_compact_result(db, unit, result)
-    db.commit()
+            try:
+                result = future.result()
+            except Exception as exc:
+                failed_count += 1
+                log_event(
+                    log,
+                    logging.ERROR,
+                    "dicom.compact.file",
+                    resource=f"unit:{unit.id}",
+                    status="failure",
+                    error=exc,
+                    error_detail=safe_error_detail(exc),
+                    unit_id=unit.id,
+                    filename=futs[future].name,
+                )
+                continue
+            for persist_attempt in range(1, 4):
+                try:
+                    _record_compact_result(db, unit, result)
+                    db.commit()
+                    processed_count += 1
+                    if result.error_type:
+                        failed_count += 1
+                    break
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    exhausted = persist_attempt == 3
+                    log_event(
+                        log,
+                        logging.ERROR if exhausted else logging.WARNING,
+                        "dicom.compact.persist",
+                        resource=f"unit:{unit.id}",
+                        status="failure" if exhausted else "retry",
+                        error=exc,
+                        error_detail=safe_error_detail(exc),
+                        unit_id=unit.id,
+                        filename=result.output_name or result.source_name,
+                        attempt=persist_attempt,
+                    )
+                    if exhausted:
+                        failed_count += 1
     with log_context(batch_correlation):
         log_event(
             log,
             logging.INFO,
             "dicom.compact.batch",
             resource=f"unit:{unit.id}",
-            status="success",
+            status="partial" if failed_count else "success",
             started_at=started_at,
             unit_id=unit.id,
             file_count=len(jobs),
+            processed_count=processed_count,
+            failed_count=failed_count,
+            remaining_count=max(0, len(settled_jobs) - len(jobs)),
         )
 
 
@@ -1465,16 +1856,20 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         transfer = ImageTransfer(
             unit_id=unit.id,
             order_id=order.id if order else None,
-            filename=result.output_name or result.source_name,
+            filename=_bounded_db_text(
+                result.output_name or result.source_name, 500
+            ),
             correlation_id=correlation_id,
-            study_uid=result.study_uid,
+            study_uid=_bounded_db_text(result.study_uid, 128),
         )
         db.add(transfer)
         db.flush()
     else:
         transfer.order_id = order.id if order else transfer.order_id
         transfer.correlation_id = correlation_id
-        transfer.study_uid = result.study_uid or transfer.study_uid
+        transfer.study_uid = (
+            _bounded_db_text(result.study_uid, 128) or transfer.study_uid
+        )
         transfer.attempts = 0
         transfer.next_attempt_at = None
         transfer.last_http_status = None
@@ -1496,7 +1891,13 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         for match in result.rule_matches
     )
     _associate_historical_transfer(db, unit, result, transfer)
-    level = logging.ERROR if result.error_type else logging.INFO
+    level = (
+        logging.ERROR
+        if result.error_type
+        else logging.DEBUG
+        if result.status == "compressed"
+        else logging.INFO
+    )
     with log_context(correlation_id):
         log_event(
             log,
@@ -1584,12 +1985,12 @@ def _associate_historical_transfer(
             study = HistoricalStudy(
                 order_id=order.id,
                 unit_id=unit.id,
-                study_uid=result.study_uid,
-                accession=result.accession,
-                study_date=result.study_date,
-                modality=result.modality,
-                body_part=result.body_part,
-                description=result.description,
+                study_uid=_bounded_db_text(result.study_uid, 128),
+                accession=_bounded_db_text(result.accession, 64),
+                study_date=_bounded_db_text(result.study_date, 16),
+                modality=_bounded_db_text(result.modality, 32),
+                body_part=_bounded_db_text(result.body_part, 64),
+                description=_bounded_db_text(result.description, 255),
             )
             db.add(study)
             db.flush()
@@ -1602,11 +2003,13 @@ def _link_historical_transfer(
     transfer: ImageTransfer,
     result: CompactResult,
 ) -> None:
-    study.accession = study.accession or result.accession
-    study.study_date = study.study_date or result.study_date
-    study.modality = study.modality or result.modality
-    study.body_part = study.body_part or result.body_part
-    study.description = study.description or result.description
+    study.accession = study.accession or _bounded_db_text(result.accession, 64)
+    study.study_date = study.study_date or _bounded_db_text(result.study_date, 16)
+    study.modality = study.modality or _bounded_db_text(result.modality, 32)
+    study.body_part = study.body_part or _bounded_db_text(result.body_part, 64)
+    study.description = study.description or _bounded_db_text(
+        result.description, 255
+    )
     link = db.scalar(
         select(HistoricalImageLink).where(
             HistoricalImageLink.historical_study_id == study.id,
@@ -1626,14 +2029,28 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
     origin = Path(unit.send_dir)
     if not cloud_url:
         return
-    circuit = _cloud_circuits.setdefault(cloud_url, CircuitState())
+    # Uma indisponibilidade em uma unidade não deve abrir o circuito das demais,
+    # mesmo quando elas usam o mesmo endpoint de nuvem.
+    circuit = _cloud_circuits.setdefault(unit.id, CircuitState())
     current_time = datetime.now()
     if circuit.open_until and current_time < circuit.open_until:
         return
 
-    settled, _inspection_errors = _settled_files(
+    settled, inspection_errors = _settled_files(
         origin, settle, timestamp=current_time.timestamp()
     )
+    for path, exc in inspection_errors:
+        log_event(
+            log,
+            logging.ERROR,
+            "cloud.file.inspect",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error=exc,
+            error_detail=safe_error_detail(exc),
+            unit_id=unit.id,
+            path_name=path.name,
+        )
     paths = {path.name: path for path in settled}
     if not paths:
         return
@@ -1647,6 +2064,26 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
             )
         )
     }
+    # Confirmações remotas já persistidas vencem sobre sobras locais. Isso cobre
+    # falha ao apagar o arquivo depois do commit sem provocar reenvio duplicado.
+    for filename, transfer in list(existing.items()):
+        if transfer.status != "uploaded":
+            continue
+        try:
+            paths[filename].unlink(missing_ok=True)
+            paths.pop(filename, None)
+        except OSError as exc:
+            log_event(
+                log,
+                logging.WARNING,
+                "cloud.upload.cleanup",
+                resource=f"transfer:{transfer.id}",
+                status="retry",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                transfer_id=transfer.id,
+                unit_id=unit.id,
+            )
     for filename in paths:
         if filename not in existing:
             transfer = ImageTransfer(
@@ -1671,8 +2108,31 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
         db.commit()
         return
     workers = max(1, unit.send_workers or 16)
+    started_at = perf_counter()
+    log_event(
+        log,
+        logging.INFO,
+        "cloud.upload.batch",
+        resource=f"unit:{unit.id}",
+        status="started",
+        unit_id=unit.id,
+        file_count=len(jobs),
+    )
     results = asyncio.run(_send_all(jobs, cloud_url, workers))
     _record_send_results(db, unit, results, circuit)
+    failure_count = sum(not result.success for result in results)
+    log_event(
+        log,
+        logging.WARNING if failure_count else logging.INFO,
+        "cloud.upload.batch",
+        resource=f"unit:{unit.id}",
+        status="partial" if failure_count else "success",
+        started_at=started_at,
+        unit_id=unit.id,
+        file_count=len(results),
+        success_count=len(results) - failure_count,
+        failure_count=failure_count,
+    )
 
 
 async def _send_all(
@@ -1705,7 +2165,7 @@ async def _send_one(
         with log_context(correlation_id):
             log_event(
                 log,
-                logging.INFO,
+                logging.DEBUG,
                 "cloud.upload",
                 resource=f"transfer:{transfer_id}",
                 status="started",
@@ -1726,8 +2186,6 @@ async def _send_one(
                     headers={"X-Request-ID": correlation_id},
                 ) as response:
                     success = response.status == 200
-                    if success:
-                        path.unlink(missing_ok=True)
                     return SendResult(
                         transfer_id,
                         correlation_id,
@@ -1754,46 +2212,74 @@ def _record_send_results(
 ) -> None:
     now = datetime.now()
     failures = 0
+    successful_filenames: list[tuple[int, str]] = []
     for result in results:
-        transfer = db.get(ImageTransfer, result.transfer_id)
-        if transfer is None:
-            continue
-        transfer.attempts += 1
-        transfer.last_http_status = result.http_status
-        transfer.last_error = result.error_type
-        if result.success:
-            transfer.status = "uploaded"
-            transfer.next_attempt_at = None
-            level = logging.INFO
-            status = "success"
-        else:
+        persisted = False
+        for persist_attempt in range(1, 4):
+            try:
+                transfer = db.get(ImageTransfer, result.transfer_id)
+                if transfer is None:
+                    persisted = True
+                    break
+                transfer.attempts += 1
+                transfer.last_http_status = result.http_status
+                transfer.last_error = _bounded_db_text(result.error_type, 500)
+                if result.success:
+                    transfer.status = "uploaded"
+                    transfer.next_attempt_at = None
+                    level = logging.DEBUG
+                    status = "success"
+                else:
+                    transfer.status = "upload_error"
+                    delay = min(
+                        SEND_RETRY_MAX_SECONDS,
+                        SEND_RETRY_BASE_SECONDS
+                        * (2 ** min(transfer.attempts - 1, 10)),
+                    )
+                    transfer.next_attempt_at = now + timedelta(seconds=delay)
+                    level = logging.WARNING
+                    status = "retry"
+                db.commit()
+                persisted = True
+                with log_context(result.correlation_id):
+                    log_event(
+                        log,
+                        level,
+                        "cloud.upload",
+                        resource=f"transfer:{transfer.id}",
+                        status=status,
+                        error_type=result.error_type or None,
+                        transfer_id=transfer.id,
+                        order_id=transfer.order_id,
+                        unit_id=unit.id,
+                        attempt=transfer.attempts,
+                        http_status=result.http_status,
+                        duration_ms=result.duration_ms,
+                    )
+                if result.success:
+                    successful_filenames.append((transfer.id, transfer.filename))
+                break
+            except SQLAlchemyError as exc:
+                db.rollback()
+                exhausted = persist_attempt == 3
+                log_event(
+                    log,
+                    logging.ERROR if exhausted else logging.WARNING,
+                    "cloud.upload.persist",
+                    resource=f"transfer:{result.transfer_id}",
+                    status="failure" if exhausted else "retry",
+                    error=exc,
+                    error_detail=safe_error_detail(exc),
+                    transfer_id=result.transfer_id,
+                    unit_id=unit.id,
+                    attempt=persist_attempt,
+                )
+        if not persisted or not result.success:
             failures += 1
-            transfer.status = "upload_error"
-            delay = min(
-                SEND_RETRY_MAX_SECONDS,
-                SEND_RETRY_BASE_SECONDS * (2 ** min(transfer.attempts - 1, 10)),
-            )
-            transfer.next_attempt_at = now + timedelta(seconds=delay)
-            level = logging.WARNING
-            status = "retry"
-        with log_context(result.correlation_id):
-            log_event(
-                log,
-                level,
-                "cloud.upload",
-                resource=f"transfer:{transfer.id}",
-                status=status,
-                error_type=result.error_type or None,
-                transfer_id=transfer.id,
-                order_id=transfer.order_id,
-                unit_id=unit.id,
-                attempt=transfer.attempts,
-                http_status=result.http_status,
-                duration_ms=result.duration_ms,
-            )
 
     if failures == len(results):
-        circuit.failures += failures
+        # Conte falhas consecutivas de lote, não cada imagem do mesmo incidente.
+        circuit.failures += 1
         if circuit.failures >= CIRCUIT_BREAKER_FAILURES:
             circuit.open_until = now + timedelta(seconds=CIRCUIT_BREAKER_SECONDS)
             log_event(
@@ -1808,7 +2294,21 @@ def _record_send_results(
     else:
         circuit.failures = 0
         circuit.open_until = None
-    db.commit()
+    for transfer_id, filename in successful_filenames:
+        try:
+            (Path(unit.send_dir) / filename).unlink(missing_ok=True)
+        except OSError as exc:
+            log_event(
+                log,
+                logging.WARNING,
+                "cloud.upload.cleanup",
+                resource=f"transfer:{transfer_id}",
+                status="retry",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                transfer_id=transfer_id,
+                unit_id=unit.id,
+            )
 
 
 def folder_counts(unit: Unit) -> dict[str, int]:

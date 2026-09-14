@@ -1,35 +1,59 @@
 {% from "icons.html" import icon %}
 {% if pager and pager.total %}
 <nav class="pager" aria-label="Paginação">
-  {% if pager.cursor %}
-  <span>Exibindo {{ pager.count }} de {{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
-  <div class="pager__controls">
-    {% if pager.has_prev %}
-      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}after={{ pager.prev_cursor }}" rel="prev" aria-label="Página anterior">{{ icon("chevron-left") }} <span>Mais recentes</span></a>
-    {% else %}
-      <span class="pager__link is-disabled" aria-disabled="true">{{ icon("chevron-left") }} <span>Mais recentes</span></span>
-    {% endif %}
-    {% if pager.has_next %}
-      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}before={{ pager.next_cursor }}" rel="next" aria-label="Próxima página"><span>Mais antigos</span> {{ icon("chevron-right") }}</a>
-    {% else %}
-      <span class="pager__link is-disabled" aria-disabled="true"><span>Mais antigos</span> {{ icon("chevron-right") }}</span>
-    {% endif %}
-  </div>
-  {% else %}
-  <span>Exibindo {{ pager.from }}–{{ pager.to }} de {{ pager.total }}</span>
-  <div class="pager__controls">
-    {% if pager.has_prev %}
-      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}page={{ pager.prev }}" rel="prev" aria-label="Página anterior">{{ icon("chevron-left") }} <span>Anterior</span></a>
-    {% else %}
-      <span class="pager__link is-disabled" aria-disabled="true">{{ icon("chevron-left") }} <span>Anterior</span></span>
-    {% endif %}
-    <span class="pager__current" aria-current="page">{{ pager.page }} de {{ pager.pages }}</span>
-    {% if pager.has_next %}
-      <a class="pager__link" href="?{{ qs }}{% if qs %}&{% endif %}page={{ pager.next }}" rel="next" aria-label="Próxima página"><span>Próxima</span> {{ icon("chevron-right") }}</a>
-    {% else %}
-      <span class="pager__link is-disabled" aria-disabled="true"><span>Próxima</span> {{ icon("chevron-right") }}</span>
+  <div class="pager__summary">
+    <span>Exibindo {{ pager.from }}–{{ pager.to }} de {{ pager.total }} | Página {{ pager.page }} de {{ pager.pages }}</span>
+    {% if pager.size_options %}
+    <form class="pager__size" method="get" action="{{ request.url.path }}">
+      {% for name, value in pager.keep.items() %}
+        {% if value not in (none, '') %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endif %}
+      {% endfor %}
+      <label for="page-size-{{ nav }}">Itens por página</label>
+      <select id="page-size-{{ nav }}" name="page_size" onchange="this.form.submit()">
+        {% for option in pager.size_options %}<option value="{{ option }}"{% if pager.size == option %} selected{% endif %}>{{ option }}</option>{% endfor %}
+      </select>
+      <noscript><button class="btn btn--quiet" type="submit">Aplicar</button></noscript>
+    </form>
     {% endif %}
   </div>
-  {% endif %}
+  <div class="pager__controls">
+    {% if pager.has_prev %}
+      <a class="pager__link pager__link--icon" href="?{{ qs }}{% if qs %}&amp;{% endif %}page=1" aria-label="Primeira página">{{ icon("chevrons-left") }}</a>
+      <a class="pager__link pager__link--icon" href="?{{ qs }}{% if qs %}&amp;{% endif %}{% if pager.cursor %}after={{ pager.prev_cursor }}&amp;{% endif %}page={{ pager.prev }}" rel="prev" aria-label="Página anterior">{{ icon("chevron-left") }}</a>
+    {% else %}
+      <span class="pager__link pager__link--icon is-disabled" aria-disabled="true" aria-label="Primeira página">{{ icon("chevrons-left") }}</span>
+      <span class="pager__link pager__link--icon is-disabled" aria-disabled="true" aria-label="Página anterior">{{ icon("chevron-left") }}</span>
+    {% endif %}
+
+    {% if pager.cursor %}
+      {% for item in pager.page_links %}
+        {% if item is none %}
+          <span class="pager__ellipsis" aria-hidden="true">…</span>
+        {% elif item.current %}
+          <span class="pager__current" aria-current="page" aria-label="Página {{ item.page }}">{{ item.page }}</span>
+        {% else %}
+          <a class="pager__link" href="?{{ qs }}{% if qs %}&amp;{% endif %}{{ item.query }}" aria-label="Ir para a página {{ item.page }}">{{ item.page }}</a>
+        {% endif %}
+      {% endfor %}
+    {% else %}
+      {% for item in pager.page_items %}
+        {% if item is none %}
+          <span class="pager__ellipsis" aria-hidden="true">…</span>
+        {% elif item == pager.page %}
+          <span class="pager__current" aria-current="page" aria-label="Página {{ item }}">{{ item }}</span>
+        {% else %}
+          <a class="pager__link" href="?{{ qs }}{% if qs %}&amp;{% endif %}page={{ item }}" aria-label="Ir para a página {{ item }}">{{ item }}</a>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+
+    {% if pager.has_next %}
+      <a class="pager__link pager__link--icon" href="?{{ qs }}{% if qs %}&amp;{% endif %}{% if pager.cursor %}before={{ pager.next_cursor }}&amp;{% endif %}page={{ pager.next }}" rel="next" aria-label="Próxima página">{{ icon("chevron-right") }}</a>
+      <a class="pager__link pager__link--icon" href="?{{ qs }}{% if qs %}&amp;{% endif %}{% if pager.cursor %}last=1&amp;{% endif %}page={{ pager.pages }}" aria-label="Última página">{{ icon("chevrons-right") }}</a>
+    {% else %}
+      <span class="pager__link pager__link--icon is-disabled" aria-disabled="true" aria-label="Próxima página">{{ icon("chevron-right") }}</span>
+      <span class="pager__link pager__link--icon is-disabled" aria-disabled="true" aria-label="Última página">{{ icon("chevrons-right") }}</span>
+    {% endif %}
+  </div>
 </nav>
 {% endif %}

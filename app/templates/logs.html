@@ -18,6 +18,7 @@
   </section>
 
   <form class="surface filter-bar logs-filter" method="get" action="/logs" aria-label="Filtros dos logs">
+    <input type="hidden" name="page_size" value="{{ pager.size }}">
     <div class="filter-grid">
       <div class="field">
         <label for="filter-resource">Recurso</label>

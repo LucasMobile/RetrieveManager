@@ -38,6 +38,16 @@ class OrdersApiParsingTest(unittest.TestCase):
         with self.assertRaises(InvalidApiOrder):
             parse_api_order({**valid, "examDate": "2026-04-23"})
 
+    def test_rejects_identifiers_that_do_not_fit_database_contract(self):
+        payload = {
+            "patientId": "1" * 65,
+            "accessionNumber": "2",
+            "examDate": "04/23/2026 10:49:23",
+            "patientBirthdate": "11/04/1955 00:00:00",
+        }
+        with self.assertRaisesRegex(InvalidApiOrder, "patientId excede"):
+            parse_api_order(payload)
+
 
 class OrdersApiIngestionTest(DatabaseTestCase):
     def setUp(self):

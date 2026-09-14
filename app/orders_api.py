@@ -37,11 +37,19 @@ class AckResult:
     error: str = ""
 
 
-def _required_text(item: dict[str, Any], key: str) -> str:
+def _required_text(item: dict[str, Any], key: str, max_length: int) -> str:
     value = item.get(key)
-    text = str(value).replace("\xa0", " ").strip() if value is not None else ""
+    text = (
+        str(value).replace("\xa0", " ").replace("\x00", " ").strip()
+        if value is not None
+        else ""
+    )
     if not text:
         raise InvalidApiOrder(f"campo obrigatório ausente: {key}")
+    if len(text) > max_length:
+        raise InvalidApiOrder(
+            f"{key} excede o limite de {max_length} caracteres"
+        )
     return text
 
 
@@ -57,12 +65,15 @@ def _dicom_date(value: str, field: str) -> str:
 def parse_api_order(item: dict[str, Any]) -> ApiOrder:
     if not isinstance(item, dict):
         raise InvalidApiOrder("pedido não é um objeto JSON")
-    birthdate = _required_text(item, "patientBirthdate")
-    exam_date = _required_text(item, "examDate")
+    birthdate = _required_text(item, "patientBirthdate", 32)
+    exam_date = _required_text(item, "examDate", 32)
+    source_id = str(item.get("_id") or "").replace("\x00", " ").strip()
+    if len(source_id) > 64:
+        raise InvalidApiOrder("_id excede o limite de 64 caracteres")
     return ApiOrder(
-        source_id=str(item.get("_id") or "").strip(),
-        patient_id=_required_text(item, "patientId"),
-        accession_number=_required_text(item, "accessionNumber"),
+        source_id=source_id,
+        patient_id=_required_text(item, "patientId", 64),
+        accession_number=_required_text(item, "accessionNumber", 64),
         patient_birthdate=_dicom_date(birthdate, "patientBirthdate"),
         exam_date=_dicom_date(exam_date, "examDate"),
     )

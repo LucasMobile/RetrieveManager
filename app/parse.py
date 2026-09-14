@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 
 from app.config import KNOWN_MODALITIES
@@ -41,6 +42,76 @@ def parse_findscu_output(output: str) -> tuple[str, str, str, str]:
 def parse_series_body_part(output: str) -> str:
     """Return the first non-empty BodyPartExamined across all SERIES responses."""
     return _first_bracket(output, "BodyPartExamined")
+
+
+def first_allowed_modality(
+    raw: str, allowed_modalities: set[str] | frozenset[str]
+) -> str:
+    """Return the first exact DICOM modality present in the allowed catalog."""
+    allowed = {value.strip().upper() for value in allowed_modalities if value.strip()}
+    for value in re.split(r"[\\,\s]+", (raw or "").strip().upper()):
+        if value in allowed:
+            return value
+    return ""
+
+
+def parse_series_metadata(
+    output: str, allowed_modalities: set[str] | frozenset[str]
+) -> tuple[str, str]:
+    """Select the first eligible SERIES response and its BodyPartExamined."""
+    current: dict[str, str] | None = None
+    responses: list[tuple[str, str]] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None:
+            responses.append(
+                (current.get("modality", ""), current.get("body_part", ""))
+            )
+        current = None
+
+    for line in (output or "").splitlines():
+        if "Find Response:" in line:
+            flush()
+            current = {} if "Pending" in line else None
+            continue
+        if "Received Final Find Response" in line:
+            flush()
+            continue
+        if current is None:
+            continue
+        if "(0008,0060)" in line:
+            current["modality"] = _bracket_value(line)
+        elif "(0018,0015)" in line:
+            current["body_part"] = _bracket_value(line)
+    flush()
+
+    first_valid: tuple[str, str] | None = None
+    for raw_modality, body_part in responses:
+        modality = first_allowed_modality(raw_modality, allowed_modalities)
+        if not modality:
+            continue
+        candidate = (modality, body_part)
+        if body_part:
+            return candidate
+        if first_valid is None:
+            first_valid = candidate
+    return first_valid or ("", "")
+
+
+def series_response_has_modality(output: str) -> bool:
+    """Whether a pending SERIES response contains a non-empty Modality value."""
+    pending = False
+    for line in (output or "").splitlines():
+        if "Find Response:" in line:
+            pending = "Pending" in line
+            continue
+        if "Received Final Find Response" in line:
+            pending = False
+            continue
+        if pending and "(0008,0060)" in line and _bracket_value(line):
+            return True
+    return False
 
 
 def parse_prior_findscu_output(output: str) -> tuple[PriorSeriesResult, ...]:

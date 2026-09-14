@@ -73,6 +73,38 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             },
         )
 
+    def test_failure_in_one_unit_does_not_block_the_next_unit(self):
+        with self.Session() as db:
+            db.add_all(
+                [
+                    make_unit(name="Unidade com falha", enabled=True),
+                    make_unit(name="Unidade saudável", enabled=True),
+                ]
+            )
+            db.commit()
+
+        def fail_first_unit(_db, unit):
+            if unit.name == "Unidade com falha":
+                raise RuntimeError("falha isolada")
+
+        supervisor = MagicMock()
+        pool = MagicMock()
+        with (
+            patch("app.worker.SessionLocal", self.Session),
+            patch("app.worker.recover_stale_locks"),
+            patch("app.worker.cleanup_unmatched_orders"),
+            patch("app.worker.archive_completed_orders"),
+            patch("app.worker.ingest_unit", side_effect=fail_first_unit),
+            patch("app.worker.find_pending") as find_pending,
+            patch("app.worker.claim_due_moves", return_value=[]),
+            patch("app.worker.compact_unit"),
+            patch("app.worker.send_unit") as send_unit,
+        ):
+            _tick(supervisor, pool)
+
+        self.assertEqual(find_pending.call_count, 2)
+        self.assertEqual(send_unit.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
