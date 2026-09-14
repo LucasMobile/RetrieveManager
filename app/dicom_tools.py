@@ -416,7 +416,10 @@ def _run(cmd: list[str], timeout: int) -> tuple[int, str]:
 
 def redact_dicom_output(output: str) -> str:
     """Remove PHI-bearing DCMTK lines before persisting diagnostic output."""
+    # PostgreSQL text fields reject NUL bytes. Some non-conformant PACS values can
+    # carry DICOM padding through findscu, so remove it before building an event.
+    clean_output = (output or "").replace("\x00", "")
     return "\n".join(
         "[REDACTED]" if _SENSITIVE_DICOM_FIELDS.search(line) else line
-        for line in (output or "").splitlines()
+        for line in clean_output.splitlines()
     )

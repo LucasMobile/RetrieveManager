@@ -3,12 +3,14 @@ from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 from sqlalchemy import select
+from sqlalchemy.exc import DataError
 
 from app.models import HistoricalStudy, ManualMoveRequest, Order, OrderEvent
 from app.pipeline import (
     _find_one,
     _run_prior_move,
     claim_due_moves,
+    find_pending,
     prior_date_range,
     recover_stale_locks,
     run_claimed_move,
@@ -151,6 +153,78 @@ Find Response: 2 (Pending)
 
             series_find.assert_called_once()
             self.assertEqual(order.body_part, "ABDOMEN")
+
+    def test_find_bounds_pacs_metadata_to_postgres_columns(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id,
+                status="watching",
+                study_uid="",
+                modality="",
+                body_part="",
+                prior_status="disabled",
+                prior_due_at=None,
+            )
+            db.add(order)
+            db.commit()
+            output = (
+                "(0020,000d) UI [1.2.3.current] # StudyInstanceUID\n"
+                "(0008,0061) CS [UNKNOWNMODALITY] # ModalitiesInStudy\n"
+                f"(0010,0010) PN [{'P' * 300}] # PatientName\n"
+                f"(0018,0015) CS [{'B' * 100}] # BodyPartExamined\n"
+            )
+
+            with (
+                patch("app.pipeline.c_find", return_value=(0, output)),
+                patch(
+                    "app.pipeline.schedule_from_now",
+                    return_value=("UNKNOWNMODALITY" * 3, datetime.now(), None),
+                ),
+            ):
+                _find_one(db, unit, order, datetime.now())
+
+            self.assertEqual(len(order.modality), 32)
+            self.assertEqual(len(order.patient_name), 255)
+            self.assertEqual(len(order.body_part), 64)
+
+    def test_database_error_in_one_find_does_not_block_the_next_order(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            first = self._order(
+                unit.id,
+                acc="first",
+                status="watching",
+                study_uid="",
+                prior_status="disabled",
+            )
+            second = self._order(
+                unit.id,
+                acc="second",
+                status="watching",
+                study_uid="",
+                prior_status="disabled",
+            )
+            db.add_all([first, second])
+            db.commit()
+            failure = DataError(
+                "INSERT",
+                {},
+                ValueError("value too long for type character varying(64)"),
+                False,
+            )
+
+            with patch("app.pipeline._find_one", side_effect=[failure, None]) as find:
+                find_pending(db, unit)
+
+            self.assertEqual(find.call_count, 2)
+            db.refresh(first)
+            self.assertEqual(first.status, "error")
+            self.assertIn("banco de dados", first.last_error)
 
     def test_prior_is_claimed_before_current_and_holds_its_order(self):
         with self.Session() as db:

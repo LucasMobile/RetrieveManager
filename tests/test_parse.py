@@ -27,6 +27,17 @@ class ParseDicomOutputTest(unittest.TestCase):
         self.assertEqual(name, "SILVA^JOAO")
         self.assertEqual(body_part, "ABDOMEN")
 
+    def test_findscu_removes_postgres_incompatible_nul_padding(self):
+        out = """
+(0020,000d) UI [1.2.3\x00] # StudyInstanceUID
+(0010,0010) PN [PACIENTE\x00^TESTE] # PatientName
+(0018,0015) CS [ABDOMEN\x00] # BodyPartExamined
+"""
+        uid, _mods, name, body_part = parse_findscu_output(out)
+        self.assertEqual(uid, "1.2.3")
+        self.assertEqual(name, "PACIENTE^TESTE")
+        self.assertEqual(body_part, "ABDOMEN")
+
     def test_prior_find_ignores_request_and_parses_each_pending_response(self):
         out = """
 # Dicom-Data-Set

@@ -427,6 +427,8 @@ input[type="checkbox"] { width: 1.125rem; min-height: 1.125rem; accent-color: va
 .action-icon .icon { width: 1.125rem; height: 1.125rem; }
 .action-icon::after { position: absolute; z-index: 20; right: 0; bottom: calc(100% + .4rem); width: max-content; max-width: 13rem; padding: .3rem .5rem; border-radius: var(--radius-sm); background: var(--color-brand-950); color: var(--color-white); content: attr(data-tooltip); font-size: .625rem; font-weight: 650; opacity: 0; pointer-events: none; transform: translateY(.2rem); transition: opacity 120ms ease, transform 120ms ease; }
 .action-icon:hover::after, .action-icon:focus-visible::after { opacity: 1; transform: translateY(0); }
+.action-icon--tooltip-bottom::after { top: calc(100% + .4rem); bottom: auto; transform: translateY(-.2rem); }
+.action-icon--tooltip-bottom:hover::after, .action-icon--tooltip-bottom:focus-visible::after { transform: translateY(0); }
 
 .summary-strip {
   display: grid; overflow: hidden;

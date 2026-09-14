@@ -133,7 +133,7 @@
         {% if user.role == 'admin' and not order.archived_at and order.prior_status in ('done', 'error') %}
         <form class="inline-form" method="post" action="/orders/{{ order.id }}/retry-prior" data-confirm="Executar novamente o retrieve de exames anteriores?" data-confirm-label="Reprocessar histórico">
           {{ csrf_input(request) }}
-          <button class="action-icon order-action-icon" type="submit" aria-label="Reprocessar histórico" data-tooltip="Reprocessar histórico" title="Reprocessar histórico">{{ icon("retry") }}</button>
+          <button class="action-icon action-icon--tooltip-bottom order-action-icon" type="submit" aria-label="Reprocessar histórico" data-tooltip="Reprocessar histórico" title="Reprocessar histórico">{{ icon("retry") }}</button>
         </form>
         {% endif %}
       </div>

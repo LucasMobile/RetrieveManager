@@ -13,6 +13,7 @@ from time import monotonic, perf_counter
 import aiohttp
 import pydicom
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import (
@@ -551,7 +552,38 @@ def find_pending(db: Session, unit: Unit) -> None:
         )
     )
     for order in orders:
-        _find_one(db, unit, order, now)
+        try:
+            _find_one(db, unit, order, now)
+        except SQLAlchemyError as exc:
+            # One malformed PACS response must not poison the whole unit queue.
+            order_id = order.id
+            db.rollback()
+            failed_order = db.get(Order, order_id)
+            if failed_order is not None:
+                failed_order.status = "error"
+                failed_order.last_find_at = now
+                failed_order.heartbeat_at = None
+                failed_order.last_error = (
+                    "Falha ao salvar o resultado do C-FIND no banco de dados"
+                )
+                add_event(
+                    db,
+                    failed_order,
+                    "Resultado do C-FIND rejeitado pelo banco de dados",
+                    level="error",
+                )
+                db.commit()
+            log_event(
+                log,
+                logging.ERROR,
+                "dicom.find.persist",
+                resource=f"order:{order_id}",
+                status="failure",
+                error=exc,
+                error_detail=_database_error_detail(exc),
+                order_id=order_id,
+                unit_id=unit.id,
+            )
 
 
 def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
@@ -639,9 +671,9 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
 
         modality, retrieve_at, second_at = schedule_from_now(db, modalities)
         order.study_uid = study_uid
-        order.modality = modality
-        order.patient_name = patient_name
-        order.body_part = body_part
+        order.modality = modality[:32]
+        order.patient_name = patient_name[:255]
+        order.body_part = body_part[:64]
         order.retrieve_at = retrieve_at
         order.second_retrieve_at = second_at
         order.found_at = now
@@ -686,6 +718,13 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             unit_id=unit.id,
             modality=modality,
         )
+
+
+def _database_error_detail(exc: SQLAlchemyError) -> str:
+    """Return the driver message without SQL text or bound DICOM parameters."""
+    original = getattr(exc, "orig", None)
+    detail = str(original or type(exc).__name__).replace("\x00", " ")
+    return " ".join(detail.splitlines())[:500]
 
 
 def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:

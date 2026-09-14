@@ -145,10 +145,11 @@ class DicomCmdTest(unittest.TestCase):
         self.assertTrue(kwargs["text"])
 
     def test_dicom_output_redacts_phi(self):
-        output = "(0010,0010) PN [SILVA^JOAO] # PatientName\nstatus ok"
+        output = "(0010,0010) PN [SILVA^JOAO] # PatientName\nstatus\x00 ok"
         safe = redact_dicom_output(output)
         self.assertNotIn("SILVA", safe)
         self.assertIn("status ok", safe)
+        self.assertNotIn("\x00", safe)
 
 
 if __name__ == "__main__":

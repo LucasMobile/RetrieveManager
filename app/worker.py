@@ -81,6 +81,7 @@ def main() -> None:
                     resource="worker",
                     status="failure",
                     error=exc,
+                    error_detail=str(getattr(exc, "orig", type(exc).__name__))[:500],
                 )
             stop_event.wait(WORKER_INTERVAL_SECONDS)
     finally:

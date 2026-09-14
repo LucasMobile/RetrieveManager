@@ -98,7 +98,7 @@ def _first_bracket(text: str, tag_name: str) -> str:
             start = line.find("[")
             end = line.find("]", start)
             if start >= 0 and end > start:
-                return line[start + 1 : end].strip()
+                return _clean_dicom_text(line[start + 1 : end])
     return ""
 
 
@@ -107,4 +107,9 @@ def _bracket_value(line: str) -> str:
         return ""
     start = line.find("[")
     end = line.find("]", start)
-    return line[start + 1 : end].strip() if end > start else ""
+    return _clean_dicom_text(line[start + 1 : end]) if end > start else ""
+
+
+def _clean_dicom_text(value: str) -> str:
+    """Remove padding that cannot be persisted in PostgreSQL text columns."""
+    return (value or "").replace("\x00", "").strip()
