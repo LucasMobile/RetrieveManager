@@ -294,6 +294,7 @@ class Order(Base):
         Index("ix_orders_acc", "acc"),
         Index("ix_orders_pat_id", "pat_id"),
         Index("ix_orders_source_id", "source_id"),
+        Index("ix_orders_unit_study_uid", "unit_id", "study_uid"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

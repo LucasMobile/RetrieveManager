@@ -8,12 +8,15 @@ from sqlalchemy import select
 
 from app.dicom_rules import RuleMatch
 from app.models import (
+    AuditLog,
     DicomRule,
     DicomRuleApplication,
     HistoricalImageLink,
     HistoricalStudy,
     ImageTransfer,
+    ModalityRule,
     Order,
+    OrderEvent,
 )
 from app.pipeline import (
     CircuitState,
@@ -26,6 +29,25 @@ from tests.support import DatabaseTestCase, make_unit
 
 
 class TransferTrackingTest(DatabaseTestCase):
+    def _add_retrieve_rules(self, db) -> None:
+        db.add_all(
+            [
+                ModalityRule(
+                    modality="CT",
+                    wait_minutes=15,
+                    second_retrieve=True,
+                    second_wait_minutes=90,
+                ),
+                ModalityRule(
+                    modality="*",
+                    wait_minutes=10,
+                    second_retrieve=False,
+                    second_wait_minutes=90,
+                ),
+            ]
+        )
+        db.flush()
+
     def test_success_is_persisted_before_local_file_cleanup(self):
         with tempfile.TemporaryDirectory() as send_dir, self.Session() as db:
             unit = make_unit(name="unit", send_dir=send_dir)
@@ -231,6 +253,7 @@ class TransferTrackingTest(DatabaseTestCase):
             link = db.scalar(select(HistoricalImageLink))
             self.assertIsNotNone(link)
             self.assertEqual(link.historical_study_id, study.id)
+            self.assertEqual(len(list(db.scalars(select(Order)))), 1)
 
     def test_discovered_historical_study_is_linked_without_metadata_guessing(self):
         with self.Session() as db:
@@ -279,6 +302,313 @@ class TransferTrackingTest(DatabaseTestCase):
             link = db.scalar(select(HistoricalImageLink))
             self.assertIsNotNone(link)
             self.assertEqual(link.historical_study_id, study.id)
+
+    def test_unsolicited_study_creates_one_order_waiting_for_second_retrieve(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit")
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+            observed_at = datetime.now()
+
+            for index in range(2):
+                _record_compact_result(
+                    db,
+                    unit,
+                    CompactResult(
+                        f"image-{index}",
+                        f"image-{index}.dcm",
+                        "1.2.unsolicited",
+                        "compressed",
+                        patient_id="123456",
+                        birth_date="19800102",
+                        study_date="20260915",
+                        accession="ACC-DIRECT",
+                        modality="CT",
+                        body_part="CHEST",
+                        observed_at=observed_at,
+                    ),
+                )
+                db.commit()
+
+            orders = list(db.scalars(select(Order)))
+            self.assertEqual(len(orders), 1)
+            order = orders[0]
+            self.assertEqual(order.status, "wait_second")
+            self.assertIsNone(order.retrieve_at)
+            self.assertIsNotNone(order.second_retrieve_at)
+            self.assertEqual(order.study_uid, "1.2.unsolicited")
+            self.assertEqual(order.acc, "ACC-DIRECT")
+            self.assertEqual(order.pat_id, "123456")
+            self.assertEqual(order.birth_date, "19800102")
+            self.assertEqual(order.exam_date, "20260915")
+            self.assertEqual(order.modality, "CT")
+            self.assertEqual(order.body_part, "CHEST")
+            self.assertEqual(order.api_read_status, "confirmed")
+            self.assertTrue(order.source_id.startswith("storescp:"))
+            self.assertEqual(
+                len(
+                    list(
+                        db.scalars(
+                            select(ImageTransfer).where(
+                                ImageTransfer.order_id == order.id
+                            )
+                        )
+                    )
+                ),
+                2,
+            )
+            self.assertEqual(
+                len(
+                    list(
+                        db.scalars(
+                            select(AuditLog).where(AuditLog.action == "create")
+                        )
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(len(list(db.scalars(select(OrderEvent)))), 1)
+
+    def test_unsolicited_study_respects_rule_without_second_retrieve(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit")
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "image",
+                    "image.dcm",
+                    "1.2.no-second",
+                    "compressed",
+                    patient_id="123456",
+                    birth_date="19800102",
+                    study_date="20260915",
+                    accession="ACC-NO-SECOND",
+                    modality="DX",
+                    observed_at=datetime.now(),
+                ),
+            )
+            db.commit()
+
+            order = db.scalar(select(Order))
+            self.assertEqual(order.status, "done")
+            self.assertIsNone(order.second_retrieve_at)
+            self.assertIsNotNone(order.done_at)
+
+    def test_later_series_fills_missing_body_part_on_received_order(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit")
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+            common = {
+                "study_uid": "1.2.body-part",
+                "status": "compressed",
+                "patient_id": "123456",
+                "birth_date": "19800102",
+                "study_date": "20260915",
+                "accession": "ACC-BODY-PART",
+                "modality": "CT",
+                "observed_at": datetime.now(),
+            }
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult("series-one", "series-one.dcm", body_part="", **common),
+            )
+            db.commit()
+            order = db.scalar(select(Order))
+            self.assertEqual(order.body_part, "")
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "series-two",
+                    "series-two.dcm",
+                    body_part="ABDOMEN",
+                    **common,
+                ),
+            )
+            db.commit()
+
+            db.refresh(order)
+            self.assertEqual(order.body_part, "ABDOMEN")
+
+    def test_received_study_satisfies_watching_order_by_accession(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit", retrieve_prior_enabled=True)
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+            order = Order(
+                unit_id=unit.id,
+                source_id="api-order",
+                acc="ACC-QUEUED",
+                pat_id="123456",
+                birth_date="19800102",
+                status="watching",
+                api_read_status="confirmed",
+            )
+            db.add(order)
+            db.commit()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "image",
+                    "image.dcm",
+                    "1.2.queued",
+                    "compressed",
+                    patient_id="123456",
+                    birth_date="19800102",
+                    study_date="20260915",
+                    accession="ACC-QUEUED",
+                    modality="CT",
+                    observed_at=datetime.now(),
+                ),
+            )
+            db.commit()
+
+            self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+            db.refresh(order)
+            self.assertEqual(order.study_uid, "1.2.queued")
+            self.assertEqual(order.status, "wait_second")
+            self.assertIsNotNone(order.second_retrieve_at)
+            self.assertEqual(order.prior_status, "queued")
+            self.assertIsNotNone(order.prior_due_at)
+
+    def test_archived_order_is_reused_and_restored_by_study_uid(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit")
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+            order = Order(
+                unit_id=unit.id,
+                source_id="old-order",
+                acc="ACC-ARCHIVED",
+                pat_id="123456",
+                birth_date="19800102",
+                status="done",
+                study_uid="1.2.archived",
+                modality="CT",
+                archived_at=datetime.now(),
+                archive_reason="retenção",
+            )
+            db.add(order)
+            db.commit()
+            order_id = order.id
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "image",
+                    "image.dcm",
+                    "1.2.archived",
+                    "compressed",
+                    patient_id="123456",
+                    birth_date="19800102",
+                    study_date="20260915",
+                    accession="ACC-ARCHIVED",
+                    modality="CT",
+                    observed_at=datetime.now(),
+                ),
+            )
+            db.commit()
+
+            self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+            restored = db.get(Order, order_id)
+            self.assertIsNone(restored.archived_at)
+            self.assertEqual(restored.archive_reason, "")
+            self.assertEqual(restored.status, "wait_second")
+            self.assertIsNotNone(restored.second_retrieve_at)
+            audit = db.scalar(select(AuditLog).where(AuditLog.action == "restore"))
+            self.assertIsNotNone(audit)
+
+    def test_invalid_unsolicited_metadata_is_quarantined_without_order(self):
+        with (
+            tempfile.TemporaryDirectory() as send_dir,
+            tempfile.TemporaryDirectory() as error_dir,
+            self.Session() as db,
+        ):
+            unit = make_unit(name="unit", send_dir=send_dir, error_dir=error_dir)
+            db.add(unit)
+            db.flush()
+            path = Path(send_dir) / "invalid.dcm"
+            path.write_bytes(b"DICOM")
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "invalid",
+                    "invalid.dcm",
+                    "1.2.invalid",
+                    "compressed",
+                    patient_id="",
+                    birth_date="19800102",
+                    study_date="20260915",
+                    accession="ACC-INVALID",
+                    modality="CT",
+                    observed_at=datetime.now(),
+                ),
+            )
+            db.commit()
+
+            self.assertIsNone(db.scalar(select(Order)))
+            transfer = db.scalar(select(ImageTransfer))
+            self.assertEqual(transfer.status, "metadata_error")
+            self.assertIn("PatientID", transfer.last_error)
+            self.assertFalse(path.exists())
+            self.assertTrue((Path(error_dir) / "invalid.dcm").exists())
+
+    def test_accession_for_another_study_is_rejected(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit")
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                source_id="existing",
+                acc="ACC-CONFLICT",
+                pat_id="123456",
+                birth_date="19800102",
+                status="done",
+                study_uid="1.2.existing",
+            )
+            db.add(order)
+            db.commit()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "image",
+                    "image.dcm",
+                    "1.2.different",
+                    "compressed",
+                    patient_id="123456",
+                    birth_date="19800102",
+                    accession="ACC-CONFLICT",
+                    modality="CT",
+                    observed_at=datetime.now(),
+                ),
+            )
+            db.commit()
+
+            self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+            transfer = db.scalar(select(ImageTransfer))
+            self.assertEqual(transfer.status, "metadata_error")
+            self.assertIsNone(transfer.order_id)
 
     def test_applied_dicom_rule_is_audited_on_transfer(self):
         with self.Session() as db:

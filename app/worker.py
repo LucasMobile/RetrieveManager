@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import logging
 import signal
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event
 from time import perf_counter
 
 from sqlalchemy import select
 
-from app.config import WORKER_HEALTH_FILE, WORKER_INTERVAL_SECONDS
+from app.config import (
+    ORDERS_API_ACK_UNIT_WORKERS,
+    WORKER_HEALTH_FILE,
+    WORKER_INTERVAL_SECONDS,
+)
 from app.db import SessionLocal, init_db
 from app.models import Unit
 from app.observability import configure_logging, log_event, safe_error_detail
 from app.pipeline import (
+    acknowledge_pending_orders,
     archive_completed_orders,
     claim_due_moves,
     cleanup_unmatched_orders,
@@ -90,13 +95,68 @@ def _move_job(resource_id: int, kind: str) -> None:
             )
 
 
+def _ack_job(unit_id: int) -> None:
+    """Run one bounded ACK batch without occupying the worker's main loop."""
+    with SessionLocal() as db:
+        unit = db.get(Unit, unit_id)
+        if unit is None or unit.deleted_at is not None or not unit.enabled:
+            return
+        try:
+            acknowledge_pending_orders(db, unit)
+        except Exception as exc:
+            db.rollback()
+            log_event(
+                log,
+                logging.ERROR,
+                "worker.stage",
+                resource=f"unit:{unit_id}",
+                status="failure",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                stage="orders.ack",
+                unit_id=unit_id,
+            )
+
+
+def _schedule_ack_job(
+    pool: ThreadPoolExecutor,
+    jobs: dict[int, Future],
+    unit_id: int,
+) -> None:
+    existing = jobs.get(unit_id)
+    if existing is not None and not existing.done():
+        return
+    if existing is not None:
+        # _ack_job contains its own errors, but consuming the result also keeps
+        # unexpected executor failures observable and releases references.
+        try:
+            existing.result()
+        except Exception as exc:
+            log_event(
+                log,
+                logging.ERROR,
+                "orders.api.ack.job",
+                resource=f"unit:{unit_id}",
+                status="failure",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                unit_id=unit_id,
+            )
+    jobs[unit_id] = pool.submit(_ack_job, unit_id)
+
+
 def main() -> None:
     configure_logging()
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     init_db()
     supervisor = StoreSupervisor()
-    pool = ThreadPoolExecutor(max_workers=16)
+    pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="dicom-move")
+    ack_pool = ThreadPoolExecutor(
+        max_workers=ORDERS_API_ACK_UNIT_WORKERS,
+        thread_name_prefix="orders-ack",
+    )
+    ack_jobs: dict[int, Future] = {}
     with SessionLocal() as db:
         units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))
         log_event(
@@ -114,7 +174,7 @@ def main() -> None:
             # legítima (por exemplo, compactação) ocupa vários segundos.
             _touch_health()
             try:
-                _tick(supervisor, pool)
+                _tick(supervisor, pool, ack_pool, ack_jobs)
                 _touch_health()
             except Exception as exc:
                 log_event(
@@ -130,6 +190,7 @@ def main() -> None:
     finally:
         supervisor.stop_all()
         pool.shutdown(wait=False)
+        ack_pool.shutdown(wait=False, cancel_futures=True)
         try:
             WORKER_HEALTH_FILE.unlink(missing_ok=True)
         except OSError as exc:
@@ -151,7 +212,12 @@ def main() -> None:
         )
 
 
-def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
+def _tick(
+    supervisor: StoreSupervisor,
+    pool: ThreadPoolExecutor,
+    ack_pool: ThreadPoolExecutor | None = None,
+    ack_jobs: dict[int, Future] | None = None,
+) -> None:
     _run_db_stage("locks.recover", recover_stale_locks)
     _run_db_stage("orders.cleanup_unmatched", cleanup_unmatched_orders)
     _run_db_stage("orders.archive_completed", archive_completed_orders)
@@ -173,8 +239,15 @@ def _tick(supervisor: StoreSupervisor, pool: ThreadPoolExecutor) -> None:
                 stage="storescp.reconcile",
             )
 
+    ack_executor = ack_pool or pool
+    active_ack_jobs = ack_jobs if ack_jobs is not None else {}
     for unit_id in unit_ids:
         _run_unit_stage(unit_id, "orders.ingest", ingest_unit)
+        _schedule_ack_job(
+            ack_executor,
+            active_ack_jobs,
+            unit_id,
+        )
         _run_unit_stage(unit_id, "dicom.find.batch", find_pending)
         claims = _run_unit_stage(unit_id, "dicom.move.claim", claim_due_moves) or []
         for resource_id, kind in claims:

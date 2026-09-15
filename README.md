@@ -14,7 +14,9 @@ Cada hospital vira uma **unidade** cadastrada na tela. A lista começa vazia.
 6. Espera 15 min (CT/MR) ou 10 min (resto) e faz o C-MOVE do exame atual pelo Study UID
 7. CT/MR têm um 2º C-MOVE ~90 min depois
 8. Sobe `storescp` na porta/AET da unidade
-9. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para o endpoint de nuvem configurado na própria unidade
+9. Associa exames recebidos diretamente ao pedido/histórico correto ou cria um
+   pedido idempotente pelo Study UID quando ainda não há pedido
+10. Grava o token da unidade no DICOM (`0008,1040`), compacta com `dcmcjpeg` e envia para o endpoint de nuvem configurado na própria unidade
 
 `storescp` do host antigo, `compacta_retrieve.py` e `envio_ret.py` **não precisam mais rodar**. Compacta/envio da nuvem que já existiam fora deste fluxo continuam independentes só se você quiser — este programa cobre a cadeia de retrieve.
 
@@ -243,7 +245,9 @@ array JSON e os campos `patientId`, `accessionNumber`, `patientBirthdate` e
 
 Pedidos com `mirthReaded=true` são ignorados. O `PUT` de confirmação só ocorre
 depois do commit no banco local; se falhar, fica pendente e é repetido sem criar
-outro pedido para o mesmo accession.
+outro pedido para o mesmo accession. As confirmações são executadas em segundo
+plano, com concorrência limitada e commit individual, portanto uma API lenta não
+interrompe C-FIND, C-MOVE, compactação nem o processamento das outras unidades.
 
 Quando o C-FIND encontra o estudo atual, o worker consulta suas séries e escolhe a
 primeira modalidade aceita pelo catálogo de compactação da unidade, desconsiderando
@@ -262,6 +266,17 @@ capacidade disponível. Cada série histórica concluída recebe um checkpoint e
 é repetida se outra série precisar de retry. O exame atual continua sendo
 recuperado pelo Study UID; seus tempos e eventual segundo retrieve não se aplicam
 aos exames anteriores.
+
+Quando um estudo chega diretamente ao Store SCP sem pedido correspondente, o
+recebimento conta como o primeiro retrieve. O worker cria somente um pedido por
+unidade e Study UID, preenche-o com as tags do DICOM e agenda apenas o segundo
+retrieve, quando ele estiver habilitado na regra da modalidade. Modalidades sem
+segundo retrieve terminam sem um novo C-MOVE. Antes de criar, o worker prioriza um
+pedido atual pelo Study UID, depois um histórico ativo e por fim um pedido anterior
+do mesmo Study UID — ou um pedido ainda sem UID com o mesmo accession. Pedidos
+arquivados do mesmo estudo são restaurados.
+Study UID, accession, Patient ID e nascimento são obrigatórios para a criação;
+arquivos sem esses identificadores ficam no diretório de erro e não são enviados.
 
 O fluxo operacional, os limites de falha e o catálogo de logs estão detalhados em
 [`RETRIEVE_HARDENING.md`](RETRIEVE_HARDENING.md).

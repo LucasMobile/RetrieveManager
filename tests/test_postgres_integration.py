@@ -53,6 +53,10 @@ class PostgreSQLRetrieveIntegrationTest(unittest.TestCase):
         self.assertIn("unit_compression_settings", table_names)
         self.assertIn("unit_compress_rules", table_names)
         self.assertIn("unit_drop_modalities", table_names)
+        order_indexes = {
+            index["name"] for index in inspect(self.engine).get_indexes("orders")
+        }
+        self.assertIn("ix_orders_unit_study_uid", order_indexes)
 
     def test_compression_modality_is_unique_inside_each_unit(self):
         with self.Session() as db:

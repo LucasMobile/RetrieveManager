@@ -11,7 +11,10 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - consulta a API por unidade;
    - valida presença, formato, tamanho e caracteres dos identificadores;
    - persiste cada pedido em savepoint próprio;
-   - confirma a leitura de modo idempotente e mantém ACKs falhos pendentes.
+   - confirma a leitura de modo idempotente e mantém ACKs falhos pendentes;
+   - os ACKs rodam fora do ciclo principal, em lotes concorrentes por unidade;
+   - cada resposta é persistida imediatamente, sem esperar o restante do lote;
+   - um job lento de confirmação não bloqueia C-FIND, C-MOVE ou outra unidade.
 2. **Localização no PACS (`dicom.find`)**
    - consulta pedidos em `watching` no intervalo configurado;
    - `exit 0` sem Study UID significa apenas “ainda não encontrado”;
@@ -39,7 +42,14 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - existe um `storescp` supervisionado por unidade;
    - queda, configuração inválida ou binário ausente ficam isolados na unidade;
    - o supervisor reinicia processos encerrados e mantém somente a cauda
-     sanitizada da saída.
+     sanitizada da saída;
+   - um estudo recebido sem pedido é registrado de forma idempotente por unidade
+     e Study UID, depois de tentar a associação com o histórico;
+   - o recebimento direto substitui o primeiro retrieve e respeita a regra da
+     modalidade para agendar ou não o segundo;
+   - identificadores obrigatórios ausentes ou conflito entre accession e Study
+     UID enviam o arquivo para quarentena, sem criar pedido ou enviar à nuvem;
+   - pedidos arquivados do mesmo Study UID são restaurados em vez de duplicados.
 7. **Compactação (`dicom.compact.*`)**
    - processa no máximo `COMPACT_BATCH_SIZE` arquivos por ciclo;
    - cada arquivo é executado isoladamente; uma exceção não cancela os demais;
@@ -68,10 +78,15 @@ estado `cancelled`.
 
 - `worker.stage status=failure`: falha contida de uma etapa/unidade;
 - `dicom.find status=retry`: PACS ou comando indisponível, não “não encontrado”;
+- `orders.api.ack.batch`: início e resumo de cada lote de confirmações PLERES;
+- `orders.api.ack status=retry`: confirmação individual mantida para nova tentativa;
 - `dicom.move.job.persist_failure`: falha crítica ao salvar a recuperação do job;
 - `dicom.move status=failure`: três tentativas do retrieve atual esgotadas;
 - `dicom.move.prior status=failure`: tentativas do histórico esgotadas;
 - `dicom.compact.batch status=partial`: um ou mais arquivos falharam;
+- `order.storescp.ingest`: pedido direto criado, associado, reutilizado ou restaurado;
+- `dicom.inbound.reject`: objeto direto rejeitado por identidade incompleta ou conflitante;
+- `dicom.inbound.quarantine status=failure`: falha ao mover objeto rejeitado para erro;
 - `cloud.upload.batch status=partial`: falha parcial ou total de envio;
 - `cloud.circuit status=open`: unidade temporariamente suspensa para envio;
 - `cloud.upload.persist status=failure`: resposta remota não pôde ser registrada.
@@ -92,6 +107,9 @@ Variáveis novas e seus padrões:
 - `FIND_BATCH_SIZE=10`
 - `COMPACT_BATCH_SIZE=250`
 - `SEND_BATCH_SIZE=250`
+- `ORDERS_API_ACK_BATCH_SIZE=32`
+- `ORDERS_API_ACK_CONCURRENCY=8`
+- `ORDERS_API_ACK_UNIT_WORKERS=4`
 
 ## Teste de integração PostgreSQL
 

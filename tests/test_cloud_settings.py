@@ -1,11 +1,27 @@
 import unittest
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from app.worker import _tick
+from app.worker import _schedule_ack_job, _tick
 from tests.support import DatabaseTestCase, make_unit
 
 
 class UnitCloudSettingsTest(DatabaseTestCase):
+    def test_only_one_ack_job_runs_for_each_unit(self):
+        pool = MagicMock()
+        first = Future()
+        second = Future()
+        pool.submit.side_effect = [first, second]
+        jobs = {}
+
+        _schedule_ack_job(pool, jobs, 7)
+        _schedule_ack_job(pool, jobs, 7)
+        self.assertEqual(pool.submit.call_count, 1)
+
+        first.set_result(None)
+        _schedule_ack_job(pool, jobs, 7)
+        self.assertEqual(pool.submit.call_count, 2)
+
     def test_worker_uses_each_units_cloud_destination_and_zero_settle(self):
         with self.Session() as db:
             db.add_all(

@@ -1974,7 +1974,12 @@ def _image_status_summary(counts: dict[str, int]) -> dict[str, int]:
         "compressed": counts.get("compressed", 0),
         "errors": sum(
             counts.get(status, 0)
-            for status in ("compression_error", "upload_error", "rule_error")
+            for status in (
+                "compression_error",
+                "upload_error",
+                "rule_error",
+                "metadata_error",
+            )
         ),
         "discarded": sum(
             counts.get(status, 0)

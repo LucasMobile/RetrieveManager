@@ -12,7 +12,7 @@ from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,8 @@ from app.config import (
     FIND_BATCH_SIZE,
     HTTP_CONNECT_TIMEOUT_SECONDS,
     HTTP_TOTAL_TIMEOUT_SECONDS,
+    ORDERS_API_ACK_BATCH_SIZE,
+    ORDERS_API_ACK_CONCURRENCY,
     ORDERS_API_POLL_SECONDS,
     SEND_BATCH_SIZE,
     SEND_RETRY_BASE_SECONDS,
@@ -68,8 +70,8 @@ from app.order_state import ACTIVE_ORDER_STATUSES
 from app.orders_api import (
     InvalidApiOrder,
     OrdersApiError,
-    acknowledge_orders,
     fetch_orders,
+    iter_acknowledgements,
     parse_api_order,
 )
 from app.parse import (
@@ -141,6 +143,18 @@ def _ensure_order_correlation(order: Order) -> str:
 def _bounded_db_text(value: object, limit: int) -> str:
     """Normalize external PACS/file text before writing bounded DB columns."""
     return str(value or "").replace("\x00", " ").strip()[:limit]
+
+
+class InboundDicomRejected(RuntimeError):
+    """The received object cannot safely create or identify an order."""
+
+
+_REQUIRED_INBOUND_FIELDS = {
+    "study_uid": "StudyInstanceUID",
+    "accession": "AccessionNumber",
+    "patient_id": "PatientID",
+    "birth_date": "PatientBirthDate",
+}
 
 
 def recover_stale_locks(db: Session) -> None:
@@ -397,11 +411,10 @@ def ingest_unit(db: Session, unit: Unit) -> int:
         created += 1
     if created or seen:
         db.commit()
-    _acknowledge_pending_orders(db, unit)
     return created
 
 
-def _acknowledge_pending_orders(db: Session, unit: Unit) -> None:
+def acknowledge_pending_orders(db: Session, unit: Unit) -> None:
     pending = list(
         db.scalars(
             select(Order)
@@ -410,57 +423,89 @@ def _acknowledge_pending_orders(db: Session, unit: Unit) -> None:
                 Order.archived_at.is_(None),
                 Order.api_read_status == "pending",
             )
-            .order_by(Order.id)
-            .limit(250)
+            .order_by(Order.api_read_attempts, Order.id)
+            .limit(ORDERS_API_ACK_BATCH_SIZE)
         )
     )
     if not pending:
         return
     by_accession = {order.acc: order for order in pending}
-    results = asyncio.run(
-        acknowledge_orders(
+    started_at = perf_counter()
+    log_event(
+        log,
+        logging.INFO,
+        "orders.api.ack.batch",
+        resource=f"unit:{unit.id}",
+        status="started",
+        unit_id=unit.id,
+        record_count=len(by_accession),
+        concurrency=ORDERS_API_ACK_CONCURRENCY,
+    )
+    success_count = 0
+    failure_count = 0
+
+    async def acknowledge_batch() -> None:
+        nonlocal success_count, failure_count
+        async for result in iter_acknowledgements(
             unit.orders_api_url,
             unit.orders_api_token,
             list(by_accession),
-        )
-    )
-    for result in results:
-        order = by_accession[result.accession_number]
-        order.api_read_attempts += 1
-        if result.success:
-            order.api_read_status = "confirmed"
-            order.api_read_last_error = ""
+            ORDERS_API_ACK_CONCURRENCY,
+        ):
+            order = by_accession[result.accession_number]
+            order.api_read_attempts += 1
             order.api_read_at = datetime.now()
-            add_event(db, order, "Pedido confirmado como lido na API PLERES")
-            level = logging.INFO
-            status = "success"
-        else:
-            order.api_read_status = "pending"
-            order.api_read_last_error = result.error[:500]
-            if order.api_read_attempts == 1:
-                add_event(
-                    db,
-                    order,
-                    "Falha ao confirmar leitura na API PLERES; "
-                    "nova tentativa será feita",
-                    level="warn",
+            if result.success:
+                order.api_read_status = "confirmed"
+                order.api_read_last_error = ""
+                add_event(db, order, "Pedido confirmado como lido na API PLERES")
+                level = logging.INFO
+                status = "success"
+                success_count += 1
+            else:
+                order.api_read_status = "pending"
+                order.api_read_last_error = result.error[:500]
+                if order.api_read_attempts == 1:
+                    add_event(
+                        db,
+                        order,
+                        "Falha ao confirmar leitura na API PLERES; "
+                        "nova tentativa será feita",
+                        level="warn",
+                    )
+                level = logging.WARNING
+                status = "retry"
+                failure_count += 1
+            # Commit por resultado: uma queda no meio do lote não perde as
+            # confirmações que a API já aceitou.
+            db.commit()
+            with log_context(_ensure_order_correlation(order)):
+                log_event(
+                    log,
+                    level,
+                    "orders.api.ack",
+                    resource=f"order:{order.id}",
+                    status=status,
+                    order_id=order.id,
+                    unit_id=unit.id,
+                    attempt=order.api_read_attempts,
+                    error_type="OrdersApiError" if not result.success else None,
+                    error_detail=result.error if not result.success else None,
                 )
-            level = logging.WARNING
-            status = "retry"
-        with log_context(_ensure_order_correlation(order)):
-            log_event(
-                log,
-                level,
-                "orders.api.ack",
-                resource=f"order:{order.id}",
-                status=status,
-                order_id=order.id,
-                unit_id=unit.id,
-                attempt=order.api_read_attempts,
-                error_type="OrdersApiError" if not result.success else None,
-                error_detail=result.error if not result.success else None,
-            )
-    db.commit()
+
+    asyncio.run(acknowledge_batch())
+    log_event(
+        log,
+        logging.WARNING if failure_count else logging.INFO,
+        "orders.api.ack.batch",
+        resource=f"unit:{unit.id}",
+        status="partial" if failure_count else "success",
+        started_at=started_at,
+        unit_id=unit.id,
+        record_count=len(by_accession),
+        success_count=success_count,
+        failure_count=failure_count,
+    )
 
 
 def cleanup_unmatched_orders(db: Session, now: datetime | None = None) -> int:
@@ -1834,15 +1879,25 @@ def _compact_one(
 
 
 def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> None:
+    # An exact active current-study match always wins. Completed/archived orders
+    # are considered only after the historical matcher, otherwise a study that
+    # is currently being retrieved as history could be attached to an old main
+    # order instead of the active historical flow.
     order = None
     if result.study_uid:
         order = db.scalar(
             select(Order)
-            .where(Order.unit_id == unit.id, Order.study_uid == result.study_uid)
-            .where(Order.archived_at.is_(None))
+            .where(
+                Order.unit_id == unit.id,
+                Order.study_uid == result.study_uid,
+                Order.archived_at.is_(None),
+                Order.status.notin_(("done", "cancelled")),
+            )
             .order_by(Order.id.desc())
             .limit(1)
         )
+    if order is not None:
+        _enrich_order_from_received(order, result)
     correlation_id = (
         _ensure_order_correlation(order) if order is not None else new_correlation_id()
     )
@@ -1873,8 +1928,34 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         transfer.attempts = 0
         transfer.next_attempt_at = None
         transfer.last_http_status = None
-    transfer.status = result.status
-    transfer.last_error = result.error_type
+
+    association = "current" if order is not None else ""
+    rejection_type = ""
+    rejection_detail = ""
+    if order is None:
+        historical_order = _associate_historical_transfer(db, unit, result, transfer)
+        if historical_order is not None:
+            order = historical_order
+            association = "historical"
+            transfer.order_id = order.id
+            transfer.correlation_id = _ensure_order_correlation(order)
+        elif not result.status.startswith("discarded"):
+            try:
+                order, association = _register_store_received_order(db, unit, result)
+            except InboundDicomRejected as exc:
+                rejection_type = type(exc).__name__
+                rejection_detail = str(exc)
+                transfer.order_id = None
+                _quarantine_compacted_output(unit, result)
+            else:
+                transfer.order_id = order.id
+                transfer.correlation_id = _ensure_order_correlation(order)
+
+    transfer.status = "metadata_error" if rejection_type else result.status
+    transfer.last_error = _bounded_db_text(
+        rejection_detail or result.error_type,
+        500,
+    )
     db.execute(
         delete(DicomRuleApplication).where(
             DicomRuleApplication.transfer_id == transfer.id
@@ -1890,27 +1971,287 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         )
         for match in result.rule_matches
     )
-    _associate_historical_transfer(db, unit, result, transfer)
+
+    if rejection_type:
+        with log_context(transfer.correlation_id):
+            log_event(
+                log,
+                logging.WARNING,
+                "dicom.inbound.reject",
+                resource=f"transfer:{transfer.id}",
+                status="rejected",
+                error_type=rejection_type,
+                error_detail=rejection_detail,
+                transfer_id=transfer.id,
+                unit_id=unit.id,
+                accession=_bounded_db_text(result.accession, 64),
+                study_uid=_bounded_db_text(result.study_uid, 128),
+            )
     level = (
         logging.ERROR
-        if result.error_type
+        if result.error_type or rejection_type
         else logging.DEBUG
         if result.status == "compressed"
         else logging.INFO
     )
-    with log_context(correlation_id):
+    with log_context(transfer.correlation_id):
         log_event(
             log,
             level,
             "dicom.compact",
             resource=f"transfer:{transfer.id}",
-            status="failure" if result.error_type else result.status,
-            error_type=result.error_type or None,
+            status="failure" if result.error_type or rejection_type else result.status,
+            error_type=rejection_type or result.error_type or None,
             transfer_id=transfer.id,
             order_id=order.id if order else None,
             unit_id=unit.id,
+            association=association or None,
             applied_rule_ids=[match.rule_id for match in result.rule_matches],
         )
+
+
+def _missing_inbound_fields(result: CompactResult) -> list[str]:
+    return [
+        dicom_name
+        for attribute, dicom_name in _REQUIRED_INBOUND_FIELDS.items()
+        if not _bounded_db_text(getattr(result, attribute), 128)
+    ]
+
+
+def _enrich_order_from_received(order: Order, result: CompactResult) -> None:
+    """Fill information missing from an order as later series arrive."""
+    order.pat_id = order.pat_id or _bounded_db_text(result.patient_id, 64)
+    order.birth_date = order.birth_date or _bounded_db_text(result.birth_date, 16)
+    order.exam_date = order.exam_date or _bounded_db_text(result.study_date, 16)
+    order.modality = order.modality or _bounded_db_text(result.modality, 32)
+    order.body_part = order.body_part or _bounded_db_text(result.body_part, 64)
+
+
+def _quarantine_compacted_output(unit: Unit, result: CompactResult) -> None:
+    """Keep an invalid inbound object out of the cloud upload queue."""
+    filename = result.output_name or result.source_name
+    if not filename:
+        return
+    source = Path(unit.send_dir) / filename
+    if not source.is_file():
+        # Compression/rule failures are already moved to the error directory.
+        return
+    error_dir = Path(unit.error_dir)
+    error_dir.mkdir(parents=True, exist_ok=True)
+    target = error_dir / filename
+    if target.exists():
+        target = error_dir / (
+            f"{target.stem}.metadata-{new_correlation_id()[:8]}{target.suffix}"
+        )
+    try:
+        shutil.move(str(source), str(target))
+    except OSError as exc:
+        log_event(
+            log,
+            logging.ERROR,
+            "dicom.inbound.quarantine",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error=exc,
+            error_detail=safe_error_detail(exc),
+            unit_id=unit.id,
+            filename=filename,
+        )
+
+
+def _register_store_received_order(
+    db: Session,
+    unit: Unit,
+    result: CompactResult,
+) -> tuple[Order, str]:
+    """Create/reuse one order for a valid study received directly by Store SCP."""
+    missing = _missing_inbound_fields(result)
+    if missing:
+        raise InboundDicomRejected(
+            "Tags DICOM obrigatórias ausentes: " + ", ".join(missing)
+        )
+
+    study_uid = _bounded_db_text(result.study_uid, 128)
+    accession = _bounded_db_text(result.accession, 64)
+    bind = db.get_bind()
+    if bind.dialect.name == "postgresql":
+        # Results from the compression pool are persisted serially today, but
+        # this database lock keeps the invariant if more workers are deployed.
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"storescp:{unit.id}:{study_uid}"},
+        )
+    order = db.scalar(
+        select(Order)
+        .where(Order.unit_id == unit.id, Order.study_uid == study_uid)
+        .order_by(Order.archived_at.is_(None).desc(), Order.id.desc())
+        .limit(1)
+    )
+    matched_by = "study_uid"
+    if order is None:
+        order = db.scalar(
+            select(Order).where(Order.unit_id == unit.id, Order.acc == accession)
+        )
+        matched_by = "accession"
+    if order is not None and order.study_uid and order.study_uid != study_uid:
+        raise InboundDicomRejected(
+            "AccessionNumber já pertence a outro StudyInstanceUID nesta unidade"
+        )
+
+    now = datetime.now()
+    modality, _ignored_first_at, second_at = schedule_from_now(db, result.modality)
+    if order is None:
+        correlation_id = new_correlation_id()
+        order = Order(
+            unit_id=unit.id,
+            source_id=_bounded_db_text(
+                f"storescp:{unit.id}:{accession}",
+                64,
+            ),
+            filename=accession,
+            pat_id=_bounded_db_text(result.patient_id, 64),
+            acc=accession,
+            birth_date=_bounded_db_text(result.birth_date, 16),
+            exam_date=_bounded_db_text(result.study_date, 16),
+            correlation_id=correlation_id,
+            api_read_status="confirmed",
+            api_read_at=now,
+            status="wait_second" if second_at else "done",
+            study_uid=study_uid,
+            modality=_bounded_db_text(modality, 32),
+            body_part=_bounded_db_text(result.body_part, 64),
+            prior_status="disabled",
+            retrieve_at=None,
+            second_retrieve_at=second_at,
+            found_at=now,
+            done_at=None if second_at else now,
+        )
+        db.add(order)
+        db.flush()
+        db.add(
+            AuditLog(
+                actor_id=None,
+                actor_username="Sistema",
+                actor_role="system",
+                action="create",
+                resource_type="order",
+                resource_id=str(order.id),
+                resource_name=order.acc,
+                summary=(
+                    "Pedido criado automaticamente a partir de exame recebido "
+                    f"diretamente pelo Store SCP da unidade {unit.name}."
+                ),
+                ip_address="",
+            )
+        )
+        if second_at:
+            message = (
+                "Exame recebido diretamente pelo Store SCP; "
+                f"2º retrieve agendado para {second_at:%d/%m/%Y às %H:%M}"
+            )
+        else:
+            message = (
+                "Exame recebido diretamente pelo Store SCP; modalidade sem "
+                "2º retrieve configurado"
+            )
+        add_event(db, order, message)
+        action = "created"
+    else:
+        was_archived = order.archived_at is not None
+        was_watching = order.status == "watching"
+        order.study_uid = order.study_uid or study_uid
+        _enrich_order_from_received(order, result)
+        order.modality = order.modality or _bounded_db_text(modality, 32)
+        order.found_at = order.found_at or now
+        _ensure_order_correlation(order)
+
+        # A direct delivery can satisfy a queued order that had not yet found
+        # the study. An archived order is restored as requested. A completed,
+        # non-archived order is merely reused, so every image in the same batch
+        # cannot repeatedly schedule a new second retrieve.
+        if order.status == "watching" or was_archived:
+            order.status = "wait_second" if second_at else "done"
+            order.retrieve_at = None
+            order.second_retrieve_at = second_at
+            order.attempts = 0
+            order.last_error = ""
+            order.heartbeat_at = None
+            order.done_at = None if second_at else now
+        if was_watching and unit.retrieve_prior_enabled:
+            prior_from, prior_to = prior_date_range(now.date())
+            order.prior_status = "queued"
+            order.prior_date_from = prior_from
+            order.prior_date_to = prior_to
+            order.prior_due_at = now
+            order.prior_started_at = None
+            order.prior_completed_at = None
+            order.prior_heartbeat_at = None
+            order.prior_attempts = 0
+            order.prior_last_error = ""
+        if was_archived:
+            order.archived_at = None
+            order.archive_reason = ""
+            order.archived_by_user_id = None
+            order.archived_by_username = ""
+            db.add(
+                AuditLog(
+                    actor_id=None,
+                    actor_username="Sistema",
+                    actor_role="system",
+                    action="restore",
+                    resource_type="order",
+                    resource_id=str(order.id),
+                    resource_name=order.acc,
+                    summary=(
+                        "Pedido restaurado automaticamente após novo recebimento "
+                        "do mesmo Study Instance UID pelo Store SCP."
+                    ),
+                    ip_address="",
+                )
+            )
+            add_event(
+                db,
+                order,
+                "Pedido arquivado restaurado após recebimento direto do estudo",
+            )
+            action = "restored"
+        elif order.status in ("wait_second", "done") and matched_by == "accession":
+            add_event(
+                db,
+                order,
+                "Exame recebido diretamente e associado ao pedido pelo accession",
+            )
+            if was_watching and unit.retrieve_prior_enabled:
+                add_event(
+                    db,
+                    order,
+                    "Retrieve histórico mantido e enfileirado para execução imediata",
+                )
+            action = "matched"
+        else:
+            action = "reused"
+
+    with log_context(_ensure_order_correlation(order)):
+        log_event(
+            log,
+            logging.INFO,
+            "order.storescp.ingest",
+            resource=f"order:{order.id}",
+            status="success",
+            order_id=order.id,
+            unit_id=unit.id,
+            result=action,
+            matched_by=matched_by if action != "created" else None,
+            accession=order.acc,
+            study_uid=order.study_uid,
+            modality=order.modality,
+            second_retrieve_at=(
+                order.second_retrieve_at.isoformat()
+                if order.second_retrieve_at
+                else None
+            ),
+        )
+    return order, f"storescp_{action}"
 
 
 def _associate_historical_transfer(
@@ -1918,9 +2259,9 @@ def _associate_historical_transfer(
     unit: Unit,
     result: CompactResult,
     transfer: ImageTransfer,
-) -> None:
+) -> Order | None:
     if not result.study_uid or result.observed_at is None:
-        return
+        return None
     known_studies = list(
         db.scalars(
             select(HistoricalStudy)
@@ -1943,7 +2284,7 @@ def _associate_historical_transfer(
     if known_studies:
         for study in known_studies:
             _link_historical_transfer(db, study, transfer, result)
-        return
+        return known_studies[0].order
 
     candidates = list(
         db.scalars(
@@ -1956,6 +2297,7 @@ def _associate_historical_transfer(
             )
         )
     )
+    matched_order = None
     for order in candidates:
         if result.study_uid == order.study_uid:
             continue
@@ -1963,15 +2305,17 @@ def _associate_historical_transfer(
             order.prior_completed_at + timedelta(minutes=1)
         ):
             continue
-        if not result.patient_id.startswith(order.pat_id):
+        if not order.pat_id or not result.patient_id.startswith(order.pat_id):
             continue
-        if result.birth_date and result.birth_date != order.birth_date:
+        if not result.birth_date or result.birth_date != order.birth_date:
+            continue
+        if not result.modality or not order.modality:
             continue
         if result.modality.upper() != order.modality.upper():
             continue
         if order.body_part and result.body_part.upper() != order.body_part.upper():
             continue
-        if result.study_date and not (
+        if not result.study_date or not (
             order.prior_date_from <= result.study_date <= order.prior_date_to
         ):
             continue
@@ -1995,6 +2339,8 @@ def _associate_historical_transfer(
             db.add(study)
             db.flush()
         _link_historical_transfer(db, study, transfer, result)
+        matched_order = matched_order or order
+    return matched_order
 
 
 def _link_historical_transfer(

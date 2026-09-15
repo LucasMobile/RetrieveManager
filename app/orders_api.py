@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -125,15 +126,40 @@ async def fetch_orders(url: str, token: str) -> list[dict[str, Any]]:
 
 
 async def acknowledge_orders(
-    url: str, token: str, accessions: list[str]
+    url: str,
+    token: str,
+    accessions: list[str],
+    concurrency: int = 8,
 ) -> list[AckResult]:
+    return [
+        result
+        async for result in iter_acknowledgements(
+            url,
+            token,
+            accessions,
+            concurrency,
+        )
+    ]
+
+
+async def iter_acknowledgements(
+    url: str,
+    token: str,
+    accessions: list[str],
+    concurrency: int = 8,
+) -> AsyncIterator[AckResult]:
+    """Yield bounded-concurrency ACK results as soon as each request finishes."""
     if not accessions:
-        return []
+        return
     endpoint = f"{url.rstrip('/')}/"
     timeout = aiohttp.ClientTimeout(total=ORDERS_API_TIMEOUT_SECONDS)
-    results: list[AckResult] = []
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for accession in accessions:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def acknowledge_one(
+        session: aiohttp.ClientSession,
+        accession: str,
+    ) -> AckResult:
+        async with semaphore:
             try:
                 await _request(
                     session,
@@ -143,7 +169,20 @@ async def acknowledge_orders(
                     params={"accessionNumber": accession},
                     json={"mirthReaded": True},
                 )
-                results.append(AckResult(accession, True))
+                return AckResult(accession, True)
             except OrdersApiError as exc:
-                results.append(AckResult(accession, False, str(exc)))
-    return results
+                return AckResult(accession, False, str(exc))
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tasks = [
+            asyncio.create_task(acknowledge_one(session, accession))
+            for accession in accessions
+        ]
+        try:
+            for completed in asyncio.as_completed(tasks):
+                yield await completed
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

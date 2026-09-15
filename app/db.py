@@ -247,6 +247,8 @@ def _ensure_postgresql_indexes() -> None:
         "ON orders USING gin (pat_id gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS ix_orders_source_id_trgm "
         "ON orders USING gin (source_id gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS ix_orders_unit_study_uid "
+        "ON orders (unit_id, study_uid)",
         "CREATE INDEX IF NOT EXISTS ix_audit_logs_resource_action_id "
         "ON audit_logs (resource_type, action, id DESC)",
     )
