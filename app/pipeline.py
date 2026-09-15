@@ -4,18 +4,19 @@ import asyncio
 import logging
 import os
 import shutil
+import stat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
 from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
 from pydicom.uid import JPEGBaseline8Bit, JPEGExtended12Bit, JPEGLosslessSV1
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -35,6 +36,10 @@ from app.config import (
     ORDERS_API_ACK_CONCURRENCY,
     ORDERS_API_POLL_SECONDS,
     SEND_BATCH_SIZE,
+    SEND_DB_BATCH_SIZE,
+    SEND_GLOBAL_CONCURRENCY,
+    SEND_RECONCILE_BATCH_SIZE,
+    SEND_RECONCILE_INTERVAL_SECONDS,
     SEND_RETRY_BASE_SECONDS,
     SEND_RETRY_MAX_SECONDS,
 )
@@ -102,6 +107,7 @@ UNMATCHED_ORDER_CLEANUP_BATCH = 500
 COMPLETED_ORDER_RETENTION = timedelta(weeks=2)
 COMPLETED_ORDER_CLEANUP_BATCH = 500
 _compact_slots = BoundedSemaphore(max(1, COMPACT_GLOBAL_WORKERS))
+_send_slots = BoundedSemaphore(max(1, SEND_GLOBAL_CONCURRENCY))
 _TARGET_TRANSFER_SYNTAX = {
     "+e1": str(JPEGLosslessSV1),
     "+eb": str(JPEGBaseline8Bit),
@@ -144,7 +150,16 @@ class CircuitState:
     open_until: datetime | None = None
 
 
+@dataclass
+class SendReconcileState:
+    directory: str
+    entries: object | None = None
+    next_scan_at: float = 0.0
+
+
 _cloud_circuits: dict[int, CircuitState] = {}
+_send_reconcile_states: dict[int, SendReconcileState] = {}
+_send_reconcile_lock = Lock()
 _last_orders_api_poll: dict[int, float] = {}
 
 
@@ -2668,19 +2683,90 @@ def _link_historical_transfer(
         )
 
 
-def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
-    origin = Path(unit.send_dir)
-    if not cloud_url:
-        return
-    # Uma indisponibilidade em uma unidade não deve abrir o circuito das demais,
-    # mesmo quando elas usam o mesmo endpoint de nuvem.
-    circuit = _cloud_circuits.setdefault(unit.id, CircuitState())
-    current_time = datetime.now()
-    if circuit.open_until and current_time < circuit.open_until:
-        return
+def _next_send_reconcile_paths(
+    unit_id: int,
+    directory: Path,
+    settle: int,
+    *,
+    timestamp: float,
+) -> tuple[list[Path], list[tuple[Path, OSError]], bool]:
+    """Inspect a bounded slice of a large send directory.
 
-    settled, inspection_errors = _settled_files(
-        origin, settle, timestamp=current_time.timestamp()
+    The scandir iterator is retained between batches, so a backlog is traversed
+    once instead of restarting at the first filename for every upload batch.
+    """
+    paths: list[Path] = []
+    errors: list[tuple[Path, OSError]] = []
+    directory_key = str(directory)
+    inspection_limit = max(1, SEND_RECONCILE_BATCH_SIZE)
+    with _send_reconcile_lock:
+        state = _send_reconcile_states.get(unit_id)
+        if state is None or state.directory != directory_key:
+            if state is not None and state.entries is not None:
+                with suppress(Exception):
+                    state.entries.close()  # type: ignore[attr-defined]
+            state = SendReconcileState(directory=directory_key)
+            _send_reconcile_states[unit_id] = state
+        if state.entries is None:
+            if monotonic() < state.next_scan_at:
+                return paths, errors, False
+            try:
+                state.entries = os.scandir(directory)
+            except OSError as exc:
+                state.next_scan_at = monotonic() + max(
+                    1, SEND_RECONCILE_INTERVAL_SECONDS
+                )
+                return paths, [(directory, exc)], False
+
+        inspected = 0
+        while inspected < inspection_limit:
+            try:
+                entry = next(state.entries)  # type: ignore[arg-type]
+            except StopIteration:
+                with suppress(Exception):
+                    state.entries.close()  # type: ignore[attr-defined]
+                state.entries = None
+                state.next_scan_at = monotonic() + max(
+                    1, SEND_RECONCILE_INTERVAL_SECONDS
+                )
+                return paths, errors, False
+            except OSError as exc:
+                errors.append((directory, exc))
+                with suppress(Exception):
+                    state.entries.close()  # type: ignore[attr-defined]
+                state.entries = None
+                state.next_scan_at = monotonic() + max(
+                    1, SEND_RECONCILE_INTERVAL_SECONDS
+                )
+                return paths, errors, False
+            inspected += 1
+            if entry.name.startswith("."):
+                continue
+            path = Path(entry.path)
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if timestamp - entry.stat(follow_symlinks=False).st_mtime < settle:
+                    continue
+                paths.append(path)
+            except OSError as exc:
+                errors.append((path, exc))
+        return paths, errors, True
+
+
+def _reconcile_send_directory(
+    db: Session,
+    unit: Unit,
+    origin: Path,
+    settle: int,
+    current_time: datetime,
+) -> tuple[int, bool]:
+    """Register orphan files incrementally and clean persisted upload leftovers."""
+    paths, inspection_errors, scan_has_more = _next_send_reconcile_paths(
+        unit.id,
+        origin,
+        settle,
+        timestamp=current_time.timestamp(),
     )
     for path, exc in inspection_errors:
         log_event(
@@ -2694,62 +2780,227 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
             unit_id=unit.id,
             path_name=path.name,
         )
-    paths = {path.name: path for path in settled}
     if not paths:
-        return
+        return 0, scan_has_more
 
+    by_name = {path.name: path for path in paths}
     existing = {
         transfer.filename: transfer
         for transfer in db.scalars(
             select(ImageTransfer).where(
                 ImageTransfer.unit_id == unit.id,
-                ImageTransfer.filename.in_(paths),
+                ImageTransfer.filename.in_(by_name),
             )
         )
     }
-    # Confirmações remotas já persistidas vencem sobre sobras locais. Isso cobre
-    # falha ao apagar o arquivo depois do commit sem provocar reenvio duplicado.
-    for filename, transfer in list(existing.items()):
-        if transfer.status != "uploaded":
+    registered = 0
+    recovered = 0
+    for filename, path in by_name.items():
+        transfer = existing.get(filename)
+        if transfer is not None:
+            # A confirmação persistida vence sobre uma sobra local criada por
+            # queda/falha de unlink, impedindo upload duplicado.
+            if transfer.status == "uploaded":
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    log_event(
+                        log,
+                        logging.WARNING,
+                        "cloud.upload.cleanup",
+                        resource=f"transfer:{transfer.id}",
+                        status="retry",
+                        error=exc,
+                        error_detail=safe_error_detail(exc),
+                        transfer_id=transfer.id,
+                        unit_id=unit.id,
+                    )
+            elif transfer.status == "file_missing":
+                transfer.status = "compressed"
+                transfer.last_error = ""
+                transfer.next_attempt_at = None
+                recovered += 1
             continue
+        db.add(
+            ImageTransfer(
+                unit_id=unit.id,
+                filename=filename,
+                correlation_id=new_correlation_id(),
+                status="compressed",
+            )
+        )
+        registered += 1
+    if registered or recovered:
         try:
-            paths[filename].unlink(missing_ok=True)
-            paths.pop(filename, None)
-        except OSError as exc:
+            db.commit()
+        except SQLAlchemyError as exc:
+            # A compactação pode ter registrado o mesmo arquivo entre o scan e
+            # o commit. O próximo passe reconciliará o estado sem interromper o
+            # envio já persistido no banco.
+            db.rollback()
             log_event(
                 log,
                 logging.WARNING,
-                "cloud.upload.cleanup",
+                "cloud.reconcile.persist",
+                resource=f"unit:{unit.id}",
+                status="retry",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                unit_id=unit.id,
+                file_count=registered + recovered,
+            )
+            existing_names = set(
+                db.scalars(
+                    select(ImageTransfer.filename).where(
+                        ImageTransfer.unit_id == unit.id,
+                        ImageTransfer.filename.in_(by_name),
+                    )
+                )
+            )
+            retry_names = set(by_name).difference(existing_names)
+            for filename in retry_names:
+                db.add(
+                    ImageTransfer(
+                        unit_id=unit.id,
+                        filename=filename,
+                        correlation_id=new_correlation_id(),
+                        status="compressed",
+                    )
+                )
+            recovered_transfers = list(
+                db.scalars(
+                    select(ImageTransfer).where(
+                        ImageTransfer.unit_id == unit.id,
+                        ImageTransfer.filename.in_(by_name),
+                        ImageTransfer.status == "file_missing",
+                    )
+                )
+            )
+            for transfer in recovered_transfers:
+                transfer.status = "compressed"
+                transfer.last_error = ""
+                transfer.next_attempt_at = None
+            try:
+                db.commit()
+                registered = len(retry_names)
+                recovered = len(recovered_transfers)
+            except SQLAlchemyError:
+                db.rollback()
+                registered = 0
+                recovered = 0
+    return registered + recovered, scan_has_more
+
+
+def _due_send_transfers(
+    db: Session,
+    unit_id: int,
+    current_time: datetime,
+    batch_size: int,
+) -> list[ImageTransfer]:
+    return list(
+        db.scalars(
+            select(ImageTransfer)
+            .where(
+                ImageTransfer.unit_id == unit_id,
+                or_(
+                    ImageTransfer.status == "compressed",
+                    and_(
+                        ImageTransfer.status == "upload_error",
+                        or_(
+                            ImageTransfer.next_attempt_at.is_(None),
+                            ImageTransfer.next_attempt_at <= current_time,
+                        ),
+                    ),
+                ),
+            )
+            .order_by(ImageTransfer.id)
+            .limit(batch_size + 1)
+        )
+    )
+
+
+def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> bool:
+    origin = Path(unit.send_dir)
+    if not cloud_url:
+        return False
+    # Uma indisponibilidade em uma unidade não deve abrir o circuito das demais,
+    # mesmo quando elas usam o mesmo endpoint de nuvem.
+    circuit = _cloud_circuits.setdefault(unit.id, CircuitState())
+    current_time = datetime.now()
+    if circuit.open_until and current_time < circuit.open_until:
+        return False
+    try:
+        if not stat.S_ISDIR(origin.stat().st_mode):
+            raise NotADirectoryError(str(origin))
+    except OSError as exc:
+        log_event(
+            log,
+            logging.ERROR,
+            "cloud.send.directory",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error=exc,
+            error_detail=safe_error_detail(exc),
+            unit_id=unit.id,
+            directory=str(origin),
+        )
+        return False
+
+    batch_size = max(1, SEND_BATCH_SIZE)
+    due_transfers = _due_send_transfers(
+        db, unit.id, current_time, batch_size
+    )
+    reconciled_count = 0
+    scan_has_more = False
+    if not due_transfers:
+        # O banco é a fila normal. A pasta só é percorrida quando ela esvazia,
+        # para recuperar arquivos órfãos de quedas sem penalizar o backlog ativo.
+        reconciled_count, scan_has_more = _reconcile_send_directory(
+            db, unit, origin, settle, current_time
+        )
+        if reconciled_count:
+            due_transfers = _due_send_transfers(
+                db, unit.id, current_time, batch_size
+            )
+    jobs: list[tuple[int, Path, str]] = []
+    missing_count = 0
+    inspection_failure = False
+    for transfer in due_transfers[:batch_size]:
+        path = origin / transfer.filename
+        try:
+            is_file = stat.S_ISREG(path.stat().st_mode)
+        except FileNotFoundError:
+            is_file = False
+        except OSError as exc:
+            inspection_failure = True
+            log_event(
+                log,
+                logging.WARNING,
+                "cloud.file.inspect",
                 resource=f"transfer:{transfer.id}",
                 status="retry",
                 error=exc,
                 error_detail=safe_error_detail(exc),
                 transfer_id=transfer.id,
                 unit_id=unit.id,
+                path_name=path.name,
             )
-    for filename in paths:
-        if filename not in existing:
-            transfer = ImageTransfer(
-                unit_id=unit.id,
-                filename=filename,
-                correlation_id=new_correlation_id(),
-                status="compressed",
-            )
-            db.add(transfer)
-            existing[filename] = transfer
-    db.flush()
-
-    jobs = [
-        (transfer.id, paths[filename], transfer.correlation_id)
-        for filename, transfer in existing.items()
-        if transfer.status in {"compressed", "upload_error"}
-        and (
-            transfer.next_attempt_at is None or transfer.next_attempt_at <= current_time
-        )
-    ][:SEND_BATCH_SIZE]
+            continue
+        if not is_file:
+            transfer.status = "file_missing"
+            transfer.last_error = "arquivo não encontrado na pasta de envio"
+            transfer.next_attempt_at = None
+            missing_count += 1
+            continue
+        jobs.append((transfer.id, path, transfer.correlation_id))
+    if missing_count:
+        db.commit()
     if not jobs:
         db.commit()
-        return
+        return (
+            not inspection_failure
+            and (scan_has_more or len(due_transfers) > batch_size)
+        )
     workers = max(1, unit.send_workers or 16)
     started_at = perf_counter()
     log_event(
@@ -2760,10 +3011,16 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
         status="started",
         unit_id=unit.id,
         file_count=len(jobs),
+        reconciled_count=reconciled_count,
+        missing_count=missing_count,
+        unit_concurrency=workers,
+        global_concurrency=SEND_GLOBAL_CONCURRENCY,
     )
     results = asyncio.run(_send_all(jobs, cloud_url, workers))
-    _record_send_results(db, unit, results, circuit)
-    failure_count = sum(not result.success for result in results)
+    failure_count, success_count = _record_send_results(
+        db, unit, results, circuit
+    )
+    duration_seconds = max(perf_counter() - started_at, 0.001)
     log_event(
         log,
         logging.WARNING if failure_count else logging.INFO,
@@ -2773,8 +3030,16 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> None:
         started_at=started_at,
         unit_id=unit.id,
         file_count=len(results),
-        success_count=len(results) - failure_count,
+        success_count=success_count,
         failure_count=failure_count,
+        files_per_second=round(len(results) / duration_seconds, 2),
+    )
+    if circuit.open_until and datetime.now() < circuit.open_until:
+        return False
+    return (
+        scan_has_more
+        or len(due_transfers) > batch_size
+        or len(jobs) == batch_size
     )
 
 
@@ -2804,17 +3069,19 @@ async def _send_one(
     correlation_id: str,
 ) -> SendResult:
     async with semaphore:
+        while not _send_slots.acquire(blocking=False):
+            await asyncio.sleep(0.01)
         started_at = perf_counter()
-        with log_context(correlation_id):
-            log_event(
-                log,
-                logging.DEBUG,
-                "cloud.upload",
-                resource=f"transfer:{transfer_id}",
-                status="started",
-                transfer_id=transfer_id,
-            )
         try:
+            with log_context(correlation_id):
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "cloud.upload",
+                    resource=f"transfer:{transfer_id}",
+                    status="started",
+                    transfer_id=transfer_id,
+                )
             with path.open("rb") as stream:
                 data = aiohttp.FormData()
                 data.add_field(
@@ -2845,6 +3112,8 @@ async def _send_one(
                 error_type=type(exc).__name__,
                 duration_ms=round((perf_counter() - started_at) * 1000, 2),
             )
+        finally:
+            _send_slots.release()
 
 
 def _record_send_results(
@@ -2852,73 +3121,40 @@ def _record_send_results(
     unit: Unit,
     results: list[SendResult],
     circuit: CircuitState,
-) -> None:
+) -> tuple[int, int]:
     now = datetime.now()
     failures = 0
     successful_filenames: list[tuple[int, str]] = []
-    for result in results:
-        persisted = False
-        for persist_attempt in range(1, 4):
-            try:
-                transfer = db.get(ImageTransfer, result.transfer_id)
-                if transfer is None:
-                    persisted = True
-                    break
-                transfer.attempts += 1
-                transfer.last_http_status = result.http_status
-                transfer.last_error = _bounded_db_text(result.error_type, 500)
-                if result.success:
-                    transfer.status = "uploaded"
-                    transfer.next_attempt_at = None
-                    level = logging.DEBUG
-                    status = "success"
-                else:
-                    transfer.status = "upload_error"
-                    delay = min(
-                        SEND_RETRY_MAX_SECONDS,
-                        SEND_RETRY_BASE_SECONDS
-                        * (2 ** min(transfer.attempts - 1, 10)),
-                    )
-                    transfer.next_attempt_at = now + timedelta(seconds=delay)
-                    level = logging.WARNING
-                    status = "retry"
-                db.commit()
-                persisted = True
-                with log_context(result.correlation_id):
-                    log_event(
-                        log,
-                        level,
-                        "cloud.upload",
-                        resource=f"transfer:{transfer.id}",
-                        status=status,
-                        error_type=result.error_type or None,
-                        transfer_id=transfer.id,
-                        order_id=transfer.order_id,
-                        unit_id=unit.id,
-                        attempt=transfer.attempts,
-                        http_status=result.http_status,
-                        duration_ms=result.duration_ms,
-                    )
-                if result.success:
-                    successful_filenames.append((transfer.id, transfer.filename))
-                break
-            except SQLAlchemyError as exc:
-                db.rollback()
-                exhausted = persist_attempt == 3
-                log_event(
-                    log,
-                    logging.ERROR if exhausted else logging.WARNING,
-                    "cloud.upload.persist",
-                    resource=f"transfer:{result.transfer_id}",
-                    status="failure" if exhausted else "retry",
-                    error=exc,
-                    error_detail=safe_error_detail(exc),
-                    transfer_id=result.transfer_id,
-                    unit_id=unit.id,
-                    attempt=persist_attempt,
+    db_batch_size = max(1, SEND_DB_BATCH_SIZE)
+    for offset in range(0, len(results), db_batch_size):
+        chunk = results[offset : offset + db_batch_size]
+        try:
+            persisted, chunk_failures = _persist_send_result_chunk(
+                db, unit, chunk, now
+            )
+            successful_filenames.extend(persisted)
+            failures += chunk_failures
+        except SQLAlchemyError as exc:
+            db.rollback()
+            log_event(
+                log,
+                logging.WARNING,
+                "cloud.upload.persist_batch",
+                resource=f"unit:{unit.id}",
+                status="fallback",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                unit_id=unit.id,
+                file_count=len(chunk),
+            )
+            for result in chunk:
+                persisted = _persist_send_result_with_retry(
+                    db, unit, result, now
                 )
-        if not persisted or not result.success:
-            failures += 1
+                if persisted is not None and result.success:
+                    successful_filenames.append(persisted)
+                if persisted is None or not result.success:
+                    failures += 1
 
     if failures == len(results):
         # Conte falhas consecutivas de lote, não cada imagem do mesmo incidente.
@@ -2952,6 +3188,139 @@ def _record_send_results(
                 transfer_id=transfer_id,
                 unit_id=unit.id,
             )
+    return failures, len(successful_filenames)
+
+
+def _apply_send_result(
+    transfer: ImageTransfer,
+    result: SendResult,
+    now: datetime,
+) -> tuple[int, str]:
+    transfer.attempts += 1
+    transfer.last_http_status = result.http_status
+    transfer.last_error = _bounded_db_text(result.error_type, 500)
+    if result.success:
+        transfer.status = "uploaded"
+        transfer.next_attempt_at = None
+        return logging.DEBUG, "success"
+    transfer.status = "upload_error"
+    delay = min(
+        SEND_RETRY_MAX_SECONDS,
+        SEND_RETRY_BASE_SECONDS * (2 ** min(transfer.attempts - 1, 10)),
+    )
+    transfer.next_attempt_at = now + timedelta(seconds=delay)
+    return logging.WARNING, "retry"
+
+
+def _log_persisted_send_result(
+    unit: Unit,
+    result: SendResult,
+    transfer_id: int,
+    order_id: int | None,
+    attempt: int,
+    level: int,
+    status: str,
+) -> None:
+    with log_context(result.correlation_id):
+        log_event(
+            log,
+            level,
+            "cloud.upload",
+            resource=f"transfer:{transfer_id}",
+            status=status,
+            error_type=result.error_type or None,
+            transfer_id=transfer_id,
+            order_id=order_id,
+            unit_id=unit.id,
+            attempt=attempt,
+            http_status=result.http_status,
+            duration_ms=result.duration_ms,
+        )
+
+
+def _persist_send_result_chunk(
+    db: Session,
+    unit: Unit,
+    results: list[SendResult],
+    now: datetime,
+) -> tuple[list[tuple[int, str]], int]:
+    """Persist one result chunk atomically, reducing commits under high load."""
+    result_by_id = {result.transfer_id: result for result in results}
+    transfers = {
+        transfer.id: transfer
+        for transfer in db.scalars(
+            select(ImageTransfer).where(ImageTransfer.id.in_(result_by_id))
+        )
+    }
+    log_rows: list[tuple[SendResult, int, int | None, int, int, str]] = []
+    successful: list[tuple[int, str]] = []
+    failures = 0
+    for result in results:
+        transfer = transfers.get(result.transfer_id)
+        if transfer is None:
+            failures += 1
+            continue
+        level, status = _apply_send_result(transfer, result, now)
+        log_rows.append(
+            (
+                result,
+                transfer.id,
+                transfer.order_id,
+                transfer.attempts,
+                level,
+                status,
+            )
+        )
+        if result.success:
+            successful.append((transfer.id, transfer.filename))
+        else:
+            failures += 1
+    db.commit()
+    for result, transfer_id, order_id, attempt, level, status in log_rows:
+        _log_persisted_send_result(
+            unit, result, transfer_id, order_id, attempt, level, status
+        )
+    return successful, failures
+
+
+def _persist_send_result_with_retry(
+    db: Session,
+    unit: Unit,
+    result: SendResult,
+    now: datetime,
+) -> tuple[int, str] | None:
+    """Isolate a problematic row if the efficient chunk commit fails."""
+    for persist_attempt in range(1, 4):
+        try:
+            transfer = db.get(ImageTransfer, result.transfer_id)
+            if transfer is None:
+                return None
+            level, status = _apply_send_result(transfer, result, now)
+            transfer_id = transfer.id
+            filename = transfer.filename
+            order_id = transfer.order_id
+            attempt = transfer.attempts
+            db.commit()
+            _log_persisted_send_result(
+                unit, result, transfer_id, order_id, attempt, level, status
+            )
+            return transfer_id, filename
+        except SQLAlchemyError as exc:
+            db.rollback()
+            exhausted = persist_attempt == 3
+            log_event(
+                log,
+                logging.ERROR if exhausted else logging.WARNING,
+                "cloud.upload.persist",
+                resource=f"transfer:{result.transfer_id}",
+                status="failure" if exhausted else "retry",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                transfer_id=result.transfer_id,
+                unit_id=unit.id,
+                attempt=persist_attempt,
+            )
+    return None
 
 
 def folder_counts(unit: Unit) -> dict[str, int]:

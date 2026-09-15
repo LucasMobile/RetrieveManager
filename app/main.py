@@ -2002,6 +2002,7 @@ def _image_status_summary(counts: dict[str, int]) -> dict[str, int]:
                 "upload_error",
                 "rule_error",
                 "metadata_error",
+                "file_missing",
             )
         ),
         "discarded": sum(

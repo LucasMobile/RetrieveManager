@@ -72,11 +72,16 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - arquivos inválidos seguem para o diretório de erro e descartes são auditados.
 8. **Envio (`cloud.upload.*`)**
    - roda em job próprio por unidade, sem esperar compactação ou outra unidade;
-   - processa no máximo `SEND_BATCH_SIZE` arquivos por ciclo;
+   - drena lotes consecutivos de até `SEND_BATCH_SIZE` enquanto houver trabalho;
+   - seleciona a fila pelo índice do PostgreSQL, sem varrer toda a pasta a cada lote;
+   - reconcilia arquivos órfãos da pasta incrementalmente, em fatias limitadas;
+   - limita a concorrência somada das unidades com `SEND_GLOBAL_CONCURRENCY`;
+   - persiste os resultados em lotes e volta ao modo individual se um lote falhar;
    - falhas usam backoff exponencial persistente;
    - o circuit breaker é independente por unidade;
    - o sucesso remoto é commitado antes da exclusão do arquivo local;
-   - se a exclusão local falhar, o próximo ciclo limpa a sobra sem reenviar.
+   - se a exclusão local falhar, a reconciliação limpa a sobra sem reenviar;
+   - indisponibilidade da pasta/volume não altera os estados pendentes no banco.
 
 ## Contenção e recuperação
 
@@ -107,6 +112,8 @@ estado `cancelled`.
 - `dicom.inbound.reject`: objeto direto rejeitado por identidade incompleta ou conflitante;
 - `dicom.inbound.quarantine status=failure`: falha ao mover objeto rejeitado para erro;
 - `cloud.upload.batch status=partial`: falha parcial ou total de envio;
+- `cloud.upload.persist_batch status=fallback`: erro de lote isolado por arquivo;
+- `cloud.send.directory status=failure`: pasta/volume de envio indisponível;
 - `cloud.circuit status=open`: unidade temporariamente suspensa para envio;
 - `cloud.upload.persist status=failure`: resposta remota não pôde ser registrada.
 
@@ -133,6 +140,10 @@ Variáveis novas e seus padrões:
 - `SEND_UNIT_SCHEDULERS=4`
 - `DASHBOARD_FILE_COUNT_CACHE_SECONDS=30`
 - `SEND_BATCH_SIZE=250`
+- `SEND_DB_BATCH_SIZE=50`
+- `SEND_RECONCILE_BATCH_SIZE=500`
+- `SEND_RECONCILE_INTERVAL_SECONDS=30`
+- `SEND_GLOBAL_CONCURRENCY=32`
 - `ORDERS_API_ACK_BATCH_SIZE=32`
 - `ORDERS_API_ACK_CONCURRENCY=8`
 - `ORDERS_API_ACK_UNIT_WORKERS=4`

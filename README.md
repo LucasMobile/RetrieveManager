@@ -221,6 +221,12 @@ sido modificados por regras não são recomprimidos. O resumo
 `dicom.compact.batch` registra `files_per_second` e
 `codec_skipped_count`, permitindo ajustar os workers com base na produção.
 
+O envio usa o PostgreSQL como fila principal e drena lotes consecutivos sem
+recomeçar uma varredura completa do diretório. Resultados são persistidos em
+lotes, com fallback individual, e a concorrência total entre unidades é limitada
+por `SEND_GLOBAL_CONCURRENCY`. Uma reconciliação incremental recupera arquivos
+órfãos e sobras já confirmadas sem reenviá-las.
+
 ## Cadastrar uma unidade
 
 Campos principais:

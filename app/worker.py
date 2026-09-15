@@ -160,17 +160,20 @@ def _compact_job(unit_id: int) -> None:
 
 
 def _send_job(unit_id: int) -> None:
-    """Run one upload batch independently from the other units."""
-    _run_unit_stage(
-        unit_id,
-        "cloud.send.batch",
-        lambda db, unit: send_unit(
-            db,
-            unit,
-            unit.cloud_url,
-            unit.file_settle_seconds,
-        ),
-    )
+    """Drain one unit's upload queue without blocking the orchestration loop."""
+    while not stop_event.is_set():
+        has_more = _run_unit_stage(
+            unit_id,
+            "cloud.send.batch",
+            lambda db, unit: send_unit(
+                db,
+                unit,
+                unit.cloud_url,
+                unit.file_settle_seconds,
+            ),
+        )
+        if has_more is not True:
+            return
 
 
 def _schedule_unit_job(
