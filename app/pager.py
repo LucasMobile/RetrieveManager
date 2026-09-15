@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from urllib.parse import urlencode
 
 
@@ -38,10 +39,7 @@ def paginate(total: int, page: int, size: int) -> dict:
 def cursor_page_links(
     pager: dict,
     *,
-    prev_cursor: int | None,
-    next_cursor: int | None,
-    page_three_cursor: int | None = None,
-    page_before_last_cursor: int | None = None,
+    page_cursors: Mapping[int, int | None],
 ) -> list[dict | None]:
     """Build compact numbered links backed by keyset cursors."""
     links: list[dict | None] = []
@@ -54,14 +52,12 @@ def cursor_page_links(
             link["query"] = query_keep(page=1)
         elif item == pager["pages"]:
             link["query"] = query_keep(last=1, page=pager["pages"])
-        elif item == pager["page"] - 1:
-            link["query"] = query_keep(after=prev_cursor, page=item)
-        elif item == pager["page"] + 1:
-            link["query"] = query_keep(before=next_cursor, page=item)
-        elif pager["page"] == 1 and item == 3:
-            link["query"] = query_keep(before=page_three_cursor, page=item)
-        elif pager["page"] == pager["pages"] and item == pager["pages"] - 2:
-            link["query"] = query_keep(after=page_before_last_cursor, page=item)
+        elif item == pager["page"]:
+            link["query"] = ""
+        elif page_cursors.get(item) is not None:
+            link["query"] = query_keep(before=page_cursors[item], page=item)
+        else:
+            link["disabled"] = True
         links.append(link)
     return links
 

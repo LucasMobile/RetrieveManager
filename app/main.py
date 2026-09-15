@@ -1778,6 +1778,27 @@ def orders_history(
     )
 
 
+def _cursor_page_cursors(
+    db: Session,
+    filtered,
+    id_column,
+    pager: dict,
+) -> dict[int, int | None]:
+    """Return the keyset boundary required to open every visible page."""
+    cursors: dict[int, int | None] = {}
+    for target_page in pager["page_items"]:
+        if target_page in (None, 1, pager["page"], pager["pages"]):
+            continue
+        boundary_offset = ((target_page - 1) * pager["size"]) - 1
+        cursors[target_page] = db.scalar(
+            filtered.with_only_columns(id_column)
+            .order_by(id_column.desc())
+            .offset(boundary_offset)
+            .limit(1)
+        )
+    return cursors
+
+
 def _orders_response(
     request: Request,
     db: Session,
@@ -1798,6 +1819,8 @@ def _orders_response(
         raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
     if sum((before is not None, after is not None, last)) > 1:
         raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
+    if page > 1 and before is None and after is None and not last:
+        raise StarletteHTTPException(422, "Cursor de paginação ausente")
     archived_filter = (
         Order.archived_at.is_not(None) if history else Order.archived_at.is_(None)
     )
@@ -1876,7 +1899,8 @@ def _orders_response(
         stmt = stmt.where(Order.id > after).order_by(Order.id.asc())
     else:
         stmt = stmt.order_by(Order.id.desc())
-    stmt = stmt.limit(pager["size"])
+    result_limit = (total - pager["offset"]) if last else pager["size"]
+    stmt = stmt.limit(result_limit)
     rows = list(db.scalars(stmt))
     if after is not None or last:
         rows.reverse()
@@ -1911,37 +1935,9 @@ def _orders_response(
         next_cursor=rows[-1].id if rows else None,
     )
 
-    page_three_cursor: int | None = None
-    page_before_last_cursor: int | None = None
-    if rows and pager["page"] == 1 and pager["pages"] > 2:
-        page_two_ids = list(
-            db.scalars(
-                filt.where(Order.id < rows[-1].id)
-                .with_only_columns(Order.id)
-                .order_by(Order.id.desc())
-                .limit(page_size)
-            )
-        )
-        if page_two_ids:
-            page_three_cursor = page_two_ids[-1]
-    elif rows and pager["page"] == pager["pages"] and pager["pages"] > 2:
-        page_before_last_ids = list(
-            db.scalars(
-                filt.where(Order.id > rows[0].id)
-                .with_only_columns(Order.id)
-                .order_by(Order.id.asc())
-                .limit(page_size)
-            )
-        )
-        if page_before_last_ids:
-            page_before_last_cursor = page_before_last_ids[-1]
-
     pager["page_links"] = cursor_page_links(
         pager,
-        prev_cursor=pager["prev_cursor"],
-        next_cursor=pager["next_cursor"],
-        page_three_cursor=page_three_cursor,
-        page_before_last_cursor=page_before_last_cursor,
+        page_cursors=_cursor_page_cursors(db, filt, Order.id, pager),
     )
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
     qs = query_keep(unit_id=unit_id, status=status, q=q, page_size=page_size)
@@ -2502,6 +2498,8 @@ def audit_logs(
         raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
     if sum((before is not None, after is not None, last)) > 1:
         raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
+    if page > 1 and before is None and after is None and not last:
+        raise StarletteHTTPException(422, "Cursor de paginação ausente")
 
     filtered = select(AuditLog)
     if action:
@@ -2539,7 +2537,8 @@ def audit_logs(
         stmt = stmt.where(AuditLog.id > after).order_by(AuditLog.id.asc())
     else:
         stmt = stmt.order_by(AuditLog.id.desc())
-    entries = list(db.scalars(stmt.limit(pager["size"])))
+    result_limit = (total - pager["offset"]) if last else pager["size"]
+    entries = list(db.scalars(stmt.limit(result_limit)))
     if after is not None or last:
         entries.reverse()
 
@@ -2570,36 +2569,9 @@ def audit_logs(
         next_cursor=entries[-1].id if entries else None,
     )
 
-    page_three_cursor: int | None = None
-    page_before_last_cursor: int | None = None
-    if entries and pager["page"] == 1 and pager["pages"] > 2:
-        page_two_ids = list(
-            db.scalars(
-                filtered.where(AuditLog.id < entries[-1].id)
-                .with_only_columns(AuditLog.id)
-                .order_by(AuditLog.id.desc())
-                .limit(page_size)
-            )
-        )
-        if page_two_ids:
-            page_three_cursor = page_two_ids[-1]
-    elif entries and pager["page"] == pager["pages"] and pager["pages"] > 2:
-        page_before_last_ids = list(
-            db.scalars(
-                filtered.where(AuditLog.id > entries[0].id)
-                .with_only_columns(AuditLog.id)
-                .order_by(AuditLog.id.asc())
-                .limit(page_size)
-            )
-        )
-        if page_before_last_ids:
-            page_before_last_cursor = page_before_last_ids[-1]
     pager["page_links"] = cursor_page_links(
         pager,
-        prev_cursor=pager["prev_cursor"],
-        next_cursor=pager["next_cursor"],
-        page_three_cursor=page_three_cursor,
-        page_before_last_cursor=page_before_last_cursor,
+        page_cursors=_cursor_page_cursors(db, filtered, AuditLog.id, pager),
     )
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     summary = {

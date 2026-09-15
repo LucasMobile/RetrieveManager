@@ -788,7 +788,7 @@ class SecurityTest(unittest.TestCase):
                     acc=f"active-{index:02d}",
                     birth_date="20000101",
                 )
-                for index in range(42)
+                for index in range(190)
             )
             db.add(
                 Order(
@@ -807,12 +807,24 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn("archived-only", first.text)
         self.assertIn('aria-label="Primeira página"', first.text)
         self.assertIn('aria-label="Última página"', first.text)
-        self.assertIn("Página 1 de 2", first.text)
+        self.assertIn("Página 1 de 7", first.text)
+        self.assertEqual(
+            self.client.get("/orders", params={"page": 2}).status_code,
+            422,
+        )
 
-        cursor = re.search(r"before=(\d+)&amp;page=2", first.text)[1]
-        second = self.client.get("/orders", params={"before": cursor, "page": 2})
-        self.assertEqual(second.text.count('class="order-date"'), 12)
-        self.assertIn("Página 2 de 2", second.text)
+        for target_page in range(2, 8):
+            link = re.search(
+                rf'href="([^"]+)" aria-label="Ir para a página {target_page}"',
+                first.text,
+            )
+            self.assertIsNotNone(link, f"Link da página {target_page} ausente")
+            href = link[1].replace("&amp;", "&")
+            response = self.client.get(f"/orders{href}")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(f"Página {target_page} de 7", response.text)
+            expected_count = 10 if target_page == 7 else 30
+            self.assertEqual(response.text.count('class="order-date"'), expected_count)
 
         ten_per_page = self.client.get("/orders", params={"page_size": 10})
         self.assertEqual(ten_per_page.text.count('class="order-date"'), 10)

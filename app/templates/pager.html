@@ -31,6 +31,8 @@
           <span class="pager__ellipsis" aria-hidden="true">…</span>
         {% elif item.current %}
           <span class="pager__current" aria-current="page" aria-label="Página {{ item.page }}">{{ item.page }}</span>
+        {% elif item.disabled %}
+          <span class="pager__link is-disabled" aria-disabled="true" aria-label="Página {{ item.page }} indisponível">{{ item.page }}</span>
         {% else %}
           <a class="pager__link" href="?{{ qs }}{% if qs %}&amp;{% endif %}{{ item.query }}" aria-label="Ir para a página {{ item.page }}">{{ item.page }}</a>
         {% endif %}
