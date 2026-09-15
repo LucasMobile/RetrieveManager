@@ -213,6 +213,14 @@ Patient ID e ID de origem. Os agregados da Visão geral têm cache curto de cinc
 segundos para que vários navegadores não repitam as mesmas varreduras do banco a
 cada atualização.
 
+Na compactação, a concorrência total do `dcmcjpeg` é limitada por
+`COMPACT_GLOBAL_WORKERS`. Persistências usam lotes pequenos configurados por
+`COMPACT_DB_BATCH_SIZE` e voltam automaticamente ao modo individual se houver
+conflito. Objetos que já estejam exatamente no JPEG configurado e não tenham
+sido modificados por regras não são recomprimidos. O resumo
+`dicom.compact.batch` registra `files_per_second` e
+`codec_skipped_count`, permitindo ajustar os workers com base na produção.
+
 ## Cadastrar uma unidade
 
 Campos principais:

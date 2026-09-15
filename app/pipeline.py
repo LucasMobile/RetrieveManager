@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from time import monotonic, perf_counter
 
 import aiohttp
 import pydicom
+from pydicom.uid import JPEGBaseline8Bit, JPEGExtended12Bit, JPEGLosslessSV1
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -22,7 +24,10 @@ from app.config import (
     CIRCUIT_BREAKER_FAILURES,
     CIRCUIT_BREAKER_SECONDS,
     COMPACT_BATCH_SIZE,
+    COMPACT_DB_BATCH_SIZE,
     COMPACT_GLOBAL_WORKERS,
+    COMPACT_TEMP_MAX_AGE_SECONDS,
+    DCMCJPEG_TIMEOUT_SECONDS,
     FIND_BATCH_SIZE,
     HTTP_CONNECT_TIMEOUT_SECONDS,
     HTTP_TOTAL_TIMEOUT_SECONDS,
@@ -97,6 +102,11 @@ UNMATCHED_ORDER_CLEANUP_BATCH = 500
 COMPLETED_ORDER_RETENTION = timedelta(weeks=2)
 COMPLETED_ORDER_CLEANUP_BATCH = 500
 _compact_slots = BoundedSemaphore(max(1, COMPACT_GLOBAL_WORKERS))
+_TARGET_TRANSFER_SYNTAX = {
+    "+e1": str(JPEGLosslessSV1),
+    "+eb": str(JPEGBaseline8Bit),
+    "+ee": str(JPEGExtended12Bit),
+}
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,7 @@ class CompactResult:
     description: str = ""
     observed_at: datetime | None = None
     rule_matches: tuple[RuleMatch, ...] = ()
+    codec_skipped: bool = False
 
 
 @dataclass(frozen=True)
@@ -1691,6 +1702,157 @@ def _compact_one_limited(*args) -> CompactResult:
         return _compact_one(*args)
 
 
+def _cleanup_compaction_temps(work_dir: Path) -> list[tuple[Path, OSError]]:
+    """Remove abandoned codec files without touching active queue entries."""
+    if not work_dir.is_dir():
+        return []
+    cutoff = datetime.now().timestamp() - max(
+        60,
+        COMPACT_TEMP_MAX_AGE_SECONDS,
+        DCMCJPEG_TIMEOUT_SECONDS * 2,
+    )
+    errors: list[tuple[Path, OSError]] = []
+    try:
+        with os.scandir(work_dir) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                try:
+                    if (
+                        entry.is_file(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_mtime < cutoff
+                    ):
+                        path.unlink(missing_ok=True)
+                except OSError as exc:
+                    errors.append((path, exc))
+    except OSError as exc:
+        errors.append((work_dir, exc))
+    return errors
+
+
+def _prefetch_compact_state(
+    db: Session,
+    unit: Unit,
+    results: list[CompactResult],
+) -> tuple[dict[str, Order], dict[str, ImageTransfer]]:
+    """Load common associations once for a persistence chunk."""
+    study_uids = {result.study_uid for result in results if result.study_uid}
+    filenames = {
+        result.output_name or result.source_name
+        for result in results
+        if result.output_name or result.source_name
+    }
+    active_orders: dict[str, Order] = {}
+    if study_uids:
+        rows = db.scalars(
+            select(Order)
+            .where(
+                Order.unit_id == unit.id,
+                Order.study_uid.in_(study_uids),
+                Order.archived_at.is_(None),
+                Order.status.notin_(("done", "cancelled")),
+            )
+            .order_by(Order.id.desc())
+        )
+        for order in rows:
+            active_orders.setdefault(order.study_uid, order)
+    transfers: dict[str, ImageTransfer] = {}
+    if filenames:
+        transfers = {
+            transfer.filename: transfer
+            for transfer in db.scalars(
+                select(ImageTransfer).where(
+                    ImageTransfer.unit_id == unit.id,
+                    ImageTransfer.filename.in_(filenames),
+                )
+            )
+        }
+    return active_orders, transfers
+
+
+def _persist_compact_result_with_retry(
+    db: Session,
+    unit: Unit,
+    result: CompactResult,
+) -> bool:
+    """Persist one result with the former retry guarantees."""
+    for persist_attempt in range(1, 4):
+        try:
+            _record_compact_result(db, unit, result)
+            db.commit()
+            return True
+        except Exception as exc:
+            db.rollback()
+            retryable = isinstance(exc, SQLAlchemyError)
+            exhausted = persist_attempt == 3 or not retryable
+            log_event(
+                log,
+                logging.ERROR if exhausted else logging.WARNING,
+                "dicom.compact.persist",
+                resource=f"unit:{unit.id}",
+                status="failure" if exhausted else "retry",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                unit_id=unit.id,
+                filename=result.output_name or result.source_name,
+                attempt=persist_attempt,
+            )
+            if exhausted:
+                return False
+    return False
+
+
+def _persist_compact_chunk(
+    db: Session,
+    unit: Unit,
+    results: list[CompactResult],
+) -> tuple[int, int]:
+    """Commit a small chunk, falling back per file on any conflict."""
+    if not results:
+        return 0, 0
+    if len(results) == 1 or COMPACT_DB_BATCH_SIZE <= 1:
+        persisted = _persist_compact_result_with_retry(db, unit, results[0])
+        return (
+            (1, int(bool(results[0].error_type)))
+            if persisted
+            else (0, 1)
+        )
+    try:
+        active_orders, transfers = _prefetch_compact_state(db, unit, results)
+        for result in results:
+            _record_compact_result(
+                db,
+                unit,
+                result,
+                active_orders=active_orders,
+                transfers=transfers,
+            )
+        db.commit()
+        return len(results), sum(bool(result.error_type) for result in results)
+    except Exception as exc:
+        db.rollback()
+        log_event(
+            log,
+            logging.WARNING,
+            "dicom.compact.persist.batch",
+            resource=f"unit:{unit.id}",
+            status="fallback",
+            error=exc,
+            error_detail=safe_error_detail(exc),
+            unit_id=unit.id,
+            file_count=len(results),
+        )
+
+    processed_count = 0
+    failed_count = 0
+    for result in results:
+        if _persist_compact_result_with_retry(db, unit, result):
+            processed_count += 1
+            failed_count += int(bool(result.error_type))
+        else:
+            failed_count += 1
+    return processed_count, failed_count
+
+
 def compact_unit(db: Session, unit: Unit) -> bool:
     """Process one bounded batch and report whether more work may be available."""
     origin = Path(unit.receive_dir)
@@ -1698,6 +1860,20 @@ def compact_unit(db: Session, unit: Unit) -> bool:
     error_dir = Path(unit.error_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     error_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = dest_dir / ".retrieve-compact-tmp"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    for path, exc in _cleanup_compaction_temps(work_dir):
+        log_event(
+            log,
+            logging.WARNING,
+            "dicom.compact.temp.cleanup",
+            resource=f"unit:{unit.id}",
+            status="failure",
+            error=exc,
+            error_detail=safe_error_detail(exc),
+            unit_id=unit.id,
+            path_name=path.name,
+        )
     drops, compress_map = compression_runtime_settings(db, unit.id)
     dicom_rules = load_rule_specs(db, unit.id)
     settle = unit.file_settle_seconds
@@ -1735,6 +1911,8 @@ def compact_unit(db: Session, unit: Unit) -> bool:
         )
     processed_count = 0
     failed_count = 0
+    codec_skipped_count = 0
+    persistence_buffer: list[CompactResult] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
             pool.submit(
@@ -1742,6 +1920,7 @@ def compact_unit(db: Session, unit: Unit) -> bool:
                 str(p),
                 str(dest_dir / (p.name + ".dcm")),
                 str(error_dir / p.name),
+                str(work_dir),
                 unit.token,
                 drops,
                 compress_map,
@@ -1773,31 +1952,25 @@ def compact_unit(db: Session, unit: Unit) -> bool:
                     quarantine_error=quarantine_error,
                 )
                 continue
-            for persist_attempt in range(1, 4):
-                try:
-                    _record_compact_result(db, unit, result)
-                    db.commit()
-                    processed_count += 1
-                    if result.error_type:
-                        failed_count += 1
-                    break
-                except SQLAlchemyError as exc:
-                    db.rollback()
-                    exhausted = persist_attempt == 3
-                    log_event(
-                        log,
-                        logging.ERROR if exhausted else logging.WARNING,
-                        "dicom.compact.persist",
-                        resource=f"unit:{unit.id}",
-                        status="failure" if exhausted else "retry",
-                        error=exc,
-                        error_detail=safe_error_detail(exc),
-                        unit_id=unit.id,
-                        filename=result.output_name or result.source_name,
-                        attempt=persist_attempt,
-                    )
-                    if exhausted:
-                        failed_count += 1
+            codec_skipped_count += int(result.codec_skipped)
+            persistence_buffer.append(result)
+            if len(persistence_buffer) >= max(1, COMPACT_DB_BATCH_SIZE):
+                persisted, persist_failures = _persist_compact_chunk(
+                    db,
+                    unit,
+                    persistence_buffer,
+                )
+                processed_count += persisted
+                failed_count += persist_failures
+                persistence_buffer.clear()
+    if persistence_buffer:
+        persisted, persist_failures = _persist_compact_chunk(
+            db,
+            unit,
+            persistence_buffer,
+        )
+        processed_count += persisted
+        failed_count += persist_failures
     elapsed_seconds = max(perf_counter() - started_at, 0.001)
     with log_context(batch_correlation):
         log_event(
@@ -1813,6 +1986,8 @@ def compact_unit(db: Session, unit: Unit) -> bool:
             failed_count=failed_count,
             backlog_hint=len(jobs) >= COMPACT_BATCH_SIZE,
             files_per_second=round(processed_count / elapsed_seconds, 2),
+            codec_skipped_count=codec_skipped_count,
+            db_batch_size=max(1, COMPACT_DB_BATCH_SIZE),
         )
     return len(jobs) >= COMPACT_BATCH_SIZE
 
@@ -1825,6 +2000,7 @@ def _compact_one(
     filepath: str,
     dest: str,
     error: str,
+    work_dir: str,
     token: str,
     drops: set[str],
     compress_map: dict[str, str],
@@ -1890,36 +2066,71 @@ def _compact_one(
         )
 
     flag = compress_map.get(processing_modality, compress_map.get("*", "+e1"))
+    source_path = Path(filepath)
     dest_path = Path(dest)
-    temp_dest = dest_path.with_name(
-        f".{dest_path.name}.{new_correlation_id()[:8]}.tmp"
-    )
+    temp_root = Path(work_dir)
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_token = new_correlation_id()
+    # UUID-only names avoid filesystem length failures when a PACS sends an
+    # unusually long SOP-based filename.
+    temp_input = temp_root / f".{temp_token}.prepared.tmp"
+    temp_dest = temp_root / f".{temp_token}.output.tmp"
     promoted = False
+    codec_skipped = False
     try:
-        image.save_as(filepath)
-        code, _out = dcmcjpeg(flag, filepath, str(temp_dest))
-        if code != 0:
-            temp_dest.unlink(missing_ok=True)
-            _quarantine_failed_source(Path(filepath), Path(error).parent)
-            return CompactResult(
-                name,
-                name,
-                study_uid,
-                "compression_error",
-                "DcmcjpegError",
-                **identity,
-                rule_matches=rule_result.matches,
+        file_meta = getattr(image, "file_meta", None)
+        current_syntax = str(getattr(file_meta, "TransferSyntaxUID", "") or "")
+        if (
+            current_syntax == _TARGET_TRANSFER_SYNTAX.get(flag)
+            and not rule_result.modified
+        ):
+            # Metadata and rules still need to be written, but recompressing an
+            # already matching pixel stream only wastes CPU and can reduce quality.
+            image.save_as(temp_dest)
+            codec_skipped = True
+        else:
+            # Never rewrite the received source in place. If the codec fails or
+            # the process is interrupted, the original remains available for
+            # quarantine and diagnosis.
+            image.save_as(temp_input)
+            code, _out = dcmcjpeg(
+                flag,
+                str(temp_input),
+                str(temp_dest),
+                timeout=max(1, DCMCJPEG_TIMEOUT_SECONDS),
             )
+            if code != 0:
+                error_type = "DcmcjpegTimeout" if code == 124 else "DcmcjpegError"
+                with suppress(OSError):
+                    temp_input.unlink(missing_ok=True)
+                with suppress(OSError):
+                    temp_dest.unlink(missing_ok=True)
+                _quarantine_failed_source(source_path, Path(error).parent)
+                return CompactResult(
+                    name,
+                    name,
+                    study_uid,
+                    "compression_error",
+                    error_type,
+                    **identity,
+                    rule_matches=rule_result.matches,
+                )
+            with suppress(OSError):
+                temp_input.unlink(missing_ok=True)
         os.replace(temp_dest, dest_path)
         promoted = True
-        os.remove(filepath)
+        source_path.unlink()
     except Exception as exc:
-        temp_dest.unlink(missing_ok=True)
+        with suppress(OSError):
+            temp_input.unlink(missing_ok=True)
+        with suppress(OSError):
+            temp_dest.unlink(missing_ok=True)
         # If promotion succeeded but source cleanup failed, discard the output;
         # otherwise the sender could upload an image lacking its DB association.
         if promoted:
-            dest_path.unlink(missing_ok=True)
-        _quarantine_failed_source(Path(filepath), Path(error).parent)
+            with suppress(OSError):
+                dest_path.unlink(missing_ok=True)
+        _quarantine_failed_source(source_path, Path(error).parent)
         return CompactResult(
             name,
             name,
@@ -1936,38 +2147,53 @@ def _compact_one(
         "compressed",
         **identity,
         rule_matches=rule_result.matches,
+        codec_skipped=codec_skipped,
     )
 
 
-def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> None:
+def _record_compact_result(
+    db: Session,
+    unit: Unit,
+    result: CompactResult,
+    *,
+    active_orders: dict[str, Order] | None = None,
+    transfers: dict[str, ImageTransfer] | None = None,
+) -> None:
     # An exact active current-study match always wins. Completed/archived orders
     # are considered only after the historical matcher, otherwise a study that
     # is currently being retrieved as history could be attached to an old main
     # order instead of the active historical flow.
     order = None
     if result.study_uid:
-        order = db.scalar(
-            select(Order)
-            .where(
-                Order.unit_id == unit.id,
-                Order.study_uid == result.study_uid,
-                Order.archived_at.is_(None),
-                Order.status.notin_(("done", "cancelled")),
+        if active_orders is not None:
+            order = active_orders.get(result.study_uid)
+        else:
+            order = db.scalar(
+                select(Order)
+                .where(
+                    Order.unit_id == unit.id,
+                    Order.study_uid == result.study_uid,
+                    Order.archived_at.is_(None),
+                    Order.status.notin_(("done", "cancelled")),
+                )
+                .order_by(Order.id.desc())
+                .limit(1)
             )
-            .order_by(Order.id.desc())
-            .limit(1)
-        )
     if order is not None:
         _enrich_order_from_received(order, result)
     correlation_id = (
         _ensure_order_correlation(order) if order is not None else new_correlation_id()
     )
-    transfer = db.scalar(
-        select(ImageTransfer).where(
-            ImageTransfer.unit_id == unit.id,
-            ImageTransfer.filename == (result.output_name or result.source_name),
+    filename = result.output_name or result.source_name
+    if transfers is not None:
+        transfer = transfers.get(filename)
+    else:
+        transfer = db.scalar(
+            select(ImageTransfer).where(
+                ImageTransfer.unit_id == unit.id,
+                ImageTransfer.filename == filename,
+            )
         )
-    )
     if transfer is None:
         transfer = ImageTransfer(
             unit_id=unit.id,
@@ -1980,6 +2206,8 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
         )
         db.add(transfer)
         db.flush()
+        if transfers is not None:
+            transfers[filename] = transfer
     else:
         transfer.order_id = order.id if order else transfer.order_id
         transfer.correlation_id = correlation_id
@@ -2011,6 +2239,14 @@ def _record_compact_result(db: Session, unit: Unit, result: CompactResult) -> No
             else:
                 transfer.order_id = order.id
                 transfer.correlation_id = _ensure_order_correlation(order)
+
+    if (
+        active_orders is not None
+        and order is not None
+        and order.study_uid == result.study_uid
+        and association != "historical"
+    ):
+        active_orders[result.study_uid] = order
 
     transfer.status = "metadata_error" if rejection_type else result.status
     transfer.last_error = _bounded_db_text(

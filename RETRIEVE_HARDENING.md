@@ -61,7 +61,14 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
      não reaparecerem indefinidamente no início de cada lote;
    - o codec grava em arquivo oculto temporário e só publica a saída com rename
      atômico, portanto o uploader nunca lê um DICOM parcialmente escrito;
-   - cada resultado é persistido em transação própria;
+   - arquivos já codificados exatamente no perfil solicitado preservam o pixel
+     data e não executam novamente o `dcmcjpeg`, desde que nenhuma regra tenha
+     alterado o dataset;
+   - a origem recebida nunca é regravada: metadados são preparados em arquivo
+     temporário e uma falha mantém o original íntegro para diagnóstico;
+   - metadados e vínculos são pré-carregados e persistidos em pequenos lotes;
+     conflito ou erro no lote aciona automaticamente o fallback por arquivo;
+   - temporários abandonados são removidos apenas depois de uma idade segura;
    - arquivos inválidos seguem para o diretório de erro e descartes são auditados.
 8. **Envio (`cloud.upload.*`)**
    - roda em job próprio por unidade, sem esperar compactação ou outra unidade;
@@ -93,6 +100,9 @@ estado `cancelled`.
 - `dicom.move status=failure`: três tentativas do retrieve atual esgotadas;
 - `dicom.move.prior status=failure`: tentativas do histórico esgotadas;
 - `dicom.compact.batch status=partial`: um ou mais arquivos falharam;
+- `dicom.compact.persist.batch status=fallback`: conflito no lote de banco,
+  tratado novamente de forma isolada por arquivo;
+- `dicom.compact.temp.cleanup status=failure`: temporário antigo não pôde ser removido;
 - `order.storescp.ingest`: pedido direto criado, associado, reutilizado ou restaurado;
 - `dicom.inbound.reject`: objeto direto rejeitado por identidade incompleta ou conflitante;
 - `dicom.inbound.quarantine status=failure`: falha ao mover objeto rejeitado para erro;
@@ -116,6 +126,9 @@ Variáveis novas e seus padrões:
 - `FIND_BATCH_SIZE=10`
 - `COMPACT_BATCH_SIZE=250`
 - `COMPACT_GLOBAL_WORKERS=8`
+- `COMPACT_DB_BATCH_SIZE=25`
+- `COMPACT_TEMP_MAX_AGE_SECONDS=3600`
+- `DCMCJPEG_TIMEOUT_SECONDS=300`
 - `COMPACT_UNIT_SCHEDULERS=4`
 - `SEND_UNIT_SCHEDULERS=4`
 - `DASHBOARD_FILE_COUNT_CACHE_SECONDS=30`

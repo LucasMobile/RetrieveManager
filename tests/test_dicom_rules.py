@@ -3,9 +3,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pydicom
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.encaps import encapsulate, generate_frames
 from pydicom.uid import (
     ExplicitVRLittleEndian,
+    JPEGLosslessSV1,
     SecondaryCaptureImageStorage,
     generate_uid,
 )
@@ -164,6 +167,7 @@ class DicomRulesTest(DatabaseTestCase):
                 str(source),
                 str(Path(directory) / "output.dcm"),
                 str(Path(directory) / "error.dcm"),
+                str(Path(directory) / ".work"),
                 "token",
                 set(),
                 {"*": "+e1"},
@@ -205,7 +209,13 @@ class DicomRulesTest(DatabaseTestCase):
             image.Modality = "CT"
             image.save_as(source, enforce_file_format=True)
 
-            def fake_dcmcjpeg(_flag, _source, destination):
+            work = Path(directory) / ".work"
+
+            def fake_dcmcjpeg(_flag, prepared_source, destination, *, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertNotEqual(Path(prepared_source), source)
+                self.assertEqual(Path(prepared_source).parent, work)
+                self.assertTrue(Path(prepared_source).is_file())
                 destination_path = Path(destination)
                 self.assertTrue(destination_path.name.startswith("."))
                 destination_path.write_bytes(b"compressed")
@@ -216,6 +226,7 @@ class DicomRulesTest(DatabaseTestCase):
                     str(source),
                     str(output),
                     str(error),
+                    str(work),
                     "token",
                     set(),
                     {"*": "+e1"},
@@ -226,6 +237,161 @@ class DicomRulesTest(DatabaseTestCase):
             self.assertFalse(source.exists())
             self.assertEqual(output.read_bytes(), b"compressed")
             self.assertFalse(any(output.parent.glob(".*.tmp")))
+            self.assertFalse(any(work.iterdir()))
+
+    def test_compaction_skips_codec_when_transfer_syntax_already_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "CT-image"
+            output = root / "send" / "CT-image.dcm"
+            error = root / "error" / "CT-image"
+            work = root / "work"
+            output.parent.mkdir()
+            error.parent.mkdir()
+            file_meta = FileMetaDataset()
+            file_meta.TransferSyntaxUID = JPEGLosslessSV1
+            file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+            file_meta.MediaStorageSOPInstanceUID = generate_uid()
+            image = FileDataset(
+                str(source),
+                {},
+                file_meta=file_meta,
+                preamble=b"\0" * 128,
+            )
+            image.SOPClassUID = file_meta.MediaStorageSOPClassUID
+            image.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+            image.StudyInstanceUID = generate_uid()
+            image.Modality = "CT"
+            image.Rows = 1
+            image.Columns = 1
+            image.SamplesPerPixel = 1
+            image.PhotometricInterpretation = "MONOCHROME2"
+            image.BitsAllocated = 8
+            image.BitsStored = 8
+            image.HighBit = 7
+            image.PixelRepresentation = 0
+            image.PixelData = encapsulate([b"\xff\xd8compressed-pixel\xff\xd9"])
+            image["PixelData"].is_undefined_length = True
+            image.save_as(source, enforce_file_format=True)
+
+            with patch("app.pipeline.dcmcjpeg") as codec:
+                result = _compact_one(
+                    str(source),
+                    str(output),
+                    str(error),
+                    str(work),
+                    "token",
+                    set(),
+                    {"*": "+e1"},
+                    (),
+                )
+
+            codec.assert_not_called()
+            self.assertTrue(result.codec_skipped)
+            self.assertEqual(result.status, "compressed")
+            self.assertTrue(output.is_file())
+            self.assertFalse(source.exists())
+            saved = pydicom.dcmread(output)
+            self.assertEqual(saved.file_meta.TransferSyntaxUID, JPEGLosslessSV1)
+            self.assertTrue(
+                next(generate_frames(saved.PixelData)).startswith(b"\xff\xd8")
+            )
+
+    def test_codec_timeout_quarantines_untouched_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "CT-timeout"
+            output = root / "send" / "CT-timeout.dcm"
+            error = root / "error" / "CT-timeout"
+            work = root / "work"
+            output.parent.mkdir()
+            error.parent.mkdir()
+            file_meta = FileMetaDataset()
+            file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+            file_meta.MediaStorageSOPInstanceUID = generate_uid()
+            image = FileDataset(
+                str(source),
+                {},
+                file_meta=file_meta,
+                preamble=b"\0" * 128,
+            )
+            image.SOPClassUID = file_meta.MediaStorageSOPClassUID
+            image.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+            image.StudyInstanceUID = generate_uid()
+            image.Modality = "CT"
+            image.save_as(source, enforce_file_format=True)
+
+            with patch("app.pipeline.dcmcjpeg", return_value=(124, "TIMEOUT")):
+                result = _compact_one(
+                    str(source),
+                    str(output),
+                    str(error),
+                    str(work),
+                    "unit-token",
+                    set(),
+                    {"*": "+e1"},
+                    (),
+                )
+
+            quarantined = pydicom.dcmread(error)
+            self.assertEqual(result.error_type, "DcmcjpegTimeout")
+            self.assertNotIn("InstitutionalDepartmentName", quarantined)
+            self.assertFalse(output.exists())
+            self.assertFalse(source.exists())
+            self.assertFalse(any(work.iterdir()))
+
+    def test_modified_rule_keeps_codec_in_the_processing_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "CT-rule"
+            output = root / "send" / "CT-rule.dcm"
+            error = root / "error" / "CT-rule"
+            work = root / "work"
+            output.parent.mkdir()
+            error.parent.mkdir()
+            file_meta = FileMetaDataset()
+            file_meta.TransferSyntaxUID = JPEGLosslessSV1
+            file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+            file_meta.MediaStorageSOPInstanceUID = generate_uid()
+            image = FileDataset(
+                str(source),
+                {},
+                file_meta=file_meta,
+                preamble=b"\0" * 128,
+            )
+            image.SOPClassUID = file_meta.MediaStorageSOPClassUID
+            image.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+            image.StudyInstanceUID = generate_uid()
+            image.Modality = "CT"
+            image.save_as(source, enforce_file_format=True)
+
+            def fake_codec(_flag, prepared, destination, *, timeout):
+                self.assertGreater(timeout, 0)
+                Path(destination).write_bytes(Path(prepared).read_bytes())
+                return 0, ""
+
+            replace_rule = rule(
+                RuleConditionSpec("0008,0060", "equals", "CT"),
+                action="replace",
+                action_tag="0008,0080",
+                action_value="Mobilemed",
+            )
+            with patch("app.pipeline.dcmcjpeg", side_effect=fake_codec) as codec:
+                result = _compact_one(
+                    str(source),
+                    str(output),
+                    str(error),
+                    str(work),
+                    "unit-token",
+                    set(),
+                    {"*": "+e1"},
+                    (replace_rule,),
+                )
+
+            codec.assert_called_once()
+            self.assertFalse(result.codec_skipped)
+            self.assertEqual(result.status, "compressed")
 
     def test_payload_validates_units_conditions_and_action_tag(self):
         payload = validate_rule_payload(

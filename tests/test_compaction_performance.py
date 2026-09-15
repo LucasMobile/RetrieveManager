@@ -1,9 +1,19 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.pipeline import _settled_files, compact_unit
+from sqlalchemy import func, select
+
+from app.models import ImageTransfer, Order
+from app.pipeline import (
+    CompactResult,
+    _cleanup_compaction_temps,
+    _persist_compact_chunk,
+    _settled_files,
+    compact_unit,
+)
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -20,6 +30,21 @@ class SettledFilesTest(unittest.TestCase):
             self.assertEqual(len(files), 3)
             self.assertFalse(errors)
             self.assertTrue(all(not path.name.startswith(".") for path in files))
+
+    def test_only_stale_compaction_temporaries_are_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / ".old.prepared.tmp"
+            active = root / ".active.output.tmp"
+            stale.write_bytes(b"old")
+            active.write_bytes(b"active")
+            os.utime(stale, (1, 1))
+
+            errors = _cleanup_compaction_temps(root)
+
+            self.assertFalse(errors)
+            self.assertFalse(stale.exists())
+            self.assertTrue(active.exists())
 
 
 class CompactionFailureIsolationTest(DatabaseTestCase):
@@ -59,6 +84,63 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
             self.assertFalse(has_more)
             self.assertFalse(source.exists())
             self.assertTrue((error / source.name).is_file())
+
+    def test_compact_metadata_is_committed_once_per_chunk(self):
+        with self.Session() as db:
+            unit = make_unit(name="Unidade")
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                source_id="source",
+                acc="ACC",
+                birth_date="20000101",
+                study_uid="1.2.current",
+                status="receiving",
+                correlation_id="correlation",
+            )
+            db.add(order)
+            db.commit()
+            results = [
+                CompactResult(
+                    f"image-{index}",
+                    f"image-{index}.dcm",
+                    order.study_uid,
+                    "compressed",
+                )
+                for index in range(5)
+            ]
+
+            with patch.object(db, "commit", wraps=db.commit) as commit:
+                processed, failed = _persist_compact_chunk(db, unit, results)
+
+            self.assertEqual((processed, failed), (5, 0))
+            self.assertEqual(commit.call_count, 1)
+            self.assertEqual(
+                db.scalar(select(func.count()).select_from(ImageTransfer)),
+                5,
+            )
+
+    def test_chunk_failure_falls_back_and_isolates_bad_metadata(self):
+        with self.Session() as db:
+            unit = make_unit(name="Unidade")
+            db.add(unit)
+            db.commit()
+            results = [
+                CompactResult(name, f"{name}.dcm", "1.2.3", "compressed")
+                for name in ("first", "bad", "last")
+            ]
+
+            def persist(_db, _unit, result, **caches):
+                if caches:
+                    raise RuntimeError("force conservative fallback")
+                if result.source_name == "bad":
+                    raise ValueError("invalid metadata")
+
+            with patch("app.pipeline._record_compact_result", side_effect=persist):
+                processed, failed = _persist_compact_chunk(db, unit, results)
+
+            self.assertEqual((processed, failed), (2, 1))
 
 
 if __name__ == "__main__":
