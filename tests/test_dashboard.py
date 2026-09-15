@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from app.main import _dashboard_units
+from app.main import _dashboard_folder_cache, _dashboard_units, _unit_runtime
 from app.models import Order, Unit
 from tests.support import DatabaseTestCase, make_unit
 
@@ -128,6 +128,31 @@ class DashboardTest(DatabaseTestCase):
 
         self.assertEqual(len(units), 2)
         self.assertTrue(all(unit.store_up for unit in units))
+
+    def test_folder_counts_are_cached_between_dashboard_refreshes(self):
+        unit = self._unit("A", enabled=True)
+        unit.id = 999
+        cache_key = (
+            unit.id,
+            unit.receive_dir,
+            unit.send_dir,
+            unit.error_dir,
+        )
+        _dashboard_folder_cache.pop(cache_key, None)
+        with (
+            patch(
+                "app.main.folder_counts",
+                return_value={"receive": 10, "send": 2, "error": 1},
+            ) as counts,
+            patch("app.main.port_listening", return_value=True) as port,
+        ):
+            first = _unit_runtime(unit)
+            second = _unit_runtime(unit)
+
+        self.assertEqual(first, second)
+        self.assertEqual(counts.call_count, 1)
+        self.assertEqual(port.call_count, 2)
+        _dashboard_folder_cache.pop(cache_key, None)
 
 
 if __name__ == "__main__":

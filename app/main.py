@@ -30,7 +30,13 @@ from app.compression import (
     save_unit_compression_settings,
     validate_unit_compression_form,
 )
-from app.config import BASE_DIR, DEFAULT_CLOUD_URL, SECRET_KEY, SESSION_HTTPS_ONLY
+from app.config import (
+    BASE_DIR,
+    DASHBOARD_FILE_COUNT_CACHE_SECONDS,
+    DEFAULT_CLOUD_URL,
+    SECRET_KEY,
+    SESSION_HTTPS_ONLY,
+)
 from app.db import get_db, init_db
 from app.dicom_rules import (
     ACTIONS,
@@ -145,6 +151,10 @@ log = logging.getLogger("web")
 
 _dashboard_stats_cache: dict[str, Any] = {"expires_at": 0.0}
 _dashboard_stats_lock = Lock()
+_dashboard_folder_cache: dict[
+    tuple[int, str, str, str], tuple[float, dict[str, int]]
+] = {}
+_dashboard_folder_lock = Lock()
 
 configure_logging()
 
@@ -479,8 +489,25 @@ def logout(request: Request):
 
 
 def _unit_runtime(unit: Unit) -> tuple[dict[str, int], bool]:
+    cache_key = (
+        unit.id,
+        unit.receive_dir,
+        unit.send_dir,
+        unit.error_dir,
+    )
+    now = monotonic()
+    with _dashboard_folder_lock:
+        cached = _dashboard_folder_cache.get(cache_key)
+        folders = dict(cached[1]) if cached and now < cached[0] else None
+    if folders is None:
+        folders = folder_counts(unit)
+        with _dashboard_folder_lock:
+            _dashboard_folder_cache[cache_key] = (
+                now + max(1, DASHBOARD_FILE_COUNT_CACHE_SECONDS),
+                dict(folders),
+            )
     return (
-        folder_counts(unit),
+        folders,
         port_listening(unit.store_port) if unit.enabled else False,
     )
 

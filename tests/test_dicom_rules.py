@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import (
@@ -180,6 +181,51 @@ class DicomRulesTest(DatabaseTestCase):
             self.assertEqual(result.status, "discarded_rule")
             self.assertEqual(result.rule_matches[0].rule_name, "Regra de teste")
             self.assertFalse(source.exists())
+
+    def test_compaction_promotes_complete_output_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "CT-image"
+            output = Path(directory) / "send" / "CT-image.dcm"
+            error = Path(directory) / "error" / "CT-image"
+            output.parent.mkdir()
+            error.parent.mkdir()
+            file_meta = FileMetaDataset()
+            file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+            file_meta.MediaStorageSOPInstanceUID = generate_uid()
+            image = FileDataset(
+                str(source),
+                {},
+                file_meta=file_meta,
+                preamble=b"\0" * 128,
+            )
+            image.SOPClassUID = file_meta.MediaStorageSOPClassUID
+            image.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+            image.StudyInstanceUID = generate_uid()
+            image.Modality = "CT"
+            image.save_as(source, enforce_file_format=True)
+
+            def fake_dcmcjpeg(_flag, _source, destination):
+                destination_path = Path(destination)
+                self.assertTrue(destination_path.name.startswith("."))
+                destination_path.write_bytes(b"compressed")
+                return 0, ""
+
+            with patch("app.pipeline.dcmcjpeg", side_effect=fake_dcmcjpeg):
+                result = _compact_one(
+                    str(source),
+                    str(output),
+                    str(error),
+                    "token",
+                    set(),
+                    {"*": "+e1"},
+                    (),
+                )
+
+            self.assertEqual(result.status, "compressed")
+            self.assertFalse(source.exists())
+            self.assertEqual(output.read_bytes(), b"compressed")
+            self.assertFalse(any(output.parent.glob(".*.tmp")))
 
     def test_payload_validates_units_conditions_and_action_tag(self):
         payload = validate_rule_payload(

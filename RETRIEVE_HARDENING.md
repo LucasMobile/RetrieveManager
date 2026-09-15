@@ -52,10 +52,19 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - pedidos arquivados do mesmo Study UID são restaurados em vez de duplicados.
 7. **Compactação (`dicom.compact.*`)**
    - processa no máximo `COMPACT_BATCH_SIZE` arquivos por ciclo;
+   - a fila é lida com `scandir` e a varredura para assim que o lote é preenchido,
+     evitando ordenar e manter dezenas de milhares de caminhos em memória;
+   - unidades são compactadas em jobs independentes e a concorrência total dos
+     codecs é limitada por `COMPACT_GLOBAL_WORKERS`;
    - cada arquivo é executado isoladamente; uma exceção não cancela os demais;
+   - arquivos que provocam exceção inesperada são movidos para quarentena, para
+     não reaparecerem indefinidamente no início de cada lote;
+   - o codec grava em arquivo oculto temporário e só publica a saída com rename
+     atômico, portanto o uploader nunca lê um DICOM parcialmente escrito;
    - cada resultado é persistido em transação própria;
    - arquivos inválidos seguem para o diretório de erro e descartes são auditados.
 8. **Envio (`cloud.upload.*`)**
+   - roda em job próprio por unidade, sem esperar compactação ou outra unidade;
    - processa no máximo `SEND_BATCH_SIZE` arquivos por ciclo;
    - falhas usam backoff exponencial persistente;
    - o circuit breaker é independente por unidade;
@@ -106,6 +115,10 @@ Variáveis novas e seus padrões:
 
 - `FIND_BATCH_SIZE=10`
 - `COMPACT_BATCH_SIZE=250`
+- `COMPACT_GLOBAL_WORKERS=8`
+- `COMPACT_UNIT_SCHEDULERS=4`
+- `SEND_UNIT_SCHEDULERS=4`
+- `DASHBOARD_FILE_COUNT_CACHE_SECONDS=30`
 - `SEND_BATCH_SIZE=250`
 - `ORDERS_API_ACK_BATCH_SIZE=32`
 - `ORDERS_API_ACK_CONCURRENCY=8`

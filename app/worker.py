@@ -9,7 +9,9 @@ from time import perf_counter
 from sqlalchemy import select
 
 from app.config import (
+    COMPACT_UNIT_SCHEDULERS,
     ORDERS_API_ACK_UNIT_WORKERS,
+    SEND_UNIT_SCHEDULERS,
     WORKER_HEALTH_FILE,
     WORKER_INTERVAL_SECONDS,
 )
@@ -145,6 +147,74 @@ def _schedule_ack_job(
     jobs[unit_id] = pool.submit(_ack_job, unit_id)
 
 
+def _compact_job(unit_id: int) -> None:
+    """Drain one unit's receive queue without blocking the orchestration loop."""
+    while not stop_event.is_set():
+        has_more = _run_unit_stage(
+            unit_id,
+            "dicom.compact.batch",
+            compact_unit,
+        )
+        if has_more is not True:
+            return
+
+
+def _send_job(unit_id: int) -> None:
+    """Run one upload batch independently from the other units."""
+    _run_unit_stage(
+        unit_id,
+        "cloud.send.batch",
+        lambda db, unit: send_unit(
+            db,
+            unit,
+            unit.cloud_url,
+            unit.file_settle_seconds,
+        ),
+    )
+
+
+def _schedule_unit_job(
+    pool: ThreadPoolExecutor,
+    jobs: dict[int, Future],
+    unit_id: int,
+    callback,
+    stage: str,
+) -> None:
+    """Keep at most one background job of a given stage active per unit."""
+    existing = jobs.get(unit_id)
+    if existing is not None and not existing.done():
+        return
+    if existing is not None:
+        try:
+            existing.result()
+        except Exception as exc:
+            log_event(
+                log,
+                logging.ERROR,
+                "worker.stage.job",
+                resource=f"unit:{unit_id}",
+                status="failure",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+                stage=stage,
+                unit_id=unit_id,
+            )
+    try:
+        jobs[unit_id] = pool.submit(callback, unit_id)
+    except RuntimeError as exc:
+        log_event(
+            log,
+            logging.WARNING,
+            "worker.stage.job",
+            resource=f"unit:{unit_id}",
+            status="skipped",
+            error=exc,
+            error_detail=safe_error_detail(exc),
+            stage=stage,
+            unit_id=unit_id,
+        )
+
+
 def main() -> None:
     configure_logging()
     signal.signal(signal.SIGINT, _stop)
@@ -156,7 +226,17 @@ def main() -> None:
         max_workers=ORDERS_API_ACK_UNIT_WORKERS,
         thread_name_prefix="orders-ack",
     )
+    compact_pool = ThreadPoolExecutor(
+        max_workers=max(1, COMPACT_UNIT_SCHEDULERS),
+        thread_name_prefix="unit-compact",
+    )
+    send_pool = ThreadPoolExecutor(
+        max_workers=max(1, SEND_UNIT_SCHEDULERS),
+        thread_name_prefix="unit-send",
+    )
     ack_jobs: dict[int, Future] = {}
+    compact_jobs: dict[int, Future] = {}
+    send_jobs: dict[int, Future] = {}
     with SessionLocal() as db:
         units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))
         log_event(
@@ -174,7 +254,16 @@ def main() -> None:
             # legítima (por exemplo, compactação) ocupa vários segundos.
             _touch_health()
             try:
-                _tick(supervisor, pool, ack_pool, ack_jobs)
+                _tick(
+                    supervisor,
+                    pool,
+                    ack_pool,
+                    ack_jobs,
+                    compact_pool,
+                    compact_jobs,
+                    send_pool,
+                    send_jobs,
+                )
                 _touch_health()
             except Exception as exc:
                 log_event(
@@ -191,6 +280,8 @@ def main() -> None:
         supervisor.stop_all()
         pool.shutdown(wait=False)
         ack_pool.shutdown(wait=False, cancel_futures=True)
+        compact_pool.shutdown(wait=False, cancel_futures=True)
+        send_pool.shutdown(wait=False, cancel_futures=True)
         try:
             WORKER_HEALTH_FILE.unlink(missing_ok=True)
         except OSError as exc:
@@ -217,6 +308,10 @@ def _tick(
     pool: ThreadPoolExecutor,
     ack_pool: ThreadPoolExecutor | None = None,
     ack_jobs: dict[int, Future] | None = None,
+    compact_pool: ThreadPoolExecutor | None = None,
+    compact_jobs: dict[int, Future] | None = None,
+    send_pool: ThreadPoolExecutor | None = None,
+    send_jobs: dict[int, Future] | None = None,
 ) -> None:
     _run_db_stage("locks.recover", recover_stale_locks)
     _run_db_stage("orders.cleanup_unmatched", cleanup_unmatched_orders)
@@ -255,14 +350,32 @@ def _tick(
                 pool.submit(_move_job, resource_id, kind)
             except Exception as exc:
                 _persist_dispatch_failure(resource_id, kind, exc)
-        _run_unit_stage(unit_id, "dicom.compact.batch", compact_unit)
-        _run_unit_stage(
-            unit_id,
-            "cloud.send.batch",
-            lambda db, unit: send_unit(
-                db, unit, unit.cloud_url, unit.file_settle_seconds
-            ),
-        )
+        if compact_pool is not None and compact_jobs is not None:
+            _schedule_unit_job(
+                compact_pool,
+                compact_jobs,
+                unit_id,
+                _compact_job,
+                "dicom.compact.batch",
+            )
+        else:
+            _run_unit_stage(unit_id, "dicom.compact.batch", compact_unit)
+        if send_pool is not None and send_jobs is not None:
+            _schedule_unit_job(
+                send_pool,
+                send_jobs,
+                unit_id,
+                _send_job,
+                "cloud.send.batch",
+            )
+        else:
+            _run_unit_stage(
+                unit_id,
+                "cloud.send.batch",
+                lambda db, unit: send_unit(
+                    db, unit, unit.cloud_url, unit.file_settle_seconds
+                ),
+            )
 
 
 def _run_db_stage(stage: str, callback):

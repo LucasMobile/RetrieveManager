@@ -2,11 +2,27 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from app.worker import _schedule_ack_job, _tick
+from app.worker import _schedule_ack_job, _schedule_unit_job, _tick
 from tests.support import DatabaseTestCase, make_unit
 
 
 class UnitCloudSettingsTest(DatabaseTestCase):
+    def test_only_one_background_stage_runs_for_each_unit(self):
+        pool = MagicMock()
+        first = Future()
+        second = Future()
+        pool.submit.side_effect = [first, second]
+        jobs = {}
+        callback = MagicMock()
+
+        _schedule_unit_job(pool, jobs, 7, callback, "dicom.compact.batch")
+        _schedule_unit_job(pool, jobs, 7, callback, "dicom.compact.batch")
+        self.assertEqual(pool.submit.call_count, 1)
+
+        first.set_result(None)
+        _schedule_unit_job(pool, jobs, 7, callback, "dicom.compact.batch")
+        self.assertEqual(pool.submit.call_count, 2)
+
     def test_only_one_ack_job_runs_for_each_unit(self):
         pool = MagicMock()
         first = Future()
@@ -88,6 +104,40 @@ class UnitCloudSettingsTest(DatabaseTestCase):
                 ("Unidade B", "https://cloud-b.example/send", 9),
             },
         )
+
+    def test_production_tick_dispatches_compaction_and_send_in_background(self):
+        with self.Session() as db:
+            db.add(make_unit(name="Unidade", enabled=True))
+            db.commit()
+
+        supervisor = MagicMock()
+        move_pool = MagicMock()
+        compact_pool = MagicMock()
+        send_pool = MagicMock()
+        with (
+            patch("app.worker.SessionLocal", self.Session),
+            patch("app.worker.recover_stale_locks"),
+            patch("app.worker.cleanup_unmatched_orders"),
+            patch("app.worker.archive_completed_orders"),
+            patch("app.worker.ingest_unit"),
+            patch("app.worker.find_pending"),
+            patch("app.worker.claim_due_moves", return_value=[]),
+            patch("app.worker.compact_unit") as compact_unit,
+            patch("app.worker.send_unit") as send_unit,
+        ):
+            _tick(
+                supervisor,
+                move_pool,
+                compact_pool=compact_pool,
+                compact_jobs={},
+                send_pool=send_pool,
+                send_jobs={},
+            )
+
+        compact_pool.submit.assert_called_once()
+        send_pool.submit.assert_called_once()
+        compact_unit.assert_not_called()
+        send_unit.assert_not_called()
 
     def test_failure_in_one_unit_does_not_block_the_next_unit(self):
         with self.Session() as db:

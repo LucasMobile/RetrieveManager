@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from threading import BoundedSemaphore
 from time import monotonic, perf_counter
 
 import aiohttp
@@ -21,6 +22,7 @@ from app.config import (
     CIRCUIT_BREAKER_FAILURES,
     CIRCUIT_BREAKER_SECONDS,
     COMPACT_BATCH_SIZE,
+    COMPACT_GLOBAL_WORKERS,
     FIND_BATCH_SIZE,
     HTTP_CONNECT_TIMEOUT_SECONDS,
     HTTP_TOTAL_TIMEOUT_SECONDS,
@@ -94,6 +96,7 @@ UNMATCHED_ORDER_RETENTION = timedelta(days=1)
 UNMATCHED_ORDER_CLEANUP_BATCH = 500
 COMPLETED_ORDER_RETENTION = timedelta(weeks=2)
 COMPLETED_ORDER_CLEANUP_BATCH = 500
+_compact_slots = BoundedSemaphore(max(1, COMPACT_GLOBAL_WORKERS))
 
 
 @dataclass(frozen=True)
@@ -1630,9 +1633,13 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
 
 
 def _settled_files(
-    directory: Path, settle_seconds: int, *, timestamp: float | None = None
+    directory: Path,
+    settle_seconds: int,
+    *,
+    timestamp: float | None = None,
+    limit: int | None = None,
 ) -> tuple[list[Path], list[tuple[Path, OSError]]]:
-    """Return visible files whose modification time is at least the settle age."""
+    """Return settled visible files without materializing the entire directory."""
     if not directory.is_dir():
         return [], []
     current_timestamp = (
@@ -1641,24 +1648,51 @@ def _settled_files(
     paths: list[Path] = []
     errors: list[tuple[Path, OSError]] = []
     try:
-        entries = directory.iterdir()
-        for path in entries:
-            if path.name.startswith("."):
-                continue
-            try:
-                if (
-                    path.is_file()
-                    and current_timestamp - path.stat().st_mtime >= settle_seconds
-                ):
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                path = Path(entry.path)
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if (
+                        current_timestamp
+                        - entry.stat(follow_symlinks=False).st_mtime
+                        < settle_seconds
+                    ):
+                        continue
                     paths.append(path)
-            except OSError as exc:
-                errors.append((path, exc))
+                    if limit is not None and len(paths) >= limit:
+                        break
+                except OSError as exc:
+                    errors.append((path, exc))
     except OSError as exc:
         errors.append((directory, exc))
     return paths, errors
 
 
-def compact_unit(db: Session, unit: Unit) -> None:
+def _quarantine_failed_source(source: Path, error_dir: Path) -> Path | None:
+    """Move a poison input aside so it cannot starve the next queue batch."""
+    if not source.is_file():
+        return None
+    error_dir.mkdir(parents=True, exist_ok=True)
+    target = error_dir / source.name
+    if target.exists():
+        target = error_dir / (
+            f"{target.stem}.failed-{new_correlation_id()[:8]}{target.suffix}"
+        )
+    shutil.move(str(source), str(target))
+    return target
+
+
+def _compact_one_limited(*args) -> CompactResult:
+    with _compact_slots:
+        return _compact_one(*args)
+
+
+def compact_unit(db: Session, unit: Unit) -> bool:
+    """Process one bounded batch and report whether more work may be available."""
     origin = Path(unit.receive_dir)
     dest_dir = Path(unit.send_dir)
     error_dir = Path(unit.error_dir)
@@ -1667,8 +1701,11 @@ def compact_unit(db: Session, unit: Unit) -> None:
     drops, compress_map = compression_runtime_settings(db, unit.id)
     dicom_rules = load_rule_specs(db, unit.id)
     settle = unit.file_settle_seconds
-    settled_jobs, inspection_errors = _settled_files(origin, settle)
-    jobs = sorted(settled_jobs, key=lambda path: path.name)[:COMPACT_BATCH_SIZE]
+    jobs, inspection_errors = _settled_files(
+        origin,
+        settle,
+        limit=COMPACT_BATCH_SIZE,
+    )
     for _path, exc in inspection_errors:
         log_event(
             log,
@@ -1680,9 +1717,10 @@ def compact_unit(db: Session, unit: Unit) -> None:
             unit_id=unit.id,
         )
     if not jobs:
-        return
+        return False
     batch_correlation = new_correlation_id()
     started_at = perf_counter()
+    workers = max(1, unit.compact_workers or 8)
     with log_context(batch_correlation):
         log_event(
             log,
@@ -1692,14 +1730,15 @@ def compact_unit(db: Session, unit: Unit) -> None:
             status="started",
             unit_id=unit.id,
             file_count=len(jobs),
+            unit_worker_limit=workers,
+            global_worker_limit=max(1, COMPACT_GLOBAL_WORKERS),
         )
-    workers = max(1, unit.compact_workers or 8)
     processed_count = 0
     failed_count = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
             pool.submit(
-                _compact_one,
+                _compact_one_limited,
                 str(p),
                 str(dest_dir / (p.name + ".dcm")),
                 str(error_dir / p.name),
@@ -1715,6 +1754,12 @@ def compact_unit(db: Session, unit: Unit) -> None:
                 result = future.result()
             except Exception as exc:
                 failed_count += 1
+                source = futs[future]
+                quarantine_error = None
+                try:
+                    _quarantine_failed_source(source, error_dir)
+                except OSError as quarantine_exc:
+                    quarantine_error = safe_error_detail(quarantine_exc)
                 log_event(
                     log,
                     logging.ERROR,
@@ -1724,7 +1769,8 @@ def compact_unit(db: Session, unit: Unit) -> None:
                     error=exc,
                     error_detail=safe_error_detail(exc),
                     unit_id=unit.id,
-                    filename=futs[future].name,
+                    filename=source.name,
+                    quarantine_error=quarantine_error,
                 )
                 continue
             for persist_attempt in range(1, 4):
@@ -1752,6 +1798,7 @@ def compact_unit(db: Session, unit: Unit) -> None:
                     )
                     if exhausted:
                         failed_count += 1
+    elapsed_seconds = max(perf_counter() - started_at, 0.001)
     with log_context(batch_correlation):
         log_event(
             log,
@@ -1764,8 +1811,10 @@ def compact_unit(db: Session, unit: Unit) -> None:
             file_count=len(jobs),
             processed_count=processed_count,
             failed_count=failed_count,
-            remaining_count=max(0, len(settled_jobs) - len(jobs)),
+            backlog_hint=len(jobs) >= COMPACT_BATCH_SIZE,
+            files_per_second=round(processed_count / elapsed_seconds, 2),
         )
+    return len(jobs) >= COMPACT_BATCH_SIZE
 
 
 def _filename_mod(name: str) -> str:
@@ -1786,7 +1835,7 @@ def _compact_one(
     try:
         image = pydicom.dcmread(filepath, defer_size="1 MB")
     except Exception as exc:
-        shutil.move(filepath, error)
+        _quarantine_failed_source(Path(filepath), Path(error).parent)
         return CompactResult(name, name, "", "compression_error", type(exc).__name__)
 
     modality = str(getattr(image, "Modality", "") or prefix).upper()
@@ -1808,7 +1857,7 @@ def _compact_one(
     try:
         rule_result = apply_rule_specs(image, dicom_rules)
     except RuleExecutionError as exc:
-        shutil.move(filepath, error)
+        _quarantine_failed_source(Path(filepath), Path(error).parent)
         return CompactResult(
             name,
             name,
@@ -1840,13 +1889,37 @@ def _compact_one(
             rule_matches=rule_result.matches,
         )
 
-    image.save_as(filepath)
-
     flag = compress_map.get(processing_modality, compress_map.get("*", "+e1"))
+    dest_path = Path(dest)
+    temp_dest = dest_path.with_name(
+        f".{dest_path.name}.{new_correlation_id()[:8]}.tmp"
+    )
+    promoted = False
     try:
-        code, _out = dcmcjpeg(flag, filepath, dest)
-    except ToolMissing as exc:
-        shutil.move(filepath, error)
+        image.save_as(filepath)
+        code, _out = dcmcjpeg(flag, filepath, str(temp_dest))
+        if code != 0:
+            temp_dest.unlink(missing_ok=True)
+            _quarantine_failed_source(Path(filepath), Path(error).parent)
+            return CompactResult(
+                name,
+                name,
+                study_uid,
+                "compression_error",
+                "DcmcjpegError",
+                **identity,
+                rule_matches=rule_result.matches,
+            )
+        os.replace(temp_dest, dest_path)
+        promoted = True
+        os.remove(filepath)
+    except Exception as exc:
+        temp_dest.unlink(missing_ok=True)
+        # If promotion succeeded but source cleanup failed, discard the output;
+        # otherwise the sender could upload an image lacking its DB association.
+        if promoted:
+            dest_path.unlink(missing_ok=True)
+        _quarantine_failed_source(Path(filepath), Path(error).parent)
         return CompactResult(
             name,
             name,
@@ -1856,23 +1929,11 @@ def _compact_one(
             **identity,
             rule_matches=rule_result.matches,
         )
-    if code == 0:
-        os.remove(filepath)
-        return CompactResult(
-            name,
-            os.path.basename(dest),
-            study_uid,
-            "compressed",
-            **identity,
-            rule_matches=rule_result.matches,
-        )
-    shutil.move(filepath, error)
     return CompactResult(
         name,
-        name,
+        dest_path.name,
         study_uid,
-        "compression_error",
-        "DcmcjpegError",
+        "compressed",
         **identity,
         rule_matches=rule_result.matches,
     )
