@@ -74,7 +74,7 @@
           <tr>
             <td><span class="order-date"><span>{{ o.created_at.strftime('%d/%m/%Y') }}</span><strong>{{ o.created_at.strftime('%H:%M') }}</strong>{% if history and o.archived_at %}<small>Arquivado em {{ o.archived_at.strftime('%d/%m/%Y %H:%M') }}</small>{% endif %}</span></td>
             <td><span class="order-unit">{{ o.unit.name }}</span></td>
-            <td><span class="order-identity"><a href="/orders/{{ o.id }}">{{ o.pat_id or 'Paciente não informado' }}</a><span>{{ o.acc }}</span></span></td>
+            <td><span class="order-identity"><a href="/orders/{{ o.id }}?{{ detail_return_qs }}">{{ o.pat_id or 'Paciente não informado' }}</a><span>{{ o.acc }}</span></span></td>
             <td><span class="modality-mark">{{ o.modality or '—' }}</span><span class="table-secondary">{{ o.body_part or 'Body Part não informado' }}</span></td>
             <td><span class="status-badge {{ o.badge }}">{{ o.status_label }}</span>{% if o.prior_status != 'disabled' %}<span class="table-secondary">Histórico: {{ o.prior_status_label }}</span>{% endif %}</td>
             <td><span class="order-next">
@@ -90,7 +90,7 @@
             </span></td>
             <td>
               <div class="table-actions order-actions">
-                <a class="action-icon" href="/orders/{{ o.id }}" data-tooltip="Visualizar" title="Visualizar" aria-label="Visualizar pedido">{{ icon("eye") }}</a>
+                <a class="action-icon" href="/orders/{{ o.id }}?{{ detail_return_qs }}" data-tooltip="Visualizar" title="Visualizar" aria-label="Visualizar pedido">{{ icon("eye") }}</a>
                 {% if user.role == 'admin' and not history %}
                 {% if o.can_reprocess and o.can_archive %}
                 {{ post_action(request, '/orders/' ~ o.id ~ '/retry', 'action-icon', 'Reprocessar pedido', icon_name='retry', tooltip='Reprocessar', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}

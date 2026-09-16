@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Lock
 from time import monotonic, perf_counter
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -1750,7 +1751,7 @@ def rules_drop_delete(
 @app.get("/orders", response_class=HTMLResponse)
 def orders_list(
     request: Request,
-    unit_id: int | None = None,
+    unit_id: str = Query("", max_length=20),
     status: str = Query("", max_length=32),
     q: str = Query("", max_length=200),
     before: int | None = Query(None, ge=1),
@@ -1761,10 +1762,11 @@ def orders_list(
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
+    parsed_unit_id = _parse_optional_unit_id(unit_id)
     return _orders_response(
         request,
         db,
-        unit_id=unit_id,
+        unit_id=parsed_unit_id,
         status=status,
         q=q,
         before=before,
@@ -1779,7 +1781,7 @@ def orders_list(
 @app.get("/orders/history", response_class=HTMLResponse)
 def orders_history(
     request: Request,
-    unit_id: int | None = None,
+    unit_id: str = Query("", max_length=20),
     status: str = Query("", max_length=32),
     q: str = Query("", max_length=200),
     before: int | None = Query(None, ge=1),
@@ -1790,10 +1792,11 @@ def orders_history(
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
+    parsed_unit_id = _parse_optional_unit_id(unit_id)
     return _orders_response(
         request,
         db,
-        unit_id=unit_id,
+        unit_id=parsed_unit_id,
         status=status,
         q=q,
         before=before,
@@ -1803,6 +1806,18 @@ def orders_history(
         page_size=page_size,
         history=True,
     )
+
+
+def _parse_optional_unit_id(value: str) -> int | None:
+    """Convert the unit filter while treating the form's empty option as unset."""
+    if value == "":
+        return None
+    if not value.isdecimal():
+        raise StarletteHTTPException(422, "Unidade inválida")
+    unit_id = int(value)
+    if unit_id < 1:
+        raise StarletteHTTPException(422, "Unidade inválida")
+    return unit_id
 
 
 def _cursor_page_cursors(
@@ -1968,6 +1983,9 @@ def _orders_response(
     )
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
     qs = query_keep(unit_id=unit_id, status=status, q=q, page_size=page_size)
+    return_to = request.url.path
+    if request.url.query:
+        return_to = f"{return_to}?{request.url.query}"
     return templates.TemplateResponse(
         request=request,
         name="orders.html",
@@ -1986,6 +2004,7 @@ def _orders_response(
             qs=qs,
             history=history,
             orders_path="/orders/history" if history else "/orders",
+            detail_return_qs=query_keep(return_to=return_to),
         ),
     )
 
@@ -2021,6 +2040,7 @@ def order_detail(
     order_id: int,
     request: Request,
     page: int = 1,
+    return_to: str = Query("", max_length=2048),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
@@ -2029,6 +2049,15 @@ def order_detail(
     )
     if order is None:
         return RedirectResponse("/orders", status_code=303)
+    default_return_path = "/orders/history" if order.archived_at else "/orders"
+    parsed_return = urlsplit(return_to)
+    if (
+        not return_to
+        or parsed_return.scheme
+        or parsed_return.netloc
+        or parsed_return.path != default_return_path
+    ):
+        return_to = default_return_path
     order.can_reprocess = can_reprocess(order)  # type: ignore[attr-defined]
     order.can_archive = can_archive(order)  # type: ignore[attr-defined]
     order.can_cancel = can_cancel(order)  # type: ignore[attr-defined]
@@ -2135,7 +2164,9 @@ def order_detail(
                 order.prior_status, order.prior_status
             ),
             pager=pager,
-            qs="",
+            qs=query_keep(return_to=return_to),
+            return_to=return_to,
+            detail_return_qs=query_keep(return_to=return_to),
         ),
     )
 

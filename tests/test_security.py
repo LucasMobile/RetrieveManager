@@ -825,6 +825,20 @@ class SecurityTest(unittest.TestCase):
             self.assertIn(f"Página {target_page} de 7", response.text)
             expected_count = 10 if target_page == 7 else 30
             self.assertEqual(response.text.count('class="order-date"'), expected_count)
+            if target_page == 2:
+                detail_link = re.search(
+                    r'href="(/orders/\d+\?return_to=[^"]+)"[^>]+'
+                    r'aria-label="Visualizar pedido"',
+                    response.text,
+                )
+                self.assertIsNotNone(detail_link)
+                detail = self.client.get(detail_link[1].replace("&amp;", "&"))
+                self.assertEqual(detail.status_code, 200)
+                self.assertRegex(
+                    detail.text,
+                    r'href="/orders\?page_size=30&amp;before=\d+&amp;page=2" '
+                    r'aria-label="Voltar"',
+                )
 
         ten_per_page = self.client.get("/orders", params={"page_size": 10})
         self.assertEqual(ten_per_page.text.count('class="order-date"'), 10)
@@ -835,6 +849,31 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(history.status_code, 200)
         self.assertIn("archived-only", history.text)
         self.assertNotIn("active-41", history.text)
+
+    def test_orders_filter_accepts_all_units_with_a_status(self):
+        self.login()
+        response = self.client.get(
+            "/orders",
+            params={"unit_id": "", "status": "watching", "page_size": 30},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<option value="watching" selected>', response.text)
+
+    def test_error_page_uses_logo_before_code_and_title(self):
+        self.login()
+        response = self.client.get(
+            "/orders",
+            params={"page": "invalid"},
+            headers={"Accept": "text/html"},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        logo = response.text.index('/static/logo-white.png?v=1')
+        code = response.text.index("ERRO 422")
+        title = response.text.index("Dados inválidos")
+        self.assertLess(logo, code)
+        self.assertLess(code, title)
 
     def test_order_page_can_queue_manual_current_retrieve(self):
         self.login()

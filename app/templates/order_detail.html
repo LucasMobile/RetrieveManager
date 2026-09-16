@@ -16,7 +16,7 @@
   <header class="page-header order-detail-header">
     <div class="page-header__copy">
       <nav class="breadcrumb" aria-label="Navegação estrutural">
-        <a href="{{ '/orders/history' if order.archived_at else '/orders' }}">{{ 'Histórico de pedidos' if order.archived_at else 'Fila de pedidos' }}</a><span aria-hidden="true">/</span><span>{{ order.unit.name }}</span>
+        <a href="{{ return_to }}">{{ 'Histórico de pedidos' if order.archived_at else 'Fila de pedidos' }}</a><span aria-hidden="true">/</span><span>{{ order.unit.name }}</span>
       </nav>
       <div class="order-detail-title">
         <h1>Pedido {{ order.acc }}</h1>
@@ -27,8 +27,8 @@
     </div>
     <div class="page-header__actions order-detail-actions">
       <div class="order-detail-actions__group" aria-label="Navegação e atualização">
-        <a class="action-icon order-action-icon" href="{{ '/orders/history' if order.archived_at else '/orders' }}" aria-label="Voltar" data-tooltip="Voltar" title="Voltar">{{ icon("arrow-left") }}</a>
-        <a class="action-icon order-action-icon" href="/orders/{{ order.id }}" aria-label="Atualizar informações" data-tooltip="Atualizar informações" title="Atualizar informações">{{ icon("refresh") }}</a>
+        <a class="action-icon order-action-icon" href="{{ return_to }}" aria-label="Voltar" data-tooltip="Voltar" title="Voltar">{{ icon("arrow-left") }}</a>
+        <a class="action-icon order-action-icon" href="/orders/{{ order.id }}?{{ detail_return_qs }}" aria-label="Atualizar informações" data-tooltip="Atualizar informações" title="Atualizar informações">{{ icon("refresh") }}</a>
       </div>
       {% if user.role == 'admin' and not order.archived_at %}
       <div class="order-detail-actions__group order-detail-actions__group--operations" aria-label="Ações do pedido">
