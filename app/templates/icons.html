@@ -5,9 +5,13 @@
   {% elif name == "dashboard" %}
     <rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" />
   {% elif name == "orders" %}
-    <path d="M6 4h12M6 10h12M6 16h8" /><circle cx="4" cy="4" r=".7" fill="currentColor" stroke="none" /><circle cx="4" cy="10" r=".7" fill="currentColor" stroke="none" /><circle cx="4" cy="16" r=".7" fill="currentColor" stroke="none" />
+    <path d="M4 6h16M4 12h10M4 18h7" /><path d="m17 11 2 2 3-4" />
+  {% elif name == "history" %}
+    <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l3 2" />
   {% elif name == "building" %}
     <path d="M4 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16M8 7h4M8 11h4M8 15h4M16 9h2a2 2 0 0 1 2 2v10M2 21h20" />
+  {% elif name == "building-2" %}
+    <path d="M3 21h18M6 21V5l6-3 6 3v16M9 9h.01M9 13h.01M9 17h.01M15 9h.01M15 13h.01M15 17h.01" />
   {% elif name == "clock" %}
     <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" />
   {% elif name == "compress" %}
@@ -48,6 +52,14 @@
     <path d="M20 11a8 8 0 1 0-2.35 5.65" /><path d="M20 4v7h-7" />
   {% elif name == "rules" %}
     <rect x="4" y="4" width="16" height="16" rx="1" /><path d="M8 9h8M8 13h5" />
+  {% elif name == "sliders-horizontal" %}
+    <path d="M4 6h6M14 6h6M4 12h10M18 12h2M4 18h2M10 18h10" /><circle cx="12" cy="6" r="2" /><circle cx="16" cy="12" r="2" /><circle cx="8" cy="18" r="2" />
+  {% elif name == "scroll-text" %}
+    <path d="M8 3h10a2 2 0 0 1 2 2v15l-3-2-3 2-3-2-3 2V5a2 2 0 0 0-4 0v3h4" /><path d="M11 8h5M11 12h5" />
+  {% elif name == "sun" %}
+    <circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41" />
+  {% elif name == "moon" %}
+    <path d="M20.5 14.1A8.5 8.5 0 0 1 9.9 3.5 8.5 8.5 0 1 0 20.5 14.1Z" />
   {% elif name == "save" %}
     <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" /><path d="M17 21v-8H7v8M7 3v5h8" />
   {% elif name == "trash" %}

@@ -488,6 +488,7 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn('href="/users"', dashboard.text)
         self.assertNotIn("Nova unidade", dashboard.text)
         self.assertIn("data-account-menu", dashboard.text)
+        self.assertIn("data-theme-toggle", dashboard.text)
         self.assertIn('href="/account/password"', dashboard.text)
         self.assertIn("Trocar senha", dashboard.text)
         orders = self.client.get("/orders")
@@ -858,7 +859,9 @@ class SecurityTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn('<option value="watching" selected>', response.text)
+        self.assertIn('name="unit_id" value=""', response.text)
+        self.assertIn('name="status" value="watching"', response.text)
+        self.assertIn('data-value="watching" aria-selected="true"', response.text)
 
     def test_error_page_uses_logo_before_code_and_title(self):
         self.login()

@@ -2,8 +2,32 @@
   "use strict";
 
   const body = document.body;
+  const root = document.documentElement;
   const sidebar = document.querySelector(".sidebar");
   const menuButton = document.querySelector("[data-sidebar-open]");
+  const themeToggle = document.querySelector("[data-theme-toggle]");
+
+  const syncThemeToggle = () => {
+    const isDark = root.dataset.theme === "dark";
+    const label = themeToggle?.querySelector("[data-theme-label]");
+    const sun = themeToggle?.querySelector(".theme-toggle__icon--sun");
+    const moon = themeToggle?.querySelector(".theme-toggle__icon--moon");
+    const action = isDark ? "Ativar tema claro" : "Ativar tema escuro";
+    if (label) label.textContent = isDark ? "Tema claro" : "Tema escuro";
+    if (sun) sun.hidden = !isDark;
+    if (moon) moon.hidden = isDark;
+    themeToggle?.setAttribute("aria-label", action);
+    themeToggle?.setAttribute("title", action);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", isDark ? "#0b1725" : "#071b33");
+  };
+
+  themeToggle?.addEventListener("click", () => {
+    const theme = root.dataset.theme === "dark" ? "light" : "dark";
+    root.dataset.theme = theme;
+    localStorage.setItem("rm-theme", theme);
+    syncThemeToggle();
+  });
+  syncThemeToggle();
 
   const setSidebar = (open) => {
     body.classList.toggle("sidebar-is-open", open);
@@ -18,6 +42,81 @@
   menuButton?.addEventListener("click", () => setSidebar(true));
   document.querySelectorAll("[data-sidebar-close]").forEach((button) => {
     button.addEventListener("click", () => setSidebar(false));
+  });
+
+  const customSelects = Array.from(document.querySelectorAll("[data-custom-select]"));
+  const setCustomSelectOpen = (select, open, restoreFocus = false) => {
+    const trigger = select?.querySelector("[data-custom-select-trigger]");
+    const menu = select?.querySelector("[data-custom-select-menu]");
+    if (!trigger || !menu) return;
+    trigger.setAttribute("aria-expanded", String(open));
+    menu.hidden = !open;
+    select.classList.toggle("is-open", open);
+    if (open) {
+      const selected = menu.querySelector('[aria-selected="true"]');
+      (selected || menu.querySelector("[data-custom-select-option]"))?.focus();
+    } else if (restoreFocus) {
+      trigger.focus();
+    }
+  };
+
+  const closeCustomSelects = (except = null) => {
+    customSelects.forEach((select) => {
+      if (select !== except) setCustomSelectOpen(select, false);
+    });
+  };
+
+  customSelects.forEach((select) => {
+    const trigger = select.querySelector("[data-custom-select-trigger]");
+    const menu = select.querySelector("[data-custom-select-menu]");
+    const value = select.querySelector("[data-custom-select-value]");
+    const label = select.querySelector("[data-custom-select-label]");
+    const options = Array.from(select.querySelectorAll("[data-custom-select-option]"));
+
+    trigger?.addEventListener("click", () => {
+      const open = trigger.getAttribute("aria-expanded") !== "true";
+      closeCustomSelects(select);
+      setCustomSelectOpen(select, open);
+    });
+
+    options.forEach((option, index) => {
+      option.addEventListener("click", () => {
+        if (value) value.value = option.dataset.value || "";
+        if (label) label.textContent = option.querySelector("span")?.textContent || option.textContent.trim();
+        options.forEach((item) => item.setAttribute("aria-selected", String(item === option)));
+        setCustomSelectOpen(select, false, true);
+      });
+      option.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const direction = event.key === "ArrowDown" ? 1 : -1;
+          options[(index + direction + options.length) % options.length]?.focus();
+        }
+        if (event.key === "Home" || event.key === "End") {
+          event.preventDefault();
+          options[event.key === "Home" ? 0 : options.length - 1]?.focus();
+        }
+      });
+    });
+
+    trigger?.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        closeCustomSelects(select);
+        setCustomSelectOpen(select, true);
+      }
+    });
+
+    menu?.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setCustomSelectOpen(select, false, true);
+      }
+    });
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-custom-select]")) closeCustomSelects();
   });
 
   const accountMenu = document.querySelector("[data-account-menu]");

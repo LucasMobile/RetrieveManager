@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.config import (
     COMPACT_UNIT_SCHEDULERS,
+    FIND_UNIT_SCHEDULERS,
     ORDERS_API_ACK_UNIT_WORKERS,
     SEND_UNIT_SCHEDULERS,
     WORKER_HEALTH_FILE,
@@ -159,6 +160,11 @@ def _compact_job(unit_id: int) -> None:
             return
 
 
+def _find_job(unit_id: int) -> None:
+    """Search one bounded batch without blocking other units or worker stages."""
+    _run_unit_stage(unit_id, "dicom.find.batch", find_pending)
+
+
 def _send_job(unit_id: int) -> None:
     """Drain one unit's upload queue without blocking the orchestration loop."""
     while not stop_event.is_set():
@@ -229,6 +235,10 @@ def main() -> None:
         max_workers=ORDERS_API_ACK_UNIT_WORKERS,
         thread_name_prefix="orders-ack",
     )
+    find_pool = ThreadPoolExecutor(
+        max_workers=max(1, FIND_UNIT_SCHEDULERS),
+        thread_name_prefix="unit-find",
+    )
     compact_pool = ThreadPoolExecutor(
         max_workers=max(1, COMPACT_UNIT_SCHEDULERS),
         thread_name_prefix="unit-compact",
@@ -238,6 +248,7 @@ def main() -> None:
         thread_name_prefix="unit-send",
     )
     ack_jobs: dict[int, Future] = {}
+    find_jobs: dict[int, Future] = {}
     compact_jobs: dict[int, Future] = {}
     send_jobs: dict[int, Future] = {}
     with SessionLocal() as db:
@@ -262,6 +273,8 @@ def main() -> None:
                     pool,
                     ack_pool,
                     ack_jobs,
+                    find_pool,
+                    find_jobs,
                     compact_pool,
                     compact_jobs,
                     send_pool,
@@ -283,6 +296,7 @@ def main() -> None:
         supervisor.stop_all()
         pool.shutdown(wait=False)
         ack_pool.shutdown(wait=False, cancel_futures=True)
+        find_pool.shutdown(wait=False, cancel_futures=True)
         compact_pool.shutdown(wait=False, cancel_futures=True)
         send_pool.shutdown(wait=False, cancel_futures=True)
         try:
@@ -311,6 +325,8 @@ def _tick(
     pool: ThreadPoolExecutor,
     ack_pool: ThreadPoolExecutor | None = None,
     ack_jobs: dict[int, Future] | None = None,
+    find_pool: ThreadPoolExecutor | None = None,
+    find_jobs: dict[int, Future] | None = None,
     compact_pool: ThreadPoolExecutor | None = None,
     compact_jobs: dict[int, Future] | None = None,
     send_pool: ThreadPoolExecutor | None = None,
@@ -340,13 +356,24 @@ def _tick(
     ack_executor = ack_pool or pool
     active_ack_jobs = ack_jobs if ack_jobs is not None else {}
     for unit_id in unit_ids:
+        # Existing backlog must not wait for a potentially large API response
+        # to be ingested before the next C-FIND batch can start.
+        if find_pool is not None and find_jobs is not None:
+            _schedule_unit_job(
+                find_pool,
+                find_jobs,
+                unit_id,
+                _find_job,
+                "dicom.find.batch",
+            )
+        else:
+            _run_unit_stage(unit_id, "dicom.find.batch", find_pending)
         _run_unit_stage(unit_id, "orders.ingest", ingest_unit)
         _schedule_ack_job(
             ack_executor,
             active_ack_jobs,
             unit_id,
         )
-        _run_unit_stage(unit_id, "dicom.find.batch", find_pending)
         claims = _run_unit_stage(unit_id, "dicom.move.claim", claim_due_moves) or []
         for resource_id, kind in claims:
             try:

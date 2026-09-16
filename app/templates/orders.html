@@ -10,34 +10,49 @@
       <h1>{{ 'Histórico de pedidos' if history else 'Fila de pedidos' }}</h1>
       <p class="page-header__description">{% if history %}Consulte pedidos arquivados sem perder eventos, vínculos ou evidências.{% else %}Consulte cada pedido e acompanhe a etapa atual do processamento.{% endif %}</p>
     </div>
+    {% if not history %}<span class="queue-live"><i aria-hidden="true"></i>Atualização automática ativa</span>{% endif %}
   </header>
 
-  <section class="queue-summary surface" aria-label="Resumo da seleção">
-    <div class="queue-summary__lead">
+  <section class="queue-summary" aria-label="Resumo da seleção">
+    <article class="queue-summary__card queue-summary__lead">
       <span class="queue-summary__icon">{{ icon("orders") }}</span>
-      <span><strong>{{ order_summary.total }} pedido{% if order_summary.total != 1 %}s{% endif %} na seleção</strong><small>{{ 'Registros preservados no histórico' if history else 'Visão consolidada dos filtros atuais' }}</small></span>
-    </div>
-    <div class="queue-summary__metric"><strong>{{ order_summary.waiting }}</strong><span>Aguardando</span></div>
-    <div class="queue-summary__metric"><strong>{{ order_summary.running }}</strong><span>Em processamento</span></div>
-    <div class="queue-summary__metric"><strong>{{ order_summary.done }}</strong><span>Concluídos</span></div>
+      <span class="queue-summary__copy"><strong>{{ order_summary.total }} pedido{% if order_summary.total != 1 %}s{% endif %} na seleção</strong><small>{{ 'Registros preservados no histórico' if history else 'Visão consolidada dos filtros atuais' }}</small></span>
+    </article>
+    <article class="queue-summary__card queue-summary__card--waiting"><span class="queue-summary__icon">{{ icon("clock") }}</span><span class="queue-summary__copy"><strong>{{ order_summary.waiting }}</strong><small>Aguardando</small></span></article>
+    <article class="queue-summary__card queue-summary__card--running"><span class="queue-summary__icon">{{ icon("activity") }}</span><span class="queue-summary__copy"><strong>{{ order_summary.running }}</strong><small>Em processamento</small></span></article>
+    <article class="queue-summary__card queue-summary__card--done"><span class="queue-summary__icon">{{ icon("check") }}</span><span class="queue-summary__copy"><strong>{{ order_summary.done }}</strong><small>Concluídos</small></span></article>
   </section>
 
   <form class="surface filter-bar orders-filter" method="get" action="{{ orders_path }}" aria-label="Filtros da fila">
     <input type="hidden" name="page_size" value="{{ pager.size }}">
+    <div class="orders-filter__header">
+      <strong>Filtrar pedidos</strong>
+      <a href="{{ orders_path }}">Limpar filtros</a>
+    </div>
     <div class="filter-grid">
-      <div class="field">
-        <label for="filter-unit">Unidade</label>
-        <select id="filter-unit" name="unit_id">
-          <option value="">Todas as unidades</option>
-          {% for u in units %}<option value="{{ u.id }}" {% if unit_id == u.id %}selected{% endif %}>{{ u.name }}</option>{% endfor %}
-        </select>
+      <div class="field custom-select" data-custom-select>
+        <span class="field__label" id="filter-unit-label">Unidade</span>
+        <input type="hidden" name="unit_id" value="{{ unit_id or '' }}" data-custom-select-value>
+        <button class="custom-select__trigger" id="filter-unit" type="button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="filter-unit-label filter-unit-value" data-custom-select-trigger>
+          <span id="filter-unit-value" data-custom-select-label>{% if unit_id %}{% for u in units %}{% if unit_id == u.id %}{{ u.name }}{% endif %}{% endfor %}{% else %}Todas as unidades{% endif %}</span>
+          {{ icon("chevron-down") }}
+        </button>
+        <div class="custom-select__menu" role="listbox" aria-labelledby="filter-unit-label" data-custom-select-menu hidden>
+          <button class="custom-select__option" type="button" role="option" data-value="" aria-selected="{{ 'true' if not unit_id else 'false' }}" data-custom-select-option><span>Todas as unidades</span>{{ icon("check") }}</button>
+          {% for u in units %}<button class="custom-select__option" type="button" role="option" data-value="{{ u.id }}" aria-selected="{{ 'true' if unit_id == u.id else 'false' }}" data-custom-select-option><span>{{ u.name }}</span>{{ icon("check") }}</button>{% endfor %}
+        </div>
       </div>
-      <div class="field">
-        <label for="filter-status">Status</label>
-        <select id="filter-status" name="status">
-          <option value="">Todos os status</option>
-          {% for key, label in statuses.items() %}<option value="{{ key }}" {% if status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
-        </select>
+      <div class="field custom-select" data-custom-select>
+        <span class="field__label" id="filter-status-label">Status</span>
+        <input type="hidden" name="status" value="{{ status or '' }}" data-custom-select-value>
+        <button class="custom-select__trigger" id="filter-status" type="button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="filter-status-label filter-status-value" data-custom-select-trigger>
+          <span id="filter-status-value" data-custom-select-label>{{ statuses.get(status, 'Todos os status') if status else 'Todos os status' }}</span>
+          {{ icon("chevron-down") }}
+        </button>
+        <div class="custom-select__menu" role="listbox" aria-labelledby="filter-status-label" data-custom-select-menu hidden>
+          <button class="custom-select__option" type="button" role="option" data-value="" aria-selected="{{ 'true' if not status else 'false' }}" data-custom-select-option><span>Todos os status</span>{{ icon("check") }}</button>
+          {% for key, label in statuses.items() %}<button class="custom-select__option" type="button" role="option" data-value="{{ key }}" aria-selected="{{ 'true' if status == key else 'false' }}" data-custom-select-option><span>{{ label }}</span>{{ icon("check") }}</button>{% endfor %}
+        </div>
       </div>
       <div class="field orders-filter__search">
         <label for="filter-query">Pedido ou paciente</label>
@@ -45,7 +60,6 @@
       </div>
       <div class="filter-actions">
         <button class="btn btn--primary" type="submit">{{ icon("search") }} Filtrar</button>
-        {% if unit_id or status or q %}<a class="btn btn--quiet" href="{{ orders_path }}">Limpar</a>{% endif %}
       </div>
     </div>
   </form>

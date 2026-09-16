@@ -655,7 +655,9 @@ def find_pending(db: Session, unit: Unit) -> None:
                     Order.last_find_at <= now - interval,
                 ),
             )
-            .order_by(Order.last_find_at, Order.id)
+            # PostgreSQL puts NULL last in ascending order by default. Without
+            # this, repeatedly due orders can starve orders never searched.
+            .order_by(Order.last_find_at.asc().nulls_first(), Order.id)
             .limit(FIND_BATCH_SIZE)
         )
     )

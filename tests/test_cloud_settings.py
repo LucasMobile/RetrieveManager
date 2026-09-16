@@ -112,6 +112,7 @@ class UnitCloudSettingsTest(DatabaseTestCase):
 
         supervisor = MagicMock()
         move_pool = MagicMock()
+        find_pool = MagicMock()
         compact_pool = MagicMock()
         send_pool = MagicMock()
         with (
@@ -120,7 +121,7 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             patch("app.worker.cleanup_unmatched_orders"),
             patch("app.worker.archive_completed_orders"),
             patch("app.worker.ingest_unit"),
-            patch("app.worker.find_pending"),
+            patch("app.worker.find_pending") as find_pending,
             patch("app.worker.claim_due_moves", return_value=[]),
             patch("app.worker.compact_unit") as compact_unit,
             patch("app.worker.send_unit") as send_unit,
@@ -128,16 +129,62 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             _tick(
                 supervisor,
                 move_pool,
+                find_pool=find_pool,
+                find_jobs={},
                 compact_pool=compact_pool,
                 compact_jobs={},
                 send_pool=send_pool,
                 send_jobs={},
             )
 
+        find_pool.submit.assert_called_once()
         compact_pool.submit.assert_called_once()
         send_pool.submit.assert_called_once()
+        find_pending.assert_not_called()
         compact_unit.assert_not_called()
         send_unit.assert_not_called()
+
+    def test_find_jobs_are_scheduled_for_each_unit_before_api_ingestion(self):
+        with self.Session() as db:
+            db.add_all(
+                [
+                    make_unit(name="Unidade A"),
+                    make_unit(name="Unidade B", store_port=11113),
+                ]
+            )
+            db.commit()
+
+        events = []
+        find_pool = MagicMock()
+        find_pool.submit.side_effect = lambda _callback, unit_id: events.append(
+            ("find", unit_id)
+        ) or Future()
+
+        def ingest(_db, unit):
+            events.append(("ingest", unit.id))
+
+        with (
+            patch("app.worker.SessionLocal", self.Session),
+            patch("app.worker.recover_stale_locks"),
+            patch("app.worker.cleanup_unmatched_orders"),
+            patch("app.worker.archive_completed_orders"),
+            patch("app.worker.ingest_unit", side_effect=ingest),
+            patch("app.worker.claim_due_moves", return_value=[]),
+            patch("app.worker.compact_unit"),
+            patch("app.worker.send_unit"),
+        ):
+            _tick(
+                MagicMock(),
+                MagicMock(),
+                find_pool=find_pool,
+                find_jobs={},
+            )
+
+        self.assertEqual(find_pool.submit.call_count, 2)
+        self.assertEqual(
+            events,
+            [("find", 1), ("ingest", 1), ("find", 2), ("ingest", 2)],
+        )
 
     def test_failure_in_one_unit_does_not_block_the_next_unit(self):
         with self.Session() as db:

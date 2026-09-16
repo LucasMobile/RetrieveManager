@@ -1,7 +1,9 @@
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
 from app.main import (
     _delete_order_record,
@@ -16,7 +18,11 @@ from app.models import (
     Unit,
 )
 from app.order_state import ACTIVE_ORDER_STATUSES
-from app.pipeline import archive_completed_orders, cleanup_unmatched_orders
+from app.pipeline import (
+    archive_completed_orders,
+    cleanup_unmatched_orders,
+    find_pending,
+)
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -33,6 +39,54 @@ class OrderActionsTest(DatabaseTestCase):
             error_dir="/error",
             token="token",
         )
+
+    def test_find_prioritizes_orders_without_an_attempt_on_postgresql(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            with patch.object(db, "scalars", return_value=[]) as scalars:
+                find_pending(db, unit)
+
+        statement = scalars.call_args.args[0]
+        sql = str(statement.compile(dialect=postgresql.dialect()))
+        self.assertIn("orders.last_find_at ASC NULLS FIRST", sql)
+        self.assertIn("orders.id", sql)
+
+    def test_find_batch_starts_with_never_searched_orders(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            already_searched = Order(
+                unit_id=unit.id,
+                acc="retried",
+                birth_date="20000101",
+                status="watching",
+                last_find_at=datetime.now() - timedelta(minutes=5),
+            )
+            never_searched = Order(
+                unit_id=unit.id,
+                acc="new",
+                birth_date="20000101",
+                status="watching",
+            )
+            db.add_all([already_searched, never_searched])
+            db.commit()
+
+            searched = []
+            with (
+                patch("app.pipeline.FIND_BATCH_SIZE", 1),
+                patch(
+                    "app.pipeline._find_one",
+                    side_effect=lambda _db, _unit, order, _now: searched.append(
+                        order.acc
+                    ),
+                ),
+            ):
+                find_pending(db, unit)
+
+        self.assertEqual(searched, ["new"])
 
     def test_delete_archives_and_preserves_history_and_transfer(self):
         with self.Session() as db:
