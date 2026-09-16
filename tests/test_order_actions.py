@@ -52,6 +52,7 @@ class OrderActionsTest(DatabaseTestCase):
         sql = str(statement.compile(dialect=postgresql.dialect()))
         self.assertIn("orders.last_find_at ASC NULLS FIRST", sql)
         self.assertIn("orders.id", sql)
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
 
     def test_find_batch_starts_with_never_searched_orders(self):
         with self.Session() as db:
@@ -87,6 +88,45 @@ class OrderActionsTest(DatabaseTestCase):
                 find_pending(db, unit)
 
         self.assertEqual(searched, ["new"])
+
+    def test_concurrent_find_slots_claim_different_orders(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            db.add_all(
+                [
+                    Order(
+                        unit_id=unit.id,
+                        acc="first",
+                        birth_date="20000101",
+                        status="watching",
+                    ),
+                    Order(
+                        unit_id=unit.id,
+                        acc="second",
+                        birth_date="20000101",
+                        status="watching",
+                    ),
+                ]
+            )
+            db.commit()
+
+            searched = []
+            with patch(
+                "app.pipeline._find_one",
+                side_effect=lambda _db, _unit, order, _now: searched.append(
+                    order.acc
+                ),
+            ):
+                find_pending(db, unit, max_orders=1)
+                find_pending(db, unit, max_orders=1)
+
+            self.assertEqual(searched, ["first", "second"])
+            self.assertEqual(
+                db.scalar(select(Order).where(Order.acc == "first")).heartbeat_at,
+                db.scalar(select(Order).where(Order.acc == "first")).last_find_at,
+            )
 
     def test_delete_archives_and_preserves_history_and_transfer(self):
         with self.Session() as db:

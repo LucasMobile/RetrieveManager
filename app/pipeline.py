@@ -30,6 +30,7 @@ from app.config import (
     COMPACT_TEMP_MAX_AGE_SECONDS,
     DCMCJPEG_TIMEOUT_SECONDS,
     FIND_BATCH_SIZE,
+    FIND_TIMEOUT_SECONDS,
     HTTP_CONNECT_TIMEOUT_SECONDS,
     HTTP_TOTAL_TIMEOUT_SECONDS,
     ORDERS_API_ACK_BATCH_SIZE,
@@ -547,6 +548,7 @@ def cleanup_unmatched_orders(db: Session, now: datetime | None = None) -> int:
                 Order.archived_at.is_(None),
                 Order.status == "watching",
                 Order.study_uid == "",
+                Order.heartbeat_at.is_(None),
                 Order.last_find_at.is_not(None),
                 Order.last_error == "",
                 Order.created_at <= cutoff,
@@ -640,9 +642,12 @@ def archive_completed_orders(db: Session, now: datetime | None = None) -> int:
     )
 
 
-def find_pending(db: Session, unit: Unit) -> None:
+def find_pending(db: Session, unit: Unit, max_orders: int | None = None) -> None:
     now = datetime.now()
     interval = timedelta(seconds=unit.find_interval_seconds or 30)
+    # A claim gravada antes da chamada ao PACS impede que os executores da
+    # mesma unidade escolham o mesmo pedido enquanto o findscu está rodando.
+    in_flight_cutoff = now - timedelta(seconds=max(180, 2 * FIND_TIMEOUT_SECONDS))
     orders = list(
         db.scalars(
             select(Order)
@@ -651,6 +656,10 @@ def find_pending(db: Session, unit: Unit) -> None:
                 Order.archived_at.is_(None),
                 Order.status == "watching",
                 or_(
+                    Order.heartbeat_at.is_(None),
+                    Order.heartbeat_at <= in_flight_cutoff,
+                ),
+                or_(
                     Order.last_find_at.is_(None),
                     Order.last_find_at <= now - interval,
                 ),
@@ -658,9 +667,15 @@ def find_pending(db: Session, unit: Unit) -> None:
             # PostgreSQL puts NULL last in ascending order by default. Without
             # this, repeatedly due orders can starve orders never searched.
             .order_by(Order.last_find_at.asc().nulls_first(), Order.id)
-            .limit(FIND_BATCH_SIZE)
+            .limit(max_orders if max_orders is not None else FIND_BATCH_SIZE)
+            .with_for_update(skip_locked=True)
         )
     )
+    for order in orders:
+        order.last_find_at = now
+        order.heartbeat_at = now
+    if orders:
+        db.commit()
     for order in orders:
         try:
             _find_one(db, unit, order, now)
@@ -750,6 +765,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 unit.pacs_port,
                 order.acc,
                 order.birth_date,
+                timeout=FIND_TIMEOUT_SECONDS,
             )
         except ToolMissing as exc:
             order.status = "error"
@@ -808,6 +824,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                     unit.pacs_ip,
                     unit.pacs_port,
                     study_uid,
+                    timeout=FIND_TIMEOUT_SECONDS,
                 )
             except ToolMissing as exc:
                 series_code, series_output = 127, str(exc)

@@ -341,8 +341,13 @@ Find Response: 2 (Pending)
             db.add(order)
             db.commit()
 
-            with patch("app.pipeline.c_find", return_value=(124, "TIMEOUT")):
+            with (
+                patch("app.pipeline.FIND_TIMEOUT_SECONDS", 7),
+                patch("app.pipeline.c_find", return_value=(124, "TIMEOUT")) as find,
+            ):
                 find_pending(db, unit)
+
+            self.assertEqual(find.call_args.kwargs["timeout"], 7)
 
             self.assertEqual(order.status, "watching")
             self.assertEqual(order.attempts, 0)

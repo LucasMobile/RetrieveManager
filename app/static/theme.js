@@ -2,10 +2,7 @@
   "use strict";
 
   const savedTheme = localStorage.getItem("rm-theme");
-  const systemTheme = window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
-  const theme = savedTheme === "dark" || savedTheme === "light" ? savedTheme : systemTheme;
+  const theme = savedTheme === "dark" ? "dark" : "light";
 
   document.documentElement.dataset.theme = theme;
   document

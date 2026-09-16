@@ -8,10 +8,16 @@
       {% for name, value in pager.keep.items() %}
         {% if value not in (none, '') %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endif %}
       {% endfor %}
-      <label for="page-size-{{ nav }}">Itens por página</label>
-      <select id="page-size-{{ nav }}" name="page_size" onchange="this.form.submit()">
-        {% for option in pager.size_options %}<option value="{{ option }}"{% if pager.size == option %} selected{% endif %}>{{ option }}</option>{% endfor %}
-      </select>
+      <span id="page-size-label-{{ nav }}">Itens por página</span>
+      <div class="custom-select pager__select" data-custom-select data-custom-select-submit>
+        <input type="hidden" name="page_size" value="{{ pager.size }}" data-custom-select-value>
+        <button class="custom-select__trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="page-size-label-{{ nav }} page-size-value-{{ nav }}" data-custom-select-trigger>
+          <span id="page-size-value-{{ nav }}" data-custom-select-label>{{ pager.size }}</span>{{ icon("chevron-down") }}
+        </button>
+        <div class="custom-select__menu" role="listbox" aria-labelledby="page-size-label-{{ nav }}" data-custom-select-menu hidden>
+          {% for option in pager.size_options %}<button class="custom-select__option" type="button" role="option" data-value="{{ option }}" aria-selected="{{ 'true' if pager.size == option else 'false' }}" data-custom-select-option><span>{{ option }}</span>{{ icon("check") }}</button>{% endfor %}
+        </div>
+      </div>
       <noscript><button class="btn btn--quiet" type="submit">Aplicar</button></noscript>
     </form>
     {% endif %}

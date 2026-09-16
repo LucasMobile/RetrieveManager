@@ -14,19 +14,19 @@
   <div class="dashboard-kpis">
     <article class="dashboard-kpi dashboard-kpi--success">
       <span class="dashboard-kpi__icon">{{ icon("building") }}</span>
-      <div><span>Unidades ativas</span><strong>{{ summary.enabled }}</strong><small>de {{ pager.total if pager else summary.enabled }} cadastradas</small></div>
+      <div><strong>{{ summary.enabled }}</strong><span>Unidades ativas</span><small>de {{ pager.total if pager else summary.enabled }} cadastradas</small></div>
     </article>
     <article class="dashboard-kpi dashboard-kpi--waiting">
       <span class="dashboard-kpi__icon">{{ icon("clock") }}</span>
-      <div><span>Pedidos na fila</span><strong>{{ summary.queue }}</strong><small>Aguardando processamento</small></div>
+      <div><strong>{{ summary.queue }}</strong><span>Pedidos na fila</span><small>Aguardando processamento</small></div>
     </article>
     <article class="dashboard-kpi dashboard-kpi--running">
       <span class="dashboard-kpi__icon">{{ icon("activity") }}</span>
-      <div><span>Em processamento</span><strong>{{ summary.running }}</strong><small>Retrieve ou envio ativo</small></div>
+      <div><strong>{{ summary.running }}</strong><span>Em processamento</span><small>Retrieve ou envio ativo</small></div>
     </article>
     <article class="dashboard-kpi dashboard-kpi--danger{% if summary.error %} has-alert{% endif %}">
       <span class="dashboard-kpi__icon">{{ icon("alert") }}</span>
-      <div><span>Erros recentes</span><strong>{{ summary.error }}</strong><small>{% if summary.error %}Nas últimas 24 horas{% else %}Nenhuma ocorrência em 24h{% endif %}</small></div>
+      <div><strong>{{ summary.error }}</strong><span>Erros recentes</span><small>{% if summary.error %}Nas últimas 24 horas{% else %}Nenhuma ocorrência em 24h{% endif %}</small></div>
     </article>
   </div>
 </section>

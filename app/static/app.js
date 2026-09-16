@@ -44,7 +44,7 @@
     button.addEventListener("click", () => setSidebar(false));
   });
 
-  const customSelects = Array.from(document.querySelectorAll("[data-custom-select]"));
+  const customSelects = () => Array.from(document.querySelectorAll("[data-custom-select]"));
   const setCustomSelectOpen = (select, open, restoreFocus = false) => {
     const trigger = select?.querySelector("[data-custom-select-trigger]");
     const menu = select?.querySelector("[data-custom-select-menu]");
@@ -61,12 +61,12 @@
   };
 
   const closeCustomSelects = (except = null) => {
-    customSelects.forEach((select) => {
+    customSelects().forEach((select) => {
       if (select !== except) setCustomSelectOpen(select, false);
     });
   };
 
-  customSelects.forEach((select) => {
+  const initCustomSelects = (scope = document) => scope.querySelectorAll("[data-custom-select]").forEach((select) => {
     const trigger = select.querySelector("[data-custom-select-trigger]");
     const menu = select.querySelector("[data-custom-select-menu]");
     const value = select.querySelector("[data-custom-select-value]");
@@ -85,6 +85,7 @@
         if (label) label.textContent = option.querySelector("span")?.textContent || option.textContent.trim();
         options.forEach((item) => item.setAttribute("aria-selected", String(item === option)));
         setCustomSelectOpen(select, false, true);
+        if (select.hasAttribute("data-custom-select-submit")) select.closest("form")?.requestSubmit();
       });
       option.addEventListener("keydown", (event) => {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -114,6 +115,7 @@
       }
     });
   });
+  initCustomSelects();
 
   document.addEventListener("click", (event) => {
     if (!event.target.closest("[data-custom-select]")) closeCustomSelects();
@@ -255,6 +257,7 @@
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       element.innerHTML = await response.text();
+      initCustomSelects(element);
       element.removeAttribute("data-poll-error");
     } catch (_error) {
       element.setAttribute("data-poll-error", "true");

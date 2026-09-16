@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import signal
 from concurrent.futures import Future, ThreadPoolExecutor
-from threading import Event
+from threading import Event, Thread
 from time import perf_counter
 
 from sqlalchemy import select
 
 from app.config import (
     COMPACT_UNIT_SCHEDULERS,
+    FIND_ORDERS_PER_UNIT,
     FIND_UNIT_SCHEDULERS,
     ORDERS_API_ACK_UNIT_WORKERS,
     SEND_UNIT_SCHEDULERS,
@@ -161,8 +162,70 @@ def _compact_job(unit_id: int) -> None:
 
 
 def _find_job(unit_id: int) -> None:
-    """Search one bounded batch without blocking other units or worker stages."""
-    _run_unit_stage(unit_id, "dicom.find.batch", find_pending)
+    """Claim and search one order in an isolated database session."""
+    _run_unit_stage(
+        unit_id,
+        "dicom.find.order",
+        lambda db, unit: find_pending(db, unit, max_orders=1),
+    )
+
+
+def _schedule_find_jobs(
+    pool: ThreadPoolExecutor,
+    jobs: dict[tuple[int, int], Future],
+) -> None:
+    """Keep a bounded number of C-FIND requests active per unit."""
+    with SessionLocal() as db:
+        unit_ids = list(
+            db.scalars(
+                select(Unit.id).where(Unit.deleted_at.is_(None), Unit.enabled.is_(True))
+            )
+        )
+    for unit_id in unit_ids:
+        for slot in range(max(1, FIND_ORDERS_PER_UNIT)):
+            key = (unit_id, slot)
+            existing = jobs.get(key)
+            if existing is not None and not existing.done():
+                continue
+            if existing is not None:
+                try:
+                    existing.result()
+                except Exception as exc:
+                    log_event(
+                        log,
+                        logging.ERROR,
+                        "worker.stage.job",
+                        resource=f"unit:{unit_id}",
+                        status="failure",
+                        error=exc,
+                        error_detail=safe_error_detail(exc),
+                        stage="dicom.find.order",
+                        unit_id=unit_id,
+                    )
+            jobs[key] = pool.submit(_find_job, unit_id)
+    active_units = set(unit_ids)
+    for key in list(jobs):
+        if key[0] not in active_units and jobs[key].done():
+            jobs.pop(key)
+
+
+def _find_scheduler_loop(pool: ThreadPoolExecutor) -> None:
+    """Schedule finds independently of API ingestion, compression and sending."""
+    jobs: dict[tuple[int, int], Future] = {}
+    while not stop_event.is_set():
+        try:
+            _schedule_find_jobs(pool, jobs)
+        except Exception as exc:
+            log_event(
+                log,
+                logging.ERROR,
+                "dicom.find.scheduler",
+                resource="worker",
+                status="failure",
+                error=exc,
+                error_detail=safe_error_detail(exc),
+            )
+        stop_event.wait(max(1, WORKER_INTERVAL_SECONDS))
 
 
 def _send_job(unit_id: int) -> None:
@@ -239,6 +302,12 @@ def main() -> None:
         max_workers=max(1, FIND_UNIT_SCHEDULERS),
         thread_name_prefix="unit-find",
     )
+    find_scheduler = Thread(
+        target=_find_scheduler_loop,
+        args=(find_pool,),
+        name="find-scheduler",
+        daemon=True,
+    )
     compact_pool = ThreadPoolExecutor(
         max_workers=max(1, COMPACT_UNIT_SCHEDULERS),
         thread_name_prefix="unit-compact",
@@ -248,7 +317,6 @@ def main() -> None:
         thread_name_prefix="unit-send",
     )
     ack_jobs: dict[int, Future] = {}
-    find_jobs: dict[int, Future] = {}
     compact_jobs: dict[int, Future] = {}
     send_jobs: dict[int, Future] = {}
     with SessionLocal() as db:
@@ -262,6 +330,7 @@ def main() -> None:
             unit_count=len(units),
             enabled_unit_count=sum(1 for unit in units if unit.enabled),
         )
+    find_scheduler.start()
     try:
         while not stop_event.is_set():
             # A healthcheck deve provar que o loop está vivo mesmo quando uma etapa
@@ -273,8 +342,6 @@ def main() -> None:
                     pool,
                     ack_pool,
                     ack_jobs,
-                    find_pool,
-                    find_jobs,
                     compact_pool,
                     compact_jobs,
                     send_pool,
@@ -293,6 +360,8 @@ def main() -> None:
                 )
             stop_event.wait(WORKER_INTERVAL_SECONDS)
     finally:
+        stop_event.set()
+        find_scheduler.join(timeout=5)
         supervisor.stop_all()
         pool.shutdown(wait=False)
         ack_pool.shutdown(wait=False, cancel_futures=True)
@@ -325,8 +394,6 @@ def _tick(
     pool: ThreadPoolExecutor,
     ack_pool: ThreadPoolExecutor | None = None,
     ack_jobs: dict[int, Future] | None = None,
-    find_pool: ThreadPoolExecutor | None = None,
-    find_jobs: dict[int, Future] | None = None,
     compact_pool: ThreadPoolExecutor | None = None,
     compact_jobs: dict[int, Future] | None = None,
     send_pool: ThreadPoolExecutor | None = None,
@@ -356,18 +423,6 @@ def _tick(
     ack_executor = ack_pool or pool
     active_ack_jobs = ack_jobs if ack_jobs is not None else {}
     for unit_id in unit_ids:
-        # Existing backlog must not wait for a potentially large API response
-        # to be ingested before the next C-FIND batch can start.
-        if find_pool is not None and find_jobs is not None:
-            _schedule_unit_job(
-                find_pool,
-                find_jobs,
-                unit_id,
-                _find_job,
-                "dicom.find.batch",
-            )
-        else:
-            _run_unit_stage(unit_id, "dicom.find.batch", find_pending)
         _run_unit_stage(unit_id, "orders.ingest", ingest_unit)
         _schedule_ack_job(
             ack_executor,

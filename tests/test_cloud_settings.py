@@ -2,7 +2,7 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from app.worker import _schedule_ack_job, _schedule_unit_job, _tick
+from app.worker import _schedule_ack_job, _schedule_find_jobs, _schedule_unit_job, _tick
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -112,7 +112,6 @@ class UnitCloudSettingsTest(DatabaseTestCase):
 
         supervisor = MagicMock()
         move_pool = MagicMock()
-        find_pool = MagicMock()
         compact_pool = MagicMock()
         send_pool = MagicMock()
         with (
@@ -129,22 +128,19 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             _tick(
                 supervisor,
                 move_pool,
-                find_pool=find_pool,
-                find_jobs={},
                 compact_pool=compact_pool,
                 compact_jobs={},
                 send_pool=send_pool,
                 send_jobs={},
             )
 
-        find_pool.submit.assert_called_once()
         compact_pool.submit.assert_called_once()
         send_pool.submit.assert_called_once()
         find_pending.assert_not_called()
         compact_unit.assert_not_called()
         send_unit.assert_not_called()
 
-    def test_find_jobs_are_scheduled_for_each_unit_before_api_ingestion(self):
+    def test_find_scheduler_is_independent_and_bounded_per_unit(self):
         with self.Session() as db:
             db.add_all(
                 [
@@ -154,37 +150,29 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             )
             db.commit()
 
-        events = []
         find_pool = MagicMock()
-        find_pool.submit.side_effect = lambda _callback, unit_id: events.append(
-            ("find", unit_id)
-        ) or Future()
+        futures = []
 
-        def ingest(_db, unit):
-            events.append(("ingest", unit.id))
+        def submit(_callback, _unit_id):
+            future = Future()
+            futures.append(future)
+            return future
+
+        find_pool.submit.side_effect = submit
+        jobs = {}
 
         with (
             patch("app.worker.SessionLocal", self.Session),
-            patch("app.worker.recover_stale_locks"),
-            patch("app.worker.cleanup_unmatched_orders"),
-            patch("app.worker.archive_completed_orders"),
-            patch("app.worker.ingest_unit", side_effect=ingest),
-            patch("app.worker.claim_due_moves", return_value=[]),
-            patch("app.worker.compact_unit"),
-            patch("app.worker.send_unit"),
+            patch("app.worker.FIND_ORDERS_PER_UNIT", 2),
         ):
-            _tick(
-                MagicMock(),
-                MagicMock(),
-                find_pool=find_pool,
-                find_jobs={},
-            )
+            _schedule_find_jobs(find_pool, jobs)
+            _schedule_find_jobs(find_pool, jobs)
+            self.assertEqual(find_pool.submit.call_count, 4)
+            self.assertEqual(set(jobs), {(1, 0), (1, 1), (2, 0), (2, 1)})
+            futures[0].set_result(None)
+            _schedule_find_jobs(find_pool, jobs)
 
-        self.assertEqual(find_pool.submit.call_count, 2)
-        self.assertEqual(
-            events,
-            [("find", 1), ("ingest", 1), ("find", 2), ("ingest", 2)],
-        )
+        self.assertEqual(find_pool.submit.call_count, 5)
 
     def test_failure_in_one_unit_does_not_block_the_next_unit(self):
         with self.Session() as db:
@@ -208,14 +196,12 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             patch("app.worker.cleanup_unmatched_orders"),
             patch("app.worker.archive_completed_orders"),
             patch("app.worker.ingest_unit", side_effect=fail_first_unit),
-            patch("app.worker.find_pending") as find_pending,
             patch("app.worker.claim_due_moves", return_value=[]),
             patch("app.worker.compact_unit"),
             patch("app.worker.send_unit") as send_unit,
         ):
             _tick(supervisor, pool)
 
-        self.assertEqual(find_pending.call_count, 2)
         self.assertEqual(send_unit.call_count, 2)
 
 

@@ -546,7 +546,8 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(logs.status_code, 200)
         self.assertIn("Unidade de teste", logs.text)
         self.assertIn("Unidade adicionada ao sistema.", logs.text)
-        self.assertIn('<option value="30" selected>', logs.text)
+        self.assertIn('name="page_size" value="30" data-custom-select-value', logs.text)
+        self.assertIn('data-value="30" aria-selected="true"', logs.text)
         self.assertEqual(
             self.client.get("/logs", params={"page_size": 10}).status_code,
             200,
@@ -843,7 +844,11 @@ class SecurityTest(unittest.TestCase):
 
         ten_per_page = self.client.get("/orders", params={"page_size": 10})
         self.assertEqual(ten_per_page.text.count('class="order-date"'), 10)
-        self.assertIn('<option value="10" selected>', ten_per_page.text)
+        self.assertIn(
+            'name="page_size" value="10" data-custom-select-value',
+            ten_per_page.text,
+        )
+        self.assertIn('data-value="10" aria-selected="true"', ten_per_page.text)
         self.assertRegex(ten_per_page.text, r"before=\d+&amp;page=3")
 
         history = self.client.get("/orders/history")
