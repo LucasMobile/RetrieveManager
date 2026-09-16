@@ -67,6 +67,11 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
             )
             db.add(unit)
             db.commit()
+            transaction_during_codec = []
+
+            def fail_codec(*_args):
+                transaction_during_codec.append(db.in_transaction())
+                raise RuntimeError("codec failed unexpectedly")
 
             with (
                 patch(
@@ -76,11 +81,12 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
                 patch("app.pipeline.load_rule_specs", return_value=()),
                 patch(
                     "app.pipeline._compact_one_limited",
-                    side_effect=RuntimeError("codec failed unexpectedly"),
+                    side_effect=fail_codec,
                 ),
             ):
                 has_more = compact_unit(db, unit)
 
+            self.assertEqual(transaction_during_codec, [False])
             self.assertFalse(has_more)
             self.assertFalse(source.exists())
             self.assertTrue((error / source.name).is_file())

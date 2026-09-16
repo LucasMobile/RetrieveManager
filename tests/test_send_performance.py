@@ -40,8 +40,10 @@ class SendPerformanceTest(DatabaseTestCase):
                 db.add(transfer)
                 transfers.append(transfer)
             db.commit()
+            transaction_during_upload = []
 
             async def successful_batch(jobs, _url, _workers):
+                transaction_during_upload.append(db.in_transaction())
                 return [
                     SendResult(job[0], job[2], True, http_status=200)
                     for job in jobs
@@ -63,6 +65,7 @@ class SendPerformanceTest(DatabaseTestCase):
                 )
             )
             self.assertTrue(has_more)
+            self.assertEqual(transaction_during_upload, [False])
             self.assertEqual(statuses, ["uploaded", "uploaded", "compressed"])
 
     def test_incremental_reconciliation_advances_through_directory(self):

@@ -110,12 +110,19 @@ class OrdersApiIngestionTest(DatabaseTestCase):
             unit = self._unit()
             db.add(unit)
             db.commit()
+            transaction_during_get = []
+
+            async def fetch(_url, _token):
+                transaction_during_get.append(db.in_transaction())
+                return payload
+
             with patch(
                 "app.pipeline.fetch_orders",
-                new=AsyncMock(return_value=payload),
+                new=fetch,
             ):
                 self.assertEqual(ingest_unit(db, unit), 1)
 
+            self.assertEqual(transaction_during_get, [False])
             orders = list(db.scalars(select(Order)))
             self.assertEqual(len(orders), 1)
             self.assertEqual(orders[0].birth_date, "19551104")

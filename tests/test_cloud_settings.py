@@ -105,13 +105,15 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             },
         )
 
-    def test_production_tick_dispatches_compaction_and_send_in_background(self):
+    def test_slow_ingest_does_not_delay_compaction_or_send(self):
         with self.Session() as db:
             db.add(make_unit(name="Unidade", enabled=True))
             db.commit()
 
         supervisor = MagicMock()
         move_pool = MagicMock()
+        ingest_pool = MagicMock()
+        ingest_pool.submit.return_value = Future()
         compact_pool = MagicMock()
         send_pool = MagicMock()
         with (
@@ -119,23 +121,29 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             patch("app.worker.recover_stale_locks"),
             patch("app.worker.cleanup_unmatched_orders"),
             patch("app.worker.archive_completed_orders"),
-            patch("app.worker.ingest_unit"),
+            patch("app.worker.ingest_unit") as ingest_unit,
             patch("app.worker.find_pending") as find_pending,
             patch("app.worker.claim_due_moves", return_value=[]),
             patch("app.worker.compact_unit") as compact_unit,
             patch("app.worker.send_unit") as send_unit,
         ):
-            _tick(
-                supervisor,
-                move_pool,
-                compact_pool=compact_pool,
-                compact_jobs={},
-                send_pool=send_pool,
-                send_jobs={},
-            )
+            ingest_jobs = {}
+            for _ in range(2):
+                _tick(
+                    supervisor,
+                    move_pool,
+                    compact_pool=compact_pool,
+                    compact_jobs={},
+                    send_pool=send_pool,
+                    send_jobs={},
+                    ingest_pool=ingest_pool,
+                    ingest_jobs=ingest_jobs,
+                )
 
-        compact_pool.submit.assert_called_once()
-        send_pool.submit.assert_called_once()
+        ingest_pool.submit.assert_called_once()
+        self.assertEqual(compact_pool.submit.call_count, 2)
+        self.assertEqual(send_pool.submit.call_count, 2)
+        ingest_unit.assert_not_called()
         find_pending.assert_not_called()
         compact_unit.assert_not_called()
         send_unit.assert_not_called()

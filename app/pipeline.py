@@ -307,6 +307,9 @@ def ingest_unit(db: Session, unit: Unit) -> int:
 
     payload: list[dict] = []
     try:
+        # db.get(Unit) abriu uma transação; não retenha a conexão durante
+        # um GET que pode consumir todo o timeout e suas tentativas.
+        db.commit()
         payload = asyncio.run(fetch_orders(unit.orders_api_url, unit.orders_api_token))
         log_event(
             log,
@@ -813,40 +816,6 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             return
 
         study_uid, modalities, patient_name, body_part = parse_findscu_output(output)
-        allowed_modalities = find_modalities_for_unit(db, unit.id)
-        modality = first_allowed_modality(modalities, allowed_modalities)
-        diagnostic_output = output
-        if study_uid:
-            try:
-                series_code, series_output = c_find_series_body_part(
-                    unit.calling_aet,
-                    unit.pacs_aet,
-                    unit.pacs_ip,
-                    unit.pacs_port,
-                    study_uid,
-                    timeout=FIND_TIMEOUT_SECONDS,
-                )
-            except ToolMissing as exc:
-                series_code, series_output = 127, str(exc)
-            diagnostic_output = (
-                f"{output}\n\nC-FIND complementar de séries:\n{series_output}"
-            )
-            if series_code == 0:
-                series_modality, series_body_part = parse_series_metadata(
-                    series_output, allowed_modalities
-                )
-                if series_modality:
-                    modality = series_modality
-                    body_part = series_body_part
-                elif series_response_has_modality(series_output):
-                    # The PACS returned series, but none belongs to the accepted
-                    # compression catalog. Keep watching instead of choosing SR/PR.
-                    modality = ""
-                    body_part = ""
-                elif modality and not body_part:
-                    # Compatibility with PACS nodes that omit Modality at SERIES.
-                    body_part = parse_series_body_part(series_output)
-        safe_output = redact_dicom_output(diagnostic_output)
         if not study_uid:
             order.heartbeat_at = None
             order.last_error = ""
@@ -854,7 +823,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 db,
                 order,
                 "C-FIND sem StudyInstanceUID (exame ainda não no PACS)",
-                safe_output,
+                redact_dicom_output(output),
             )
             db.commit()
             log_event(
@@ -869,7 +838,42 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 command_status=code,
             )
             return
-
+        allowed_modalities = find_modalities_for_unit(db, unit.id)
+        modality = first_allowed_modality(modalities, allowed_modalities)
+        diagnostic_output = output
+        # A consulta de regras abriu uma transação; não retenha a conexão
+        # enquanto o C-FIND complementar aguarda a resposta do PACS.
+        db.commit()
+        try:
+            series_code, series_output = c_find_series_body_part(
+                unit.calling_aet,
+                unit.pacs_aet,
+                unit.pacs_ip,
+                unit.pacs_port,
+                study_uid,
+                timeout=FIND_TIMEOUT_SECONDS,
+            )
+        except ToolMissing as exc:
+            series_code, series_output = 127, str(exc)
+        diagnostic_output = (
+            f"{output}\n\nC-FIND complementar de séries:\n{series_output}"
+        )
+        if series_code == 0:
+            series_modality, series_body_part = parse_series_metadata(
+                series_output, allowed_modalities
+            )
+            if series_modality:
+                modality = series_modality
+                body_part = series_body_part
+            elif series_response_has_modality(series_output):
+                # The PACS returned series, but none belongs to the accepted
+                # compression catalog. Keep watching instead of choosing SR/PR.
+                modality = ""
+                body_part = ""
+            elif modality and not body_part:
+                # Compatibility with PACS nodes that omit Modality at SERIES.
+                body_part = parse_series_body_part(series_output)
+        safe_output = redact_dicom_output(diagnostic_output)
         if not modality:
             order.heartbeat_at = None
             order.last_error = ""
@@ -1947,6 +1951,9 @@ def compact_unit(db: Session, unit: Unit) -> bool:
     failed_count = 0
     codec_skipped_count = 0
     persistence_buffer: list[CompactResult] = []
+    # As regras já foram materializadas em valores simples. Devolva a conexão
+    # ao pool enquanto o codec processa os arquivos deste lote.
+    db.commit()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
             pool.submit(
@@ -3035,6 +3042,9 @@ def send_unit(db: Session, unit: Unit, cloud_url: str, settle: int) -> bool:
         unit_concurrency=workers,
         global_concurrency=SEND_GLOBAL_CONCURRENCY,
     )
+    # O upload usa apenas IDs/caminhos já coletados; não segure uma transação
+    # durante requisições HTTP potencialmente longas.
+    db.commit()
     results = asyncio.run(_send_all(jobs, cloud_url, workers))
     failure_count, success_count = _record_send_results(
         db, unit, results, circuit

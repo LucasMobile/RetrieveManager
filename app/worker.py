@@ -13,6 +13,7 @@ from app.config import (
     FIND_ORDERS_PER_UNIT,
     FIND_UNIT_SCHEDULERS,
     ORDERS_API_ACK_UNIT_WORKERS,
+    ORDERS_API_INGEST_UNIT_WORKERS,
     SEND_UNIT_SCHEDULERS,
     WORKER_HEALTH_FILE,
     WORKER_INTERVAL_SECONDS,
@@ -120,6 +121,11 @@ def _ack_job(unit_id: int) -> None:
                 stage="orders.ack",
                 unit_id=unit_id,
             )
+
+
+def _ingest_job(unit_id: int) -> None:
+    """Keep a slow PLERES GET off the batch-dispatch loop."""
+    _run_unit_stage(unit_id, "orders.ingest", ingest_unit)
 
 
 def _schedule_ack_job(
@@ -298,6 +304,10 @@ def main() -> None:
         max_workers=ORDERS_API_ACK_UNIT_WORKERS,
         thread_name_prefix="orders-ack",
     )
+    ingest_pool = ThreadPoolExecutor(
+        max_workers=max(1, ORDERS_API_INGEST_UNIT_WORKERS),
+        thread_name_prefix="orders-ingest",
+    )
     find_pool = ThreadPoolExecutor(
         max_workers=max(1, FIND_UNIT_SCHEDULERS),
         thread_name_prefix="unit-find",
@@ -317,6 +327,7 @@ def main() -> None:
         thread_name_prefix="unit-send",
     )
     ack_jobs: dict[int, Future] = {}
+    ingest_jobs: dict[int, Future] = {}
     compact_jobs: dict[int, Future] = {}
     send_jobs: dict[int, Future] = {}
     with SessionLocal() as db:
@@ -346,6 +357,8 @@ def main() -> None:
                     compact_jobs,
                     send_pool,
                     send_jobs,
+                    ingest_pool=ingest_pool,
+                    ingest_jobs=ingest_jobs,
                 )
                 _touch_health()
             except Exception as exc:
@@ -365,6 +378,7 @@ def main() -> None:
         supervisor.stop_all()
         pool.shutdown(wait=False)
         ack_pool.shutdown(wait=False, cancel_futures=True)
+        ingest_pool.shutdown(wait=False, cancel_futures=True)
         find_pool.shutdown(wait=False, cancel_futures=True)
         compact_pool.shutdown(wait=False, cancel_futures=True)
         send_pool.shutdown(wait=False, cancel_futures=True)
@@ -398,6 +412,8 @@ def _tick(
     compact_jobs: dict[int, Future] | None = None,
     send_pool: ThreadPoolExecutor | None = None,
     send_jobs: dict[int, Future] | None = None,
+    ingest_pool: ThreadPoolExecutor | None = None,
+    ingest_jobs: dict[int, Future] | None = None,
 ) -> None:
     _run_db_stage("locks.recover", recover_stale_locks)
     _run_db_stage("orders.cleanup_unmatched", cleanup_unmatched_orders)
@@ -423,7 +439,16 @@ def _tick(
     ack_executor = ack_pool or pool
     active_ack_jobs = ack_jobs if ack_jobs is not None else {}
     for unit_id in unit_ids:
-        _run_unit_stage(unit_id, "orders.ingest", ingest_unit)
+        if ingest_pool is not None and ingest_jobs is not None:
+            _schedule_unit_job(
+                ingest_pool,
+                ingest_jobs,
+                unit_id,
+                _ingest_job,
+                "orders.ingest",
+            )
+        else:
+            _run_unit_stage(unit_id, "orders.ingest", ingest_unit)
         _schedule_ack_job(
             ack_executor,
             active_ack_jobs,
