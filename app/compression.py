@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.codec import PROFILE_LOSSLESS, PROFILES
 from app.models import (
     CompressRule,
     DropModality,
@@ -15,12 +16,8 @@ from app.models import (
 )
 from app.validation import validate_modality
 
-DEFAULT_JPEG_FLAG = "+e1"
-JPEG_PROFILES = {
-    "lossless": "+e1",
-    "lossy_8": "+eb",
-    "lossy_12": "+ee",
-}
+# Stored in the jpeg_flag columns. Modalities without a rule use lossless.
+DEFAULT_PROFILE = PROFILE_LOSSLESS
 COMPRESSION_MODALITIES = (
     "BMD",
     "CP",
@@ -45,10 +42,6 @@ class UnitCompressionForm:
     profiles: dict[str, frozenset[str]]
     drops: frozenset[str]
 
-    @property
-    def by_flag(self) -> dict[str, frozenset[str]]:
-        return {JPEG_PROFILES[name]: values for name, values in self.profiles.items()}
-
 
 def _parse_modalities(raw: str) -> set[str]:
     if len(raw) > 2048:
@@ -68,9 +61,8 @@ def _parse_modalities(raw: str) -> set[str]:
 
 def validate_unit_compression_form(form: dict[str, str]) -> UnitCompressionForm:
     profiles = {
-        "lossless": _parse_modalities(form.get("compress_lossless", "")),
-        "lossy_8": _parse_modalities(form.get("compress_lossy_8", "")),
-        "lossy_12": _parse_modalities(form.get("compress_lossy_12", "")),
+        profile: _parse_modalities(form.get(f"compress_{profile}", ""))
+        for profile in PROFILES
     }
     assigned: dict[str, str] = {}
     for profile, modalities in profiles.items():
@@ -93,14 +85,12 @@ def validate_unit_compression_form(form: dict[str, str]) -> UnitCompressionForm:
 
 
 def compression_form_for_unit(db: Session, unit_id: int) -> UnitCompressionForm:
-    grouped = {name: set() for name in JPEG_PROFILES}
-    flag_to_profile = {flag: name for name, flag in JPEG_PROFILES.items()}
+    grouped = {name: set() for name in PROFILES}
     for rule in db.scalars(
         select(UnitCompressRule).where(UnitCompressRule.unit_id == unit_id)
     ):
-        profile = flag_to_profile.get(rule.jpeg_flag)
-        if profile:
-            grouped[profile].add(rule.modality.upper())
+        if rule.jpeg_flag in grouped:
+            grouped[rule.jpeg_flag].add(rule.modality.upper())
     drops = {
         row.code.upper()
         for row in db.scalars(
@@ -128,19 +118,16 @@ def save_unit_compression_settings(
     config = db.get(UnitCompressionSettings, unit.id)
     if config is None:
         db.add(
-            UnitCompressionSettings(
-                unit_id=unit.id, default_jpeg_flag=DEFAULT_JPEG_FLAG
-            )
+            UnitCompressionSettings(unit_id=unit.id, default_jpeg_flag=DEFAULT_PROFILE)
         )
     else:
-        config.default_jpeg_flag = DEFAULT_JPEG_FLAG
+        config.default_jpeg_flag = DEFAULT_PROFILE
 
     db.execute(delete(UnitCompressRule).where(UnitCompressRule.unit_id == unit.id))
     db.execute(delete(UnitDropModality).where(UnitDropModality.unit_id == unit.id))
     for profile, modalities in settings.profiles.items():
-        flag = JPEG_PROFILES[profile]
         db.add_all(
-            UnitCompressRule(unit_id=unit.id, modality=code, jpeg_flag=flag)
+            UnitCompressRule(unit_id=unit.id, modality=code, jpeg_flag=profile)
             for code in sorted(modalities)
         )
     db.add_all(
@@ -159,17 +146,13 @@ def migrate_legacy_unit_compression(db: Session) -> None:
 
 def legacy_unit_compression_form(db: Session) -> UnitCompressionForm:
     """Return safe defaults for migration and newly-created units."""
-    legacy_drops = {
-        row.code.upper() for row in db.scalars(select(DropModality))
-    }
-    legacy_profiles = {name: set() for name in JPEG_PROFILES}
-    flag_to_profile = {flag: name for name, flag in JPEG_PROFILES.items()}
+    legacy_drops = {row.code.upper() for row in db.scalars(select(DropModality))}
+    legacy_profiles = {name: set() for name in PROFILES}
     for row in db.scalars(select(CompressRule)):
-        if row.modality == "*":
+        if row.modality == "*" or row.modality.upper() in legacy_drops:
             continue
-        profile = flag_to_profile.get(row.jpeg_flag)
-        if profile and row.modality.upper() not in legacy_drops:
-            legacy_profiles[profile].add(row.modality.upper())
+        if row.jpeg_flag in legacy_profiles:
+            legacy_profiles[row.jpeg_flag].add(row.modality.upper())
     return UnitCompressionForm(
         {name: frozenset(values) for name, values in legacy_profiles.items()},
         frozenset(legacy_drops),
@@ -191,7 +174,7 @@ def compression_runtime_settings(
             select(UnitCompressRule).where(UnitCompressRule.unit_id == unit_id)
         )
     }
-    compress_map["*"] = DEFAULT_JPEG_FLAG
+    compress_map["*"] = DEFAULT_PROFILE
     return drops, compress_map
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from app.compaction import CompactResult
 from app.dicom_rules import RuleMatch
 from app.models import (
     AuditLog,
@@ -18,13 +19,8 @@ from app.models import (
     Order,
     OrderEvent,
 )
-from app.pipeline import (
-    CircuitState,
-    CompactResult,
-    SendResult,
-    _record_compact_result,
-    _record_send_results,
-)
+from app.pipeline.records import _record_compact_result
+from app.pipeline.send import CircuitState, SendResult, _record_send_results
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -184,7 +180,8 @@ class TransferTrackingTest(DatabaseTestCase):
             db.commit()
 
             db.refresh(transfer)
-            self.assertEqual(transfer.status, "compressed")
+            # Released to the sender only once the file is in send_dir.
+            self.assertEqual(transfer.status, "publishing")
             self.assertEqual(transfer.correlation_id, "new-correlation")
             self.assertEqual(transfer.attempts, 0)
 
@@ -233,7 +230,7 @@ class TransferTrackingTest(DatabaseTestCase):
                     "historical-file.dcm",
                     "1.2.historical",
                     "compressed",
-                    patient_id="30211738-A",
+                    patient_id="30211738",
                     birth_date="19691027",
                     study_date="20250110",
                     accession="old-accession",
@@ -254,6 +251,59 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertIsNotNone(link)
             self.assertEqual(link.historical_study_id, study.id)
             self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+
+    def test_historical_patient_id_suffix_is_linked_only_with_unit_opt_in(self):
+        for wildcard in (False, True):
+            with self.subTest(wildcard=wildcard), self.Session() as db:
+                unit = make_unit(
+                    name=f"unit-{wildcard}",
+                    store_port=444 + int(wildcard),
+                    retrieve_prior_enabled=True,
+                    pacs_patient_id_wildcard=wildcard,
+                )
+                db.add(unit)
+                db.flush()
+                observed_at = datetime.now()
+                order = Order(
+                    unit_id=unit.id,
+                    source_id=f"order-{wildcard}",
+                    acc=f"current-{wildcard}",
+                    pat_id="30211738",
+                    birth_date="19691027",
+                    study_uid=f"1.2.current.{int(wildcard)}",
+                    modality="MR",
+                    body_part="ABDOMEN",
+                    prior_status="retrieving",
+                    prior_date_from="20230911",
+                    prior_date_to="20260910",
+                    prior_started_at=observed_at - timedelta(seconds=5),
+                )
+                db.add(order)
+                db.commit()
+
+                _record_compact_result(
+                    db,
+                    unit,
+                    CompactResult(
+                        f"historical-{wildcard}",
+                        f"historical-{wildcard}.dcm",
+                        f"1.2.historical.{int(wildcard)}",
+                        "compressed",
+                        patient_id="30211738-A",
+                        birth_date="19691027",
+                        study_date="20250110",
+                        accession=f"old-accession-{wildcard}",
+                        modality="MR",
+                        body_part="ABDOMEN",
+                        observed_at=observed_at,
+                    ),
+                )
+                db.commit()
+
+                study = db.scalar(
+                    select(HistoricalStudy).where(HistoricalStudy.order_id == order.id)
+                )
+                self.assertEqual(study is not None, wildcard)
 
     def test_discovered_historical_study_is_linked_without_metadata_guessing(self):
         with self.Session() as db:
@@ -361,9 +411,7 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertEqual(
                 len(
                     list(
-                        db.scalars(
-                            select(AuditLog).where(AuditLog.action == "create")
-                        )
+                        db.scalars(select(AuditLog).where(AuditLog.action == "create"))
                     )
                 ),
                 1,
@@ -560,6 +608,7 @@ class TransferTrackingTest(DatabaseTestCase):
                     accession="ACC-INVALID",
                     modality="CT",
                     observed_at=datetime.now(),
+                    temp_output=str(path),
                 ),
             )
             db.commit()

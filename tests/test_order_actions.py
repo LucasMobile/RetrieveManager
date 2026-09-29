@@ -5,10 +5,6 @@ from unittest.mock import patch
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
-from app.main import (
-    _delete_order_record,
-    _reset_order_for_reprocess,
-)
 from app.models import (
     AuditLog,
     ImageTransfer,
@@ -18,10 +14,11 @@ from app.models import (
     Unit,
 )
 from app.order_state import ACTIVE_ORDER_STATUSES
-from app.pipeline import (
-    archive_completed_orders,
-    cleanup_unmatched_orders,
-    find_pending,
+from app.pipeline.find import find_pending
+from app.pipeline.orders import archive_completed_orders, cleanup_unmatched_orders
+from app.routes.orders import (
+    _delete_order_record,
+    _reset_order_for_reprocess,
 )
 from tests.support import DatabaseTestCase, make_unit
 
@@ -77,9 +74,9 @@ class OrderActionsTest(DatabaseTestCase):
 
             searched = []
             with (
-                patch("app.pipeline.FIND_BATCH_SIZE", 1),
+                patch("app.pipeline.find.FIND_BATCH_SIZE", 1),
                 patch(
-                    "app.pipeline._find_one",
+                    "app.pipeline.find._find_one",
                     side_effect=lambda _db, _unit, order, _now: searched.append(
                         order.acc
                     ),
@@ -114,10 +111,8 @@ class OrderActionsTest(DatabaseTestCase):
 
             searched = []
             with patch(
-                "app.pipeline._find_one",
-                side_effect=lambda _db, _unit, order, _now: searched.append(
-                    order.acc
-                ),
+                "app.pipeline.find._find_one",
+                side_effect=lambda _db, _unit, order, _now: searched.append(order.acc),
             ):
                 find_pending(db, unit, max_orders=1)
                 find_pending(db, unit, max_orders=1)

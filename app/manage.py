@@ -10,7 +10,7 @@ from app.config import ADMIN_PASSWORD, ADMIN_USER
 from app.db import SessionLocal
 from app.models import User
 from app.observability import configure_logging, log_event
-from app.security import hash_password
+from app.security import hash_password, revoke_sessions
 
 log = logging.getLogger("manage")
 
@@ -25,6 +25,7 @@ def reset_admin() -> None:
             db.add(user)
         user.password_hash = hash_password(ADMIN_PASSWORD)
         user.role = "admin"
+        revoke_sessions(user)
         db.flush()
         user_id = user.id
 

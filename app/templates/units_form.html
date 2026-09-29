@@ -92,6 +92,10 @@
                 <label for="pacs-port">Porta do PACS</label>
                 <input id="pacs-port" class="mono" name="pacs_port" type="number" min="1" max="65535" value="{{ unit.pacs_port if unit else 2104 }}" data-connection-field="pacs-port" required>
               </div>
+              <div class="field field--full">
+                <label class="checkbox-option"><input id="pacs-patient-id-wildcard" name="pacs_patient_id_wildcard" type="checkbox" value="1" {% if unit and unit.pacs_patient_id_wildcard %}checked{% endif %}> <span>Usar * no Patient ID no C-FIND</span></label>
+                <span class="field__hint">Desmarcado, o Patient ID do PLERES precisa ser idêntico ao do PACS. Marque só se o PACS acrescenta sufixo ao ID (ex.: 12345 → 12345-1); o histórico passa a aceitar IDs que começam com o do pedido.</span>
+              </div>
 
               <div class="echo-test field--full" data-echo-test data-url="/units/test-echo">
                 <div class="echo-test__copy">
@@ -136,6 +140,12 @@
                 <input id="orders-api-station-id" class="mono" name="orders_api_station_id" maxlength="64" value="{{ unit.orders_api_station_id if unit else '' }}" autocomplete="off">
                 <span class="field__hint">Opcional. Quando informado, filtra localmente pelo campo idPosto.</span>
               </div>
+              <div class="field">
+                <label for="orders-api-company-id">Empresa ID</label>
+                <input id="orders-api-company-id" class="mono" name="orders_api_company_id" inputmode="numeric" pattern="[0-9]+" maxlength="64" value="{{ unit.orders_api_company_id if unit else '' }}" autocomplete="off" required>
+                <span class="field__hint">Obrigatório. Identifica a empresa ao confirmar a leitura dos pedidos no PLERES.</span>
+                {% if unit and not unit.orders_api_company_id %}<span class="field__hint">Preencha para liberar as confirmações de leitura desta unidade.</span>{% endif %}
+              </div>
             </div>
           </div>
         </section>
@@ -174,6 +184,16 @@
                 <span class="field__hint">Use uma porta publicada pelo container e liberada no host.</span>
               </div>
               <div class="field">
+                <label for="store-allowed-aets">AE Titles autorizados a enviar</label>
+                <input id="store-allowed-aets" class="mono" name="store_allowed_aets" maxlength="600" value="{{ unit.store_allowed_aets if unit else '' }}" placeholder="Todos" autocapitalize="characters" spellcheck="false">
+                <span class="field__hint">Opcional. Separe por vírgula; normalmente o AET do PACS. Vazio aceita qualquer remetente. Objetos de outros AEs vão para a pasta de erro, sem criar pedido nem subir para a nuvem.</span>
+              </div>
+              <div class="field">
+                <label for="store-allowed-ips">IPs autorizados a enviar</label>
+                <input id="store-allowed-ips" class="mono" name="store_allowed_ips" maxlength="1200" value="{{ unit.store_allowed_ips if unit else '' }}" placeholder="Todos" spellcheck="false" autocomplete="off">
+                <span class="field__hint">Opcional. IPs ou faixas separados por vírgula, ex.: 192.168.3.103, 10.10.0.0/24. Vazio aceita qualquer IP. Conexões de outros endereços são recusadas antes de receber qualquer imagem.</span>
+              </div>
+              <div class="field">
                 <label for="receive-dir">Recebimento DICOM</label>
                 <input id="receive-dir" class="mono" name="receive_dir" value="{{ unit.receive_dir if unit else '' }}" spellcheck="false" required>
               </div>
@@ -193,7 +213,7 @@
         <section class="form-section" aria-labelledby="compression-title" data-unit-compression>
           <div class="form-section__header">
             <span class="form-section__number">06</span>
-            <div><h2 id="compression-title">Compactação</h2><p>Token, perfil JPEG e descarte configurados exclusivamente para esta unidade.</p></div>
+            <div><h2 id="compression-title">Compactação</h2><p>Token, perfil JPEG 2000 e descarte configurados exclusivamente para esta unidade.</p></div>
           </div>
           <div class="form-section__body">
             <div class="form-grid form-grid--2">
@@ -208,9 +228,8 @@
                 <p class="compression-field-description">Selecione as modalidades de cada perfil. Uma modalidade só pode pertencer a um perfil por vez.</p>
                 <div class="unit-compression-profiles">
                   {% for profile, label, description in [
-                    ('lossless', 'JPEG Lossless', 'Sem perda de qualidade'),
-                    ('lossy_8', 'JPEG Lossy 8 Bits', 'Compressão com perda em 8 bits'),
-                    ('lossy_12', 'JPEG Lossy 12 Bits', 'Compressão com perda em 12 bits')
+                    ('lossless', 'JPEG 2000 Lossless', 'Sem perda de qualidade'),
+                    ('lossy', 'JPEG 2000 Lossy', 'Até 8 bits: taxa 10 · 9 a 12 bits: taxa 5 · acima: lossless')
                   ] %}
                   <article class="unit-compression-profile" data-profile-card="{{ profile }}">
                     <input type="hidden" name="compress_{{ profile }}" value="{{ compression_settings.profiles[profile] | sort | join(',') }}" data-profile-input="{{ profile }}">
@@ -226,7 +245,7 @@
                   </article>
                   {% endfor %}
                 </div>
-                <span class="field__hint">Modalidades não selecionadas utilizam JPEG Lossless automaticamente.</span>
+                <span class="field__hint">Modalidades não selecionadas utilizam JPEG 2000 Lossless. Imagens que já chegam comprimidas e objetos sem imagem (SR, PDF) seguem sem recompressão.</span>
               </div>
 
               <div class="field field--full">
@@ -247,9 +266,8 @@
           </div>
 
           {% for profile, label in [
-            ('lossless', 'JPEG Lossless'),
-            ('lossy_8', 'JPEG Lossy 8 Bits'),
-            ('lossy_12', 'JPEG Lossy 12 Bits')
+            ('lossless', 'JPEG 2000 Lossless'),
+            ('lossy', 'JPEG 2000 Lossy')
           ] %}
           <dialog class="compression-dialog" data-compression-dialog="{{ profile }}" aria-labelledby="compression-dialog-title-{{ profile }}">
             <header class="compression-dialog__header">
@@ -285,7 +303,7 @@
         <section class="form-section" aria-labelledby="cloud-title">
           <div class="form-section__header">
             <span class="form-section__number">07</span>
-            <div><h2 id="cloud-title">Envio para a nuvem</h2><p>Destino e intervalo de segurança usados exclusivamente por esta unidade.</p></div>
+            <div><h2 id="cloud-title">Envio para a nuvem</h2><p>Destino usado exclusivamente por esta unidade.</p></div>
           </div>
           <div class="form-section__body">
             <div class="form-grid form-grid--2">
@@ -293,17 +311,10 @@
                 <label for="cloud-url">URL de destino</label>
                 <input id="cloud-url" class="mono" name="cloud_url" type="url" maxlength="500" value="{{ unit.cloud_url if unit else default_cloud_url }}" placeholder="https://api.exemplo.com/imagens" spellcheck="false" autocomplete="url" required>
               </div>
-              <div class="field">
-                <label for="file-settle-seconds">Espera antes de compactar e enviar</label>
-                <div class="settings-unit-input">
-                  <input id="file-settle-seconds" name="file_settle_seconds" type="number" min="0" max="3600" value="{{ unit.file_settle_seconds if unit else 3 }}">
-                  <span aria-hidden="true">s</span>
-                </div>
-              </div>
             </div>
             <div class="settings-note">
               {{ icon("info") }}
-              <span>As alterações serão aplicadas aos próximos arquivos processados pelo worker.</span>
+              <span>Imagens são enviadas em ordem de chegada. Cada falha é tentada novamente com espera crescente; depois de {{ send_max_attempts }} tentativas a imagem fica em "falha de envio". A cada 5 minutos uma delas é testada e, se o envio voltar a funcionar, todas são retomadas; também é possível reenviá-las manualmente.</span>
             </div>
           </div>
         </section>
@@ -344,6 +355,10 @@
           <form class="inline-form" method="post" action="/units/{{ unit.id }}/retry-errors">
         {{ csrf_input(request) }}
             <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar erros</button>
+          </form>
+          <form class="inline-form" method="post" action="/units/{{ unit.id }}/resend-failed" data-confirm="Reenviar todas as imagens desta unidade que esgotaram as tentativas de envio?" data-confirm-label="Reenviar">
+        {{ csrf_input(request) }}
+            <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reenviar falhas de envio</button>
           </form>
           <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Arquivar esta unidade? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
         {{ csrf_input(request) }}

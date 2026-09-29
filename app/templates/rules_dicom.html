@@ -33,6 +33,7 @@
             <span class="dicom-rule-card__priority">{{ rule.priority }}</span>
             <div><h3>{{ rule.name }}</h3><p>{{ rule.combinator_label }}</p></div>
             <span class="status-badge {{ 'ok' if rule.enabled else 'off' }}">{{ 'Ativa' if rule.enabled else 'Inativa' }}</span>
+            {% if rule.protected_action %}<span class="status-badge warn" data-tooltip="A ação altera uma tag protegida e não é executada; as imagens mantêm o valor original. Edite ou exclua a regra.">Ignorada: tag protegida</span>{% endif %}
           </div>
           <div class="dicom-rule-card__conditions">
             {% for condition in rule.conditions %}

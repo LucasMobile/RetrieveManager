@@ -40,6 +40,9 @@
       <a href="/orders/history" class="nav__item{% if nav == 'order_history' %} is-active{% endif %}"{% if nav == 'order_history' %} aria-current="page"{% endif %}>
         {{ icon("history") }}<span>Histórico de pedidos</span>
       </a>
+      <a href="/instances" class="nav__item{% if nav == 'instances' %} is-active{% endif %}"{% if nav == 'instances' %} aria-current="page"{% endif %}>
+        {{ icon("image") }}<span>Instâncias com pendência</span>
+      </a>
       <a href="/units" class="nav__item{% if nav == 'units' %} is-active{% endif %}"{% if nav == 'units' %} aria-current="page"{% endif %}>
         {{ icon("building-2") }}<span>Unidades</span>
       </a>

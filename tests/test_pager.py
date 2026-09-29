@@ -13,9 +13,7 @@ class PagerTest(unittest.TestCase):
             paginate(340, 17, 10)["page_items"],
             [1, None, 16, 17, 18, None, 34],
         )
-        self.assertEqual(
-            paginate(340, 34, 10)["page_items"], [1, None, 32, 33, 34]
-        )
+        self.assertEqual(paginate(340, 34, 10)["page_items"], [1, None, 32, 33, 34])
 
     def test_cursor_links_require_a_cursor_for_each_intermediate_page(self):
         pager = paginate(190, 1, 30)

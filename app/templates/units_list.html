@@ -87,6 +87,7 @@
             </td>
             <td>
               <span class="table-primary mono units-table__path">{{ u.orders_api_url }}</span>
+              <span class="table-secondary">{% if u.orders_api_company_id %}Empresa ID {{ u.orders_api_company_id }}{% else %}Empresa ID pendente · confirmação de leitura bloqueada{% endif %}</span>
               <span class="table-secondary">{% if u.orders_api_station_id %}ID Posto {{ u.orders_api_station_id }}{% else %}Todos os postos liberados pelo token{% endif %} · Histórico {{ 'ativo' if u.retrieve_prior_enabled else 'inativo' }}</span>
             </td>
             <td>

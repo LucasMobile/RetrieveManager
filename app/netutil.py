@@ -5,7 +5,7 @@ from app.config import store_bind_port
 
 
 def _check_hosts() -> list[str]:
-    raw = os.getenv("STORE_CHECK_HOSTS", "127.0.0.1,worker,localhost")
+    raw = os.getenv("STORE_CHECK_HOSTS", "127.0.0.1,receiver,localhost")
     return [h.strip() for h in raw.split(",") if h.strip()]
 
 

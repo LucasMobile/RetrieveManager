@@ -8,12 +8,15 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.encaps import encapsulate, generate_frames
 from pydicom.uid import (
     ExplicitVRLittleEndian,
+    JPEG2000Lossless,
     JPEGLosslessSV1,
     SecondaryCaptureImageStorage,
     generate_uid,
 )
 from sqlalchemy import select
 
+from app.codec_worker import CodecTimeout
+from app.compaction import file_sha256
 from app.dicom_rules import (
     RuleConditionSpec,
     RuleSpec,
@@ -31,7 +34,7 @@ from app.models import (
     Settings,
     Unit,
 )
-from app.pipeline import _compact_one
+from app.pipeline.compact import _compact_one
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -170,7 +173,7 @@ class DicomRulesTest(DatabaseTestCase):
                 str(Path(directory) / ".work"),
                 "token",
                 set(),
-                {"*": "+e1"},
+                {"*": "lossless"},
                 (
                     rule(
                         RuleConditionSpec(
@@ -186,7 +189,7 @@ class DicomRulesTest(DatabaseTestCase):
             self.assertEqual(result.rule_matches[0].rule_name, "Regra de teste")
             self.assertFalse(source.exists())
 
-    def test_compaction_promotes_complete_output_atomically(self):
+    def test_compaction_writes_output_aside_and_keeps_the_source(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "CT-image"
             output = Path(directory) / "send" / "CT-image.dcm"
@@ -210,34 +213,38 @@ class DicomRulesTest(DatabaseTestCase):
             image.save_as(source, enforce_file_format=True)
 
             work = Path(directory) / ".work"
+            image.Rows = image.Columns = 32
+            image.SamplesPerPixel = 1
+            image.PhotometricInterpretation = "MONOCHROME2"
+            image.BitsAllocated = image.BitsStored = 16
+            image.HighBit = 15
+            image.PixelRepresentation = 0
+            image.PixelData = bytes(range(256)) * 8
+            image.save_as(source, enforce_file_format=True)
 
-            def fake_dcmcjpeg(_flag, prepared_source, destination, *, timeout):
-                self.assertGreater(timeout, 0)
-                self.assertNotEqual(Path(prepared_source), source)
-                self.assertEqual(Path(prepared_source).parent, work)
-                self.assertTrue(Path(prepared_source).is_file())
-                destination_path = Path(destination)
-                self.assertTrue(destination_path.name.startswith("."))
-                destination_path.write_bytes(b"compressed")
-                return 0, ""
-
-            with patch("app.pipeline.dcmcjpeg", side_effect=fake_dcmcjpeg):
-                result = _compact_one(
-                    str(source),
-                    str(output),
-                    str(error),
-                    str(work),
-                    "token",
-                    set(),
-                    {"*": "+e1"},
-                    (),
-                )
+            result = _compact_one(
+                str(source),
+                str(output),
+                str(error),
+                str(work),
+                "token",
+                set(),
+                {"*": "lossless"},
+                (),
+            )
 
             self.assertEqual(result.status, "compressed")
-            self.assertFalse(source.exists())
-            self.assertEqual(output.read_bytes(), b"compressed")
-            self.assertFalse(any(output.parent.glob(".*.tmp")))
-            self.assertFalse(any(work.iterdir()))
+            self.assertEqual(result.codec_method, "lossless")
+            # Publication happens after the transfer row is committed.
+            self.assertTrue(source.exists())
+            self.assertFalse(output.exists())
+            temp_output = Path(result.temp_output)
+            self.assertEqual(temp_output.parent, work)
+            self.assertEqual(list(work.iterdir()), [temp_output])
+            self.assertEqual(result.output_sha256, file_sha256(temp_output))
+            saved = pydicom.dcmread(temp_output)
+            self.assertEqual(saved.file_meta.TransferSyntaxUID, JPEG2000Lossless)
+            self.assertEqual(saved.pixel_array.tobytes(), bytes(range(256)) * 8)
 
     def test_compaction_skips_codec_when_transfer_syntax_already_matches(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -274,24 +281,21 @@ class DicomRulesTest(DatabaseTestCase):
             image["PixelData"].is_undefined_length = True
             image.save_as(source, enforce_file_format=True)
 
-            with patch("app.pipeline.dcmcjpeg") as codec:
-                result = _compact_one(
-                    str(source),
-                    str(output),
-                    str(error),
-                    str(work),
-                    "token",
-                    set(),
-                    {"*": "+e1"},
-                    (),
-                )
+            result = _compact_one(
+                str(source),
+                str(output),
+                str(error),
+                str(work),
+                "token",
+                set(),
+                {"*": "lossy"},
+                (),
+            )
 
-            codec.assert_not_called()
             self.assertTrue(result.codec_skipped)
+            self.assertEqual(result.codec_reason, "already_compressed")
             self.assertEqual(result.status, "compressed")
-            self.assertTrue(output.is_file())
-            self.assertFalse(source.exists())
-            saved = pydicom.dcmread(output)
+            saved = pydicom.dcmread(result.temp_output)
             self.assertEqual(saved.file_meta.TransferSyntaxUID, JPEGLosslessSV1)
             self.assertTrue(
                 next(generate_frames(saved.PixelData)).startswith(b"\xff\xd8")
@@ -322,7 +326,9 @@ class DicomRulesTest(DatabaseTestCase):
             image.Modality = "CT"
             image.save_as(source, enforce_file_format=True)
 
-            with patch("app.pipeline.dcmcjpeg", return_value=(124, "TIMEOUT")):
+            with patch(
+                "app.pipeline.compact._codec_pool.run", side_effect=CodecTimeout
+            ):
                 result = _compact_one(
                     str(source),
                     str(output),
@@ -330,18 +336,18 @@ class DicomRulesTest(DatabaseTestCase):
                     str(work),
                     "unit-token",
                     set(),
-                    {"*": "+e1"},
+                    {"*": "lossless"},
                     (),
                 )
 
             quarantined = pydicom.dcmread(error)
-            self.assertEqual(result.error_type, "DcmcjpegTimeout")
+            self.assertEqual(result.error_type, "CodecTimeout")
             self.assertNotIn("InstitutionalDepartmentName", quarantined)
             self.assertFalse(output.exists())
             self.assertFalse(source.exists())
             self.assertFalse(any(work.iterdir()))
 
-    def test_modified_rule_keeps_codec_in_the_processing_path(self):
+    def test_rule_changes_are_saved_when_pixel_data_is_kept(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "CT-rule"
@@ -366,32 +372,28 @@ class DicomRulesTest(DatabaseTestCase):
             image.Modality = "CT"
             image.save_as(source, enforce_file_format=True)
 
-            def fake_codec(_flag, prepared, destination, *, timeout):
-                self.assertGreater(timeout, 0)
-                Path(destination).write_bytes(Path(prepared).read_bytes())
-                return 0, ""
-
             replace_rule = rule(
                 RuleConditionSpec("0008,0060", "equals", "CT"),
                 action="replace",
                 action_tag="0008,0080",
                 action_value="Mobilemed",
             )
-            with patch("app.pipeline.dcmcjpeg", side_effect=fake_codec) as codec:
-                result = _compact_one(
-                    str(source),
-                    str(output),
-                    str(error),
-                    str(work),
-                    "unit-token",
-                    set(),
-                    {"*": "+e1"},
-                    (replace_rule,),
-                )
+            result = _compact_one(
+                str(source),
+                str(output),
+                str(error),
+                str(work),
+                "unit-token",
+                set(),
+                {"*": "lossless"},
+                (replace_rule,),
+            )
 
-            codec.assert_called_once()
-            self.assertFalse(result.codec_skipped)
             self.assertEqual(result.status, "compressed")
+            self.assertTrue(result.codec_skipped)
+            saved = pydicom.dcmread(result.temp_output)
+            self.assertEqual(saved.InstitutionName, "Mobilemed")
+            self.assertEqual(saved.file_meta.TransferSyntaxUID, JPEGLosslessSV1)
 
     def test_payload_validates_units_conditions_and_action_tag(self):
         payload = validate_rule_payload(
@@ -444,6 +446,17 @@ class DicomRulesTest(DatabaseTestCase):
         self.assertEqual(payload["conditions"][0]["operator"], "exists")
 
         with self.assertRaisesRegex(ValueError, "substituição textual segura"):
+            validate_rule_payload(
+                **common,
+                action="replace",
+                action_tag="0042,0011",  # Encapsulated Document (OB)
+                action_value="novo valor",
+                condition_tags=["0008,0060"],
+                condition_operators=["equals"],
+                condition_values=["CT"],
+            )
+
+        with self.assertRaisesRegex(ValueError, "protegida"):
             validate_rule_payload(
                 **common,
                 action="replace",

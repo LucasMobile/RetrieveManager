@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -24,6 +25,10 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(16), default="admin", nullable=False)
+    # Incremented on password changes; older signed session cookies stop working.
+    session_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
 
 class AuditLog(Base):
@@ -31,9 +36,7 @@ class AuditLog(Base):
     __table_args__ = (
         Index("ix_audit_logs_created_at", "created_at"),
         Index("ix_audit_logs_resource_action", "resource_type", "action"),
-        Index(
-            "ix_audit_logs_resource_action_id", "resource_type", "action", "id"
-        ),
+        Index("ix_audit_logs_resource_action_id", "resource_type", "action", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -67,6 +70,9 @@ class Unit(Base):
     orders_api_url: Mapped[str] = mapped_column(String(500), nullable=False)
     orders_api_token: Mapped[str] = mapped_column(String(2048), nullable=False)
     orders_api_station_id: Mapped[str] = mapped_column(String(64), default="")
+    orders_api_company_id: Mapped[str] = mapped_column(
+        String(64), default="", nullable=False
+    )
 
     # Mantidos apenas para que bancos SQLite de desenvolvimento já criados
     # possam iniciar; não participam mais do cadastro nem do processamento.
@@ -76,9 +82,21 @@ class Unit(Base):
     pacs_aet: Mapped[str] = mapped_column(String(64), nullable=False)
     pacs_ip: Mapped[str] = mapped_column(String(64), nullable=False)
     pacs_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Opt-in: PACS nodes that store the PLERES PatientID with a suffix.
+    pacs_patient_id_wildcard: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
 
     calling_aet: Mapped[str] = mapped_column(String(64), nullable=False)
     store_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Comma-separated calling AE titles accepted by the Store SCP; empty = all.
+    # Addresses or CIDR ranges allowed to associate; empty accepts any.
+    store_allowed_ips: Mapped[str] = mapped_column(
+        String(1200), default="", nullable=False
+    )
+    store_allowed_aets: Mapped[str] = mapped_column(
+        String(600), default="", server_default="", nullable=False
+    )
 
     receive_dir: Mapped[str] = mapped_column(String(500), nullable=False)
     send_dir: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -86,7 +104,6 @@ class Unit(Base):
 
     token: Mapped[str] = mapped_column(String(255), default="")
     cloud_url: Mapped[str] = mapped_column(String(500), default="", nullable=False)
-    file_settle_seconds: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
 
     move_timeout_first: Mapped[int] = mapped_column(Integer, default=600)
     move_timeout_second: Mapped[int] = mapped_column(Integer, default=900)
@@ -156,7 +173,7 @@ class UnitCompressionSettings(Base):
         ForeignKey("units.id", ondelete="CASCADE"), primary_key=True
     )
     default_jpeg_flag: Mapped[str] = mapped_column(
-        String(8), default="+e1", nullable=False
+        String(8), default="lossless", nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now
@@ -242,9 +259,7 @@ class DicomRuleCondition(Base):
 class DicomRuleUnit(Base):
     __tablename__ = "dicom_rule_units"
 
-    rule_id: Mapped[int] = mapped_column(
-        ForeignKey("dicom_rules.id"), primary_key=True
-    )
+    rule_id: Mapped[int] = mapped_column(ForeignKey("dicom_rules.id"), primary_key=True)
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), primary_key=True)
 
     rule: Mapped[DicomRule] = relationship(back_populates="unit_links")
@@ -424,9 +439,7 @@ class HistoricalSeries(Base):
 
     __tablename__ = "historical_series"
     __table_args__ = (
-        UniqueConstraint(
-            "order_id", "series_uid", name="uq_historical_order_series"
-        ),
+        UniqueConstraint("order_id", "series_uid", name="uq_historical_order_series"),
         Index("ix_historical_series_order_status", "order_id", "status"),
     )
 
@@ -487,6 +500,8 @@ class ImageTransfer(Base):
     correlation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     study_uid: Mapped[str] = mapped_column(String(128), default="")
     status: Mapped[str] = mapped_column(String(32), default="received")
+    # SHA-256 of the published artifact, recorded before it enters send_dir.
+    sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     last_http_status: Mapped[int] = mapped_column(Integer, nullable=True)
@@ -500,6 +515,70 @@ class ImageTransfer(Base):
     )
     rule_applications: Mapped[list["DicomRuleApplication"]] = relationship(
         back_populates="transfer", cascade="all, delete-orphan"
+    )
+
+
+class DicomStudy(Base):
+    """Studies seen by the receiver, with a running instance count per unit."""
+
+    __tablename__ = "dicom_studies"
+    __table_args__ = (
+        UniqueConstraint("unit_id", "study_uid", name="uq_dicom_study_unit_uid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
+    study_uid: Mapped[str] = mapped_column(String(64), nullable=False)
+    instance_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    last_received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class DicomInstance(Base):
+    """One received object, recorded before the Store SCP acknowledges it.
+
+    The row is the compaction queue. ``(unit, SOP, SHA-256)`` identifies the
+    exact content: a resend is a duplicate, while the same SOP with different
+    bytes is kept as ``conflict`` for review instead of replacing the first.
+    States: received, compacting, compacted, discarded, rejected, error,
+    missing and conflict.
+    """
+
+    __tablename__ = "dicom_instances"
+    __table_args__ = (
+        UniqueConstraint(
+            "unit_id", "sop_uid", "source_sha256", name="uq_dicom_instance_content"
+        ),
+        Index("ix_dicom_instance_unit_state_id", "unit_id", "state", "id"),
+        Index("ix_dicom_instance_unit_sop", "unit_id", "sop_uid"),
+        Index("ix_dicom_instance_unit_path", "unit_id", "source_path"),
+        Index("ix_dicom_instance_study", "study_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
+    study_id: Mapped[int] = mapped_column(
+        ForeignKey("dicom_studies.id"), nullable=False
+    )
+    series_uid: Mapped[str] = mapped_column(String(64), default="")
+    sop_uid: Mapped[str] = mapped_column(String(64), nullable=False)
+    sop_class_uid: Mapped[str] = mapped_column(String(64), default="")
+    transfer_syntax: Mapped[str] = mapped_column(String(64), default="")
+    modality: Mapped[str] = mapped_column(String(16), default="")
+    source_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    source_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    calling_aet: Mapped[str] = mapped_column(String(16), default="")
+    peer_ip: Mapped[str] = mapped_column(String(64), default="")
+    state: Mapped[str] = mapped_column(String(16), default="received")
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    transfer_id: Mapped[int] = mapped_column(
+        ForeignKey("image_transfers.id"), nullable=True
+    )
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
     )
 
 

@@ -18,7 +18,8 @@ class DatabaseMigrationTest(unittest.TestCase):
                         "CREATE TABLE units ("
                         "id INTEGER PRIMARY KEY, "
                         "name VARCHAR(120) NOT NULL, "
-                        "dest_aet VARCHAR(64) NOT NULL"
+                        "dest_aet VARCHAR(64) NOT NULL, "
+                        "file_settle_seconds INTEGER NOT NULL DEFAULT 3"
                         ")"
                     )
                 )
@@ -35,6 +36,7 @@ class DatabaseMigrationTest(unittest.TestCase):
                 db_module.engine = engine
                 db_module.DATABASE_URL = f"sqlite:///{path.as_posix()}"
                 db_module._migrate_schema()
+                db_module._migrate_schema()
             finally:
                 db_module.engine = original_engine
                 db_module.DATABASE_URL = original_url
@@ -43,15 +45,21 @@ class DatabaseMigrationTest(unittest.TestCase):
                 column["name"] for column in inspect(engine).get_columns("units")
             }
             self.assertNotIn("dest_aet", columns)
+            self.assertNotIn("file_settle_seconds", columns)
             self.assertIn("orders_api_url", columns)
             self.assertIn("orders_api_token", columns)
             self.assertIn("orders_api_station_id", columns)
+            self.assertIn("orders_api_company_id", columns)
             self.assertIn("retrieve_prior_enabled", columns)
             self.assertIn("move_timeout_prior", columns)
             with engine.connect() as connection:
                 self.assertEqual(
                     connection.scalar(text("SELECT name FROM units")),
                     "Unidade antiga",
+                )
+                self.assertEqual(
+                    connection.scalar(text("SELECT orders_api_company_id FROM units")),
+                    "",
                 )
             engine.dispose()
 

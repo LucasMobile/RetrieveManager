@@ -2,31 +2,78 @@ import unittest
 from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
-from sqlalchemy import select
+from pydicom.dataset import Dataset
+from sqlalchemy import func, select
 from sqlalchemy.exc import DataError
 
+from app.dicom_net import FindResult, MoveResult
 from app.models import (
     HistoricalSeries,
     HistoricalStudy,
     ManualMoveRequest,
     Order,
     OrderEvent,
+    Unit,
 )
-from app.pipeline import (
-    _find_one,
+from app.pipeline.find import _find_one, find_pending, prior_date_range
+from app.pipeline.move import (
     _run_move,
     _run_prior_move,
     claim_due_moves,
     fail_claimed_move,
-    find_pending,
-    prior_date_range,
-    recover_stale_locks,
     run_claimed_move,
 )
+from app.pipeline.orders import recover_stale_locks
 from tests.support import DatabaseTestCase, make_unit
 
 
+def response(**values) -> Dataset:
+    ds = Dataset()
+    for keyword, value in values.items():
+        setattr(ds, keyword, "" if value is None else value)
+    return ds
+
+
+def find_result(*responses: dict) -> FindResult:
+    """Successful C-FIND with the given pending responses."""
+    return FindResult(True, tuple(response(**values) for values in responses), 0)
+
+
+def study_find_output(*responses: dict) -> FindResult:
+    """STUDY responses carrying the order's identity unless overridden."""
+    return find_result(
+        *(
+            {
+                "AccessionNumber": "accession",
+                "PatientID": "30211738",
+                "PatientBirthDate": "19691027",
+                **values,
+            }
+            for values in responses
+        )
+    )
+
+
+MOVE_OK = MoveResult(True, 0x0000, completed=1)
+
+
+def move_failed(error: str = "falha de rede") -> MoveResult:
+    return MoveResult(False, error=error)
+
+
 class PriorRetrieveTest(DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        # No test may reach a real PACS: the complementary SERIES query
+        # defaults to "no series"; tests that need series patch it again.
+        for module in ("find", "move"):
+            series = patch(
+                f"app.pipeline.{module}.find_study_series",
+                return_value=FindResult(True),
+            )
+            series.start()
+            self.addCleanup(series.stop)
+
     @staticmethod
     def _unit(max_parallel_moves=1):
         return make_unit(
@@ -91,18 +138,20 @@ class PriorRetrieveTest(DatabaseTestCase):
             db.add(order)
             db.commit()
             found_at = datetime(2026, 9, 11, 10, 30)
-            output = """
-(0020,000d) UI [1.2.3.current] # StudyInstanceUID
-(0008,0061) CS [MR] # ModalitiesInStudy
-(0010,0010) PN [PACIENTE^TESTE] # PatientName
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-"""
+            output = study_find_output(
+                {
+                    "StudyInstanceUID": "1.2.3.current",
+                    "ModalitiesInStudy": "MR",
+                    "PatientName": "PACIENTE^TESTE",
+                    "BodyPartExamined": "ABDOMEN",
+                }
+            )
             first_at = found_at + timedelta(minutes=15)
 
             with (
-                patch("app.pipeline.c_find", return_value=(0, output)),
+                patch("app.pipeline.find.find_study", return_value=output),
                 patch(
-                    "app.pipeline.schedule_from_now",
+                    "app.pipeline.find.schedule_from_now",
                     return_value=("MR", first_at, None),
                 ),
             ):
@@ -134,33 +183,29 @@ class PriorRetrieveTest(DatabaseTestCase):
             db.add(order)
             db.commit()
             found_at = datetime(2026, 9, 14, 14, 0)
-            study_output = """
-(0020,000d) UI [1.2.3.current] # StudyInstanceUID
-(0008,0061) CS [SR] # ModalitiesInStudy
-(0010,0010) PN [PACIENTE^TESTE] # PatientName
-(0018,0015) CS [CHEST] # BodyPartExamined
-"""
-            series_output = """
-Find Response: 1 (Pending)
-(0008,0060) CS [SR] # Modality
-(0018,0015) CS [CHEST] # BodyPartExamined
-Find Response: 2 (Pending)
-(0008,0060) CS [MR] # Modality
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-Find Response: 3 (Pending)
-(0008,0060) CS [PR] # Modality
-Received Final Find Response (Success)
-"""
+            study_output = study_find_output(
+                {
+                    "StudyInstanceUID": "1.2.3.current",
+                    "ModalitiesInStudy": "SR",
+                    "PatientName": "PACIENTE^TESTE",
+                    "BodyPartExamined": "CHEST",
+                }
+            )
+            series_output = find_result(
+                {"Modality": "SR", "BodyPartExamined": "CHEST"},
+                {"Modality": "MR", "BodyPartExamined": "ABDOMEN"},
+                {"Modality": "PR"},
+            )
             first_at = found_at + timedelta(minutes=15)
 
             with (
-                patch("app.pipeline.c_find", return_value=(0, study_output)),
+                patch("app.pipeline.find.find_study", return_value=study_output),
                 patch(
-                    "app.pipeline.c_find_series_body_part",
-                    return_value=(0, series_output),
+                    "app.pipeline.find.find_study_series",
+                    return_value=series_output,
                 ),
                 patch(
-                    "app.pipeline.schedule_from_now",
+                    "app.pipeline.find.schedule_from_now",
                     return_value=("MR", first_at, None),
                 ) as schedule,
             ):
@@ -185,25 +230,21 @@ Received Final Find Response (Success)
             )
             db.add(order)
             db.commit()
-            study_output = """
-(0020,000d) UI [1.2.3.current] # StudyInstanceUID
-(0008,0061) CS [SR] # ModalitiesInStudy
-"""
-            series_output = """
-Find Response: 1 (Pending)
-(0008,0060) CS [SR] # Modality
-Find Response: 2 (Pending)
-(0008,0060) CS [PR] # Modality
-Received Final Find Response (Success)
-"""
+            study_output = study_find_output(
+                {"StudyInstanceUID": "1.2.3.current", "ModalitiesInStudy": "SR"}
+            )
+            series_output = find_result(
+                {"Modality": "SR"},
+                {"Modality": "PR"},
+            )
 
             with (
-                patch("app.pipeline.c_find", return_value=(0, study_output)),
+                patch("app.pipeline.find.find_study", return_value=study_output),
                 patch(
-                    "app.pipeline.c_find_series_body_part",
-                    return_value=(0, series_output),
+                    "app.pipeline.find.find_study_series",
+                    return_value=series_output,
                 ),
-                patch("app.pipeline.schedule_from_now") as schedule,
+                patch("app.pipeline.find.schedule_from_now") as schedule,
             ):
                 _find_one(db, unit, order, datetime.now())
 
@@ -229,27 +270,27 @@ Received Final Find Response (Success)
             )
             db.add(order)
             db.commit()
-            output = """
-(0020,000d) UI [1.2.3.current] # StudyInstanceUID
-(0008,0061) CS [CT] # ModalitiesInStudy
-(0010,0010) PN [PACIENTE^TESTE] # PatientName
-(0018,0015) CS (no value available) # BodyPartExamined
-"""
-            series_output = """
-Find Response: 1 (Pending)
-(0018,0015) CS (no value available) # BodyPartExamined
-Find Response: 2 (Pending)
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-"""
+            output = study_find_output(
+                {
+                    "StudyInstanceUID": "1.2.3.current",
+                    "ModalitiesInStudy": "CT",
+                    "PatientName": "PACIENTE^TESTE",
+                    "BodyPartExamined": None,
+                }
+            )
+            series_output = find_result(
+                {"BodyPartExamined": None},
+                {"BodyPartExamined": "ABDOMEN"},
+            )
 
             with (
-                patch("app.pipeline.c_find", return_value=(0, output)),
+                patch("app.pipeline.find.find_study", return_value=output),
                 patch(
-                    "app.pipeline.c_find_series_body_part",
-                    return_value=(0, series_output),
+                    "app.pipeline.find.find_study_series",
+                    return_value=series_output,
                 ) as series_find,
                 patch(
-                    "app.pipeline.schedule_from_now",
+                    "app.pipeline.find.schedule_from_now",
                     return_value=("CT", datetime.now(), None),
                 ),
             ):
@@ -274,17 +315,19 @@ Find Response: 2 (Pending)
             )
             db.add(order)
             db.commit()
-            output = (
-                "(0020,000d) UI [1.2.3.current] # StudyInstanceUID\n"
-                "(0008,0061) CS [MR] # ModalitiesInStudy\n"
-                f"(0010,0010) PN [{'P' * 300}] # PatientName\n"
-                f"(0018,0015) CS [{'B' * 100}] # BodyPartExamined\n"
+            output = study_find_output(
+                {
+                    "StudyInstanceUID": "1.2.3.current",
+                    "ModalitiesInStudy": "MR",
+                    "PatientName": "P" * 300,
+                    "BodyPartExamined": "B" * 100,
+                }
             )
 
             with (
-                patch("app.pipeline.c_find", return_value=(0, output)),
+                patch("app.pipeline.find.find_study", return_value=output),
                 patch(
-                    "app.pipeline.schedule_from_now",
+                    "app.pipeline.find.schedule_from_now",
                     return_value=("MR", datetime.now(), None),
                 ),
             ):
@@ -293,6 +336,212 @@ Find Response: 2 (Pending)
             self.assertEqual(order.modality, "MR")
             self.assertEqual(len(order.patient_name), 255)
             self.assertEqual(len(order.body_part), 64)
+
+    def _watching_order(self, db, **unit_values):
+        unit = self._unit()
+        # Several subtests share one database; unit names and ports are unique.
+        sequence = db.scalar(select(func.count()).select_from(Unit)) + 1
+        unit.name = f"unit-{sequence}"
+        unit.store_port = 10000 + sequence
+        for key, value in unit_values.items():
+            setattr(unit, key, value)
+        db.add(unit)
+        db.flush()
+        order = self._order(
+            unit.id,
+            status="watching",
+            study_uid="",
+            modality="",
+            body_part="",
+            prior_status="disabled",
+            prior_due_at=None,
+        )
+        db.add(order)
+        db.commit()
+        return unit, order
+
+    def _run_find(self, db, unit, order, output):
+        with (
+            patch("app.pipeline.find.find_study", return_value=output),
+            patch(
+                "app.pipeline.find.find_study_series", return_value=FindResult(True)
+            ) as series,
+            patch(
+                "app.pipeline.find.schedule_from_now",
+                return_value=("MR", datetime.now(), None),
+            ) as schedule,
+        ):
+            _find_one(db, unit, order, datetime.now())
+        return series, schedule
+
+    def test_find_blocks_order_when_accession_returns_two_studies(self):
+        with self.Session() as db:
+            unit, order = self._watching_order(db)
+            output = study_find_output(
+                {"StudyInstanceUID": "1.2.study.a", "ModalitiesInStudy": "MR"},
+                {"StudyInstanceUID": "1.2.study.b", "ModalitiesInStudy": "MR"},
+            )
+            series, schedule = self._run_find(db, unit, order, output)
+
+            series.assert_not_called()
+            schedule.assert_not_called()
+            self.assertEqual(order.status, "error")
+            self.assertEqual(order.study_uid, "")
+            self.assertIn("2 estudos diferentes", order.last_error)
+            self.assertEqual(order.events[-1].level, "error")
+
+    def test_find_accepts_repeated_responses_for_the_same_study(self):
+        with self.Session() as db:
+            unit, order = self._watching_order(db)
+            response = {"StudyInstanceUID": "1.2.3.current", "ModalitiesInStudy": "MR"}
+            self._run_find(db, unit, order, study_find_output(response, response))
+            self.assertEqual(order.status, "wait_retrieve")
+            self.assertEqual(order.study_uid, "1.2.3.current")
+
+    def test_find_blocks_study_whose_returned_identity_differs_from_order(self):
+        cases = {
+            "PatientID": {"PatientID": "99999999"},
+            "PatientBirthDate": {"PatientBirthDate": "19700101"},
+            "AccessionNumber": {"AccessionNumber": "other-accession"},
+        }
+        for field, override in cases.items():
+            with self.subTest(field=field), self.Session() as db:
+                unit, order = self._watching_order(db)
+                output = study_find_output(
+                    {
+                        "StudyInstanceUID": "1.2.3.current",
+                        "ModalitiesInStudy": "MR",
+                        **override,
+                    }
+                )
+                _series, schedule = self._run_find(db, unit, order, output)
+
+                schedule.assert_not_called()
+                self.assertEqual(order.status, "error")
+                self.assertIn(field, order.last_error)
+                self.assertNotIn("99999999", order.last_error)
+
+    def test_find_rejects_missing_patient_id_in_pacs_response(self):
+        with self.Session() as db:
+            unit, order = self._watching_order(db)
+            output = study_find_output(
+                {
+                    "StudyInstanceUID": "1.2.3.current",
+                    "ModalitiesInStudy": "MR",
+                    "PatientID": None,
+                }
+            )
+            self._run_find(db, unit, order, output)
+            self.assertEqual(order.status, "error")
+            self.assertIn("PatientID", order.last_error)
+
+    def test_find_patient_id_suffix_requires_unit_opt_in(self):
+        suffixed = {
+            "StudyInstanceUID": "1.2.3.current",
+            "ModalitiesInStudy": "MR",
+            "PatientID": "30211738-1",
+        }
+        with self.Session() as db:
+            unit, order = self._watching_order(db)
+            self._run_find(db, unit, order, study_find_output(suffixed))
+            self.assertEqual(order.status, "error")
+        with self.Session() as db:
+            unit, order = self._watching_order(db, pacs_patient_id_wildcard=True)
+            self._run_find(db, unit, order, study_find_output(suffixed))
+            self.assertEqual(order.status, "wait_retrieve")
+            self.assertEqual(order.study_uid, "1.2.3.current")
+
+    def test_prior_find_is_exact_and_ignores_series_from_other_patients(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(unit.id, prior_status="retrieving")
+            db.add(order)
+            db.commit()
+            output = find_result(
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "StudyInstanceUID": "1.2.own",
+                    "SeriesInstanceUID": "1.2.own.series",
+                },
+                {
+                    "PatientID": "302117389",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "StudyInstanceUID": "1.2.prefix",
+                    "SeriesInstanceUID": "1.2.prefix.series",
+                },
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19700101",
+                    "StudyDate": "20250110",
+                    "StudyInstanceUID": "1.2.birth",
+                    "SeriesInstanceUID": "1.2.birth.series",
+                },
+                {
+                    "StudyDate": "20250110",
+                    "StudyInstanceUID": "1.2.anonymous",
+                    "SeriesInstanceUID": "1.2.anonymous.series",
+                },
+            )
+            with (
+                patch(
+                    "app.pipeline.move.find_prior_series", return_value=output
+                ) as find,
+                patch("app.pipeline.move.move_series", return_value=MOVE_OK) as move,
+            ):
+                _run_prior_move(db, unit, order)
+
+            self.assertFalse(find.call_args.kwargs["patient_id_wildcard"])
+            move.assert_called_once()
+            self.assertEqual(move.call_args.args[2], "1.2.own.series")
+            self.assertEqual(
+                list(db.scalars(select(HistoricalStudy.study_uid))), ["1.2.own"]
+            )
+            self.assertEqual(order.prior_status, "done")
+            self.assertIn(
+                "3 série(s) com identificação divergente", order.events[-1].message
+            )
+
+    def test_prior_wildcard_option_is_forwarded_and_accepts_suffixed_id(self):
+        with self.Session() as db:
+            unit = self._unit()
+            unit.pacs_patient_id_wildcard = True
+            db.add(unit)
+            db.flush()
+            order = self._order(unit.id, prior_status="retrieving")
+            db.add(order)
+            db.commit()
+            output = find_result(
+                {
+                    "PatientID": "30211738-1",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "StudyInstanceUID": "1.2.suffixed",
+                    "SeriesInstanceUID": "1.2.suffixed.series",
+                },
+                {
+                    "PatientID": "3021173",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "StudyInstanceUID": "1.2.shorter",
+                    "SeriesInstanceUID": "1.2.shorter.series",
+                },
+            )
+            with (
+                patch(
+                    "app.pipeline.move.find_prior_series", return_value=output
+                ) as find,
+                patch("app.pipeline.move.move_series", return_value=MOVE_OK) as move,
+            ):
+                _run_prior_move(db, unit, order)
+
+            self.assertTrue(find.call_args.kwargs["patient_id_wildcard"])
+            move.assert_called_once()
+            self.assertEqual(move.call_args.args[2], "1.2.suffixed.series")
 
     def test_database_error_in_one_find_does_not_block_the_next_order(self):
         with self.Session() as db:
@@ -322,7 +571,9 @@ Find Response: 2 (Pending)
                 False,
             )
 
-            with patch("app.pipeline._find_one", side_effect=[failure, None]) as find:
+            with patch(
+                "app.pipeline.find._find_one", side_effect=[failure, None]
+            ) as find:
                 find_pending(db, unit)
 
             self.assertEqual(find.call_count, 2)
@@ -342,8 +593,11 @@ Find Response: 2 (Pending)
             db.commit()
 
             with (
-                patch("app.pipeline.FIND_TIMEOUT_SECONDS", 7),
-                patch("app.pipeline.c_find", return_value=(124, "TIMEOUT")) as find,
+                patch("app.pipeline.find.FIND_TIMEOUT_SECONDS", 7),
+                patch(
+                    "app.pipeline.find.find_study",
+                    return_value=FindResult(False, error="tempo esgotado"),
+                ) as find,
             ):
                 find_pending(db, unit)
 
@@ -351,7 +605,7 @@ Find Response: 2 (Pending)
 
             self.assertEqual(order.status, "watching")
             self.assertEqual(order.attempts, 0)
-            self.assertIn("exit 124", order.last_error)
+            self.assertIn("tempo esgotado", order.last_error)
             event = db.scalar(
                 select(OrderEvent)
                 .where(OrderEvent.order_id == order.id)
@@ -373,7 +627,7 @@ Find Response: 2 (Pending)
             db.add(order)
             db.commit()
 
-            with patch("app.pipeline.c_move", return_value=(2, "network failure")):
+            with patch("app.pipeline.move.move_study", return_value=move_failed()):
                 _run_move(db, unit, order, second=False)
 
             self.assertEqual(order.status, "wait_retrieve")
@@ -426,7 +680,10 @@ Find Response: 2 (Pending)
             db.add(order)
             db.commit()
 
-            with patch("app.pipeline.c_find_prior", return_value=(2, "failed")):
+            with patch(
+                "app.pipeline.move.find_prior_series",
+                return_value=FindResult(False, error="falha"),
+            ):
                 _run_prior_move(db, unit, order)
 
             self.assertEqual(order.status, "wait_retrieve")
@@ -450,8 +707,10 @@ Find Response: 2 (Pending)
             db.commit()
 
             with (
-                patch("app.pipeline.c_find_prior", return_value=(0, "success")),
-                patch("app.pipeline.c_move_prior_series") as move,
+                patch(
+                    "app.pipeline.move.find_prior_series", return_value=FindResult(True)
+                ),
+                patch("app.pipeline.move.move_series") as move,
             ):
                 _run_prior_move(db, unit, order)
 
@@ -473,27 +732,30 @@ Find Response: 2 (Pending)
             order = self._order(unit.id, prior_status="retrieving")
             db.add(order)
             db.commit()
-            output = """
-Find Response: 1 (Pending)
-(0008,0020) DA [20250110] # StudyDate
-(0008,0050) SH [OLD-1] # AccessionNumber
-(0008,0060) CS [MR] # Modality
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-(0020,000d) UI [1.2.old] # StudyInstanceUID
-(0020,000e) UI [1.2.old.series.1] # SeriesInstanceUID
-Find Response: 2 (Pending)
-(0008,0020) DA [20250110] # StudyDate
-(0008,0060) CS [MR] # Modality
-(0020,000d) UI [1.2.old] # StudyInstanceUID
-(0020,000e) UI [1.2.old.series.2] # SeriesInstanceUID
-Received Final Find Response (Success)
-"""
+            output = find_result(
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "AccessionNumber": "OLD-1",
+                    "Modality": "MR",
+                    "BodyPartExamined": "ABDOMEN",
+                    "StudyInstanceUID": "1.2.old",
+                    "SeriesInstanceUID": "1.2.old.series.1",
+                },
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "Modality": "MR",
+                    "StudyInstanceUID": "1.2.old",
+                    "SeriesInstanceUID": "1.2.old.series.2",
+                },
+            )
 
             with (
-                patch("app.pipeline.c_find_prior", return_value=(0, output)),
-                patch(
-                    "app.pipeline.c_move_prior_series", return_value=(0, "success")
-                ) as move,
+                patch("app.pipeline.move.find_prior_series", return_value=output),
+                patch("app.pipeline.move.move_series", return_value=MOVE_OK) as move,
             ):
                 _run_prior_move(db, unit, order)
 
@@ -505,9 +767,7 @@ Received Final Find Response (Success)
             self.assertEqual(order.prior_status, "done")
             completed_series = list(
                 db.scalars(
-                    select(HistoricalSeries).where(
-                        HistoricalSeries.status == "done"
-                    )
+                    select(HistoricalSeries).where(HistoricalSeries.status == "done")
                 )
             )
             self.assertEqual(len(completed_series), 2)
@@ -520,24 +780,29 @@ Received Final Find Response (Success)
             order = self._order(unit.id, prior_status="retrieving")
             db.add(order)
             db.commit()
-            output = """
-Find Response: 1 (Pending)
-(0008,0020) DA [20250110] # StudyDate
-(0008,0060) CS [MR] # Modality
-(0020,000d) UI [1.2.old] # StudyInstanceUID
-(0020,000e) UI [1.2.old.series.1] # SeriesInstanceUID
-Find Response: 2 (Pending)
-(0008,0020) DA [20250110] # StudyDate
-(0008,0060) CS [MR] # Modality
-(0020,000d) UI [1.2.old] # StudyInstanceUID
-(0020,000e) UI [1.2.old.series.2] # SeriesInstanceUID
-Received Final Find Response (Success)
-"""
+            output = find_result(
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "Modality": "MR",
+                    "StudyInstanceUID": "1.2.old",
+                    "SeriesInstanceUID": "1.2.old.series.1",
+                },
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20250110",
+                    "Modality": "MR",
+                    "StudyInstanceUID": "1.2.old",
+                    "SeriesInstanceUID": "1.2.old.series.2",
+                },
+            )
             with (
-                patch("app.pipeline.c_find_prior", return_value=(0, output)),
+                patch("app.pipeline.move.find_prior_series", return_value=output),
                 patch(
-                    "app.pipeline.c_move_prior_series",
-                    side_effect=[(0, "ok"), (2, "fail")],
+                    "app.pipeline.move.move_series",
+                    side_effect=[MOVE_OK, move_failed()],
                 ),
             ):
                 _run_prior_move(db, unit, order)
@@ -546,15 +811,13 @@ Received Final Find Response (Success)
             order.prior_status = "retrieving"
             db.commit()
             with (
-                patch("app.pipeline.c_find_prior", return_value=(0, output)),
-                patch(
-                    "app.pipeline.c_move_prior_series", return_value=(0, "ok")
-                ) as move,
+                patch("app.pipeline.move.find_prior_series", return_value=output),
+                patch("app.pipeline.move.move_series", return_value=MOVE_OK) as move,
             ):
                 _run_prior_move(db, unit, order)
 
             move.assert_called_once()
-            self.assertEqual(move.call_args.args[5], "1.2.old.series.2")
+            self.assertEqual(move.call_args.args[2], "1.2.old.series.2")
             self.assertEqual(order.prior_status, "done")
 
     def test_prior_find_discards_current_study_outside_history_range(self):
@@ -565,18 +828,20 @@ Received Final Find Response (Success)
             order = self._order(unit.id, prior_status="retrieving")
             db.add(order)
             db.commit()
-            output = """
-Find Response: 1 (Pending)
-(0008,0020) DA [20260913] # StudyDate
-(0008,0060) CS [MR] # Modality
-(0020,000d) UI [1.2.3.current] # StudyInstanceUID
-(0020,000e) UI [1.2.current.series] # SeriesInstanceUID
-Received Final Find Response (Success)
-"""
+            output = find_result(
+                {
+                    "PatientID": "30211738",
+                    "PatientBirthDate": "19691027",
+                    "StudyDate": "20260913",
+                    "Modality": "MR",
+                    "StudyInstanceUID": "1.2.3.current",
+                    "SeriesInstanceUID": "1.2.current.series",
+                },
+            )
 
             with (
-                patch("app.pipeline.c_find_prior", return_value=(0, output)),
-                patch("app.pipeline.c_move_prior_series") as move,
+                patch("app.pipeline.move.find_prior_series", return_value=output),
+                patch("app.pipeline.move.move_series") as move,
             ):
                 _run_prior_move(db, unit, order)
 
@@ -609,11 +874,9 @@ Received Final Find Response (Success)
             db.add(move_request)
             db.commit()
 
-            self.assertEqual(
-                claim_due_moves(db, unit), [(move_request.id, "manual")]
-            )
+            self.assertEqual(claim_due_moves(db, unit), [(move_request.id, "manual")])
             self.assertEqual(order.prior_status, "queued")
-            with patch("app.pipeline.c_move", return_value=(0, "success")) as move:
+            with patch("app.pipeline.move.move_study", return_value=MOVE_OK) as move:
                 run_claimed_move(db, move_request.id, "manual")
 
             move.assert_called_once()

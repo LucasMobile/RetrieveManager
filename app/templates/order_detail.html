@@ -93,6 +93,9 @@
       <section class="surface order-images" aria-labelledby="images-title">
         <div><h2 id="images-title">Imagens associadas</h2><p>Arquivos processados neste pedido.</p></div>
         {% if image_summary.total %}<div class="order-images__summary">{{ image_status_badges(image_summary) }}</div>{% else %}<span class="muted small">Nenhuma imagem correlacionada.</span>{% endif %}
+        {% if user.role == 'admin' and not order.archived_at and send_failures %}
+        {{ post_action(request, '/orders/' ~ order.id ~ '/resend-failed', 'btn btn--secondary', 'Reenviar imagens com falha de envio', icon_name='retry', text='Reenviar ' ~ send_failures ~ ' imagem(ns) com falha de envio', confirm='Reenviar as imagens deste pedido que esgotaram as tentativas de envio?', confirm_label='Reenviar') }}
+        {% endif %}
       </section>
     </div>
 

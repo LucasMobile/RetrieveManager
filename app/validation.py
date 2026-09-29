@@ -18,7 +18,7 @@ _HOSTNAME = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 _MODALITY = re.compile(r"^(?:\*|[A-Z0-9]{1,8})$")
-_JPEG_FLAGS = frozenset({"+e1", "+eb", "+ee"})
+_JPEG_FLAGS = frozenset({"lossless", "lossy"})
 
 
 def bounded_int(
@@ -45,6 +45,79 @@ def validate_aet(value: str, field: str) -> str:
     return aet
 
 
+def validate_store_allowed_aets(value: str) -> str:
+    """Normalize the Store SCP sender allowlist; an empty list accepts anyone."""
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for item in re.split(r"[,;\n]", value or ""):
+        if not item.strip():
+            continue
+        aet = validate_aet(item, "AE Titles autorizados a enviar")
+        if aet.upper() not in seen:
+            seen.add(aet.upper())
+            accepted.append(aet)
+    if len(accepted) > 32:
+        raise ValueError("AE Titles autorizados a enviar: informe no máximo 32")
+    return ",".join(accepted)
+
+
+StoreNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def validate_store_allowed_ips(value: str) -> str:
+    """Normalize the Store SCP IP allowlist; an empty list accepts any address.
+
+    Items are single addresses or CIDR ranges (192.168.3.0/24).
+    """
+    accepted: list[str] = []
+    for item in re.split(r"[,;\s]+", value or ""):
+        if not item:
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise ValueError(
+                f"IPs autorizados a enviar: {item[:45]} não é um IP nem uma faixa "
+                "válida (ex.: 192.168.3.103 ou 192.168.3.0/24)"
+            ) from exc
+        text = (
+            str(network.network_address) if network.num_addresses == 1 else str(network)
+        )
+        if text not in accepted:
+            accepted.append(text)
+    if len(accepted) > 64:
+        raise ValueError("IPs autorizados a enviar: informe no máximo 64")
+    return ",".join(accepted)
+
+
+def store_allowed_networks(value: str | None) -> tuple[StoreNetwork, ...]:
+    return tuple(
+        ipaddress.ip_network(item.strip(), strict=False)
+        for item in (value or "").split(",")
+        if item.strip()
+    )
+
+
+def peer_ip_allowed(peer_ip: str, networks: tuple[StoreNetwork, ...]) -> bool:
+    """An empty allowlist accepts everyone; unparsable peers are refused."""
+    if not networks:
+        return True
+    try:
+        address = ipaddress.ip_address(peer_ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return any(address in network for network in networks)
+
+
+def store_allowed_senders(value: str | None) -> frozenset[str]:
+    """Return the stored allowlist in its case-insensitive comparison form."""
+    return frozenset(
+        item.strip().upper() for item in (value or "").split(",") if item.strip()
+    )
+
+
 def validate_host(value: str) -> str:
     host = value.strip()
     try:
@@ -68,6 +141,17 @@ def validate_data_path(value: str, field: str) -> str:
     return str(path)
 
 
+def validate_orders_api_company_id(value: str | None) -> str:
+    company_id = (value or "").strip()
+    if not company_id:
+        raise ValueError("Empresa ID é obrigatório.")
+    if not re.fullmatch(r"[0-9]{1,64}", company_id) or int(company_id) <= 0:
+        raise ValueError(
+            "Empresa ID deve ser um número inteiro positivo de até 64 dígitos."
+        )
+    return str(int(company_id))
+
+
 def validate_unit_form(
     form: dict[str, str], *, creating: bool = False
 ) -> dict[str, str | int | bool]:
@@ -78,6 +162,8 @@ def validate_unit_form(
         raise ValueError("Estado da unidade inválido")
     if form.get("retrieve_prior_enabled", "0") not in {"0", "1"}:
         raise ValueError("Configuração de exames anteriores inválida")
+    if form.get("pacs_patient_id_wildcard", "0") not in {"0", "1"}:
+        raise ValueError("Configuração do curinga no Patient ID inválida")
     orders_api_token = form.get("orders_api_token", "").strip()
     station_id = form.get("orders_api_station_id", "").strip()
     token = form.get("token", "").strip()
@@ -102,9 +188,19 @@ def validate_unit_form(
             maximum=65535,
             default=444,
         ),
+        "pacs_patient_id_wildcard": form.get("pacs_patient_id_wildcard", "0") == "1",
+        "store_allowed_ips": validate_store_allowed_ips(
+            form.get("store_allowed_ips", "")
+        ),
+        "store_allowed_aets": validate_store_allowed_aets(
+            form.get("store_allowed_aets", "")
+        ),
         "orders_api_url": validate_orders_api_url(form.get("orders_api_url", "")),
         "orders_api_token": orders_api_token,
         "orders_api_station_id": station_id,
+        "orders_api_company_id": validate_orders_api_company_id(
+            form.get("orders_api_company_id", "")
+        ),
         "retrieve_prior_enabled": form.get("retrieve_prior_enabled", "0") == "1",
         "move_timeout_prior": bounded_int(
             form.get("move_timeout_prior"),
@@ -120,13 +216,6 @@ def validate_unit_form(
         "error_dir": validate_data_path(form.get("error_dir", ""), "Pasta de erro"),
         "token": token,
         "cloud_url": validate_cloud_url(form.get("cloud_url", DEFAULT_CLOUD_URL)),
-        "file_settle_seconds": bounded_int(
-            form.get("file_settle_seconds"),
-            "Espera antes de compactar e enviar",
-            minimum=0,
-            maximum=3600,
-            default=3,
-        ),
         "move_timeout_first": bounded_int(
             form.get("move_timeout_first"),
             "Timeout do 1º C-MOVE",
@@ -243,5 +332,5 @@ def validate_modality(value: str) -> str:
 def validate_jpeg_flag(value: str) -> str:
     flag = value.strip()
     if flag not in _JPEG_FLAGS:
-        raise ValueError("Perfil JPEG inválido")
+        raise ValueError("Perfil de compactação inválido")
     return flag
