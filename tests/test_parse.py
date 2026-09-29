@@ -1,110 +1,110 @@
 import unittest
 
+from pydicom.dataset import Dataset
+
 from app.parse import (
+    dataset_text,
+    first_series_body_part,
     normalize_modality,
-    parse_findscu_output,
-    parse_prior_findscu_output,
-    parse_series_body_part,
-    parse_series_metadata,
-    series_response_has_modality,
+    patient_id_matches,
+    prior_series_results,
+    series_have_modality,
+    series_metadata,
+    study_response,
 )
 
 
-class ParseDicomOutputTest(unittest.TestCase):
+def response(**values) -> Dataset:
+    ds = Dataset()
+    for keyword, value in values.items():
+        setattr(ds, keyword, value)
+    return ds
+
+
+class ParseResponsesTest(unittest.TestCase):
     def test_normalize_last_known_wins(self):
         self.assertEqual(normalize_modality("CT\\MR"), "CT")
         self.assertEqual(normalize_modality("US"), "US")
         self.assertEqual(normalize_modality(""), "")
 
-    def test_findscu_brackets(self):
-        out = """
-(0008,0061) CS [CT]                                      # ModalitiesInStudy
-(0018,0015) CS [ABDOMEN]                                 # BodyPartExamined
-(0010,0010) PN [SILVA^JOAO]                              # PatientName
-(0020,000d) UI [1.2.840.113619.2.55.3]                   # StudyInstanceUID
-"""
-        uid, mods, name, body_part = parse_findscu_output(out)
-        self.assertEqual(uid, "1.2.840.113619.2.55.3")
-        self.assertEqual(mods, "CT")
-        self.assertEqual(name, "SILVA^JOAO")
-        self.assertEqual(body_part, "ABDOMEN")
+    def test_study_response_reads_identity_and_multi_valued_modalities(self):
+        parsed = study_response(
+            response(
+                StudyInstanceUID="1.2.840.113619.2.55.3",
+                AccessionNumber="ACC-1",
+                PatientID="12345",
+                PatientBirthDate="19800101",
+                PatientName="SILVA^JOAO",
+                ModalitiesInStudy=["CT", "SR"],
+                BodyPartExamined="ABDOMEN",
+                NumberOfStudyRelatedInstances="120",
+            )
+        )
+        self.assertEqual(parsed.study_uid, "1.2.840.113619.2.55.3")
+        self.assertEqual(parsed.accession, "ACC-1")
+        self.assertEqual(parsed.patient_id, "12345")
+        self.assertEqual(parsed.birth_date, "19800101")
+        self.assertEqual(parsed.patient_name, "SILVA^JOAO")
+        self.assertEqual(parsed.modalities, "CT\\SR")
+        self.assertEqual(parsed.body_part, "ABDOMEN")
+        self.assertEqual(parsed.instance_count, "120")
 
-    def test_findscu_removes_postgres_incompatible_nul_padding(self):
-        out = """
-(0020,000d) UI [1.2.3\x00] # StudyInstanceUID
-(0010,0010) PN [PACIENTE\x00^TESTE] # PatientName
-(0018,0015) CS [ABDOMEN\x00] # BodyPartExamined
-"""
-        uid, _mods, name, body_part = parse_findscu_output(out)
-        self.assertEqual(uid, "1.2.3")
-        self.assertEqual(name, "PACIENTE^TESTE")
-        self.assertEqual(body_part, "ABDOMEN")
+    def test_missing_elements_are_empty_and_nul_padding_is_removed(self):
+        parsed = study_response(
+            response(StudyInstanceUID="1.2.3\x00", BodyPartExamined="ABDOMEN\x00")
+        )
+        self.assertEqual(parsed.study_uid, "1.2.3")
+        self.assertEqual(parsed.body_part, "ABDOMEN")
+        self.assertEqual(parsed.patient_id, "")
+        self.assertEqual(dataset_text(Dataset(), "PatientName"), "")
 
-    def test_prior_find_ignores_request_and_parses_each_pending_response(self):
-        out = """
-# Dicom-Data-Set
-(0008,0020) DA [20230913-20260912] # StudyDate
-(0020,000d) UI [] # StudyInstanceUID
----------------------------
-Find Response: 1 (Pending)
-# Dicom-Data-Set
-(0008,0020) DA [20240110] # StudyDate
-(0008,0050) SH [ACC-1] # AccessionNumber
-(0008,0060) CS [CT] # Modality
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-(0020,000d) UI [1.2.study] # StudyInstanceUID
-(0020,000e) UI [1.2.series.1] # SeriesInstanceUID
----------------------------
-Find Response: 2 (Pending)
-# Dicom-Data-Set
-(0008,0020) DA [20240110] # StudyDate
-(0008,0060) CS [CT] # Modality
-(0020,000d) UI [1.2.study] # StudyInstanceUID
-(0020,000e) UI [1.2.series.2] # SeriesInstanceUID
-Received Final Find Response (Success)
-"""
-        results = parse_prior_findscu_output(out)
-        self.assertEqual(len(results), 2)
+    def test_prior_series_are_unique_and_require_both_uids(self):
+        results = prior_series_results(
+            [
+                response(
+                    StudyInstanceUID="1.2.study",
+                    SeriesInstanceUID="1.2.series.1",
+                    AccessionNumber="ACC-1",
+                    StudyDate="20240110",
+                    Modality="CT",
+                    PatientID="30211738",
+                    PatientBirthDate="19691027",
+                ),
+                response(
+                    StudyInstanceUID="1.2.study", SeriesInstanceUID="1.2.series.1"
+                ),
+                response(
+                    StudyInstanceUID="1.2.study", SeriesInstanceUID="1.2.series.2"
+                ),
+                response(StudyInstanceUID="1.2.study"),
+            ]
+        )
+        self.assertEqual(
+            [result.series_uid for result in results], ["1.2.series.1", "1.2.series.2"]
+        )
         self.assertEqual(results[0].study_uid, "1.2.study")
-        self.assertEqual(results[0].series_uid, "1.2.series.1")
-        self.assertEqual(results[0].accession, "ACC-1")
-        self.assertEqual(results[1].series_uid, "1.2.series.2")
-
-    def test_series_body_part_skips_series_without_value(self):
-        output = """
-Find Response: 1 (Pending)
-(0018,0015) CS (no value available) # BodyPartExamined
-Find Response: 2 (Pending)
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-"""
-        self.assertEqual(parse_series_body_part(output), "ABDOMEN")
 
     def test_series_metadata_skips_non_clinical_first_series(self):
-        output = """
-(0008,0060) CS (no value available) # Modality from request dataset
-Find Response: 1 (Pending)
-(0008,0060) CS [SR] # Modality
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-Find Response: 2 (Pending)
-(0008,0060) CS [MR] # Modality
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-Find Response: 3 (Pending)
-(0008,0060) CS [PR] # Modality
-Received Final Find Response (Success)
-"""
-        self.assertEqual(
-            parse_series_metadata(output, frozenset({"CT", "MR"})),
-            ("MR", "ABDOMEN"),
-        )
-        self.assertTrue(series_response_has_modality(output))
+        responses = [
+            response(Modality="SR", BodyPartExamined="CHEST"),
+            response(Modality="MR", BodyPartExamined="ABDOMEN"),
+            response(Modality="PR"),
+        ]
+        self.assertEqual(series_metadata(responses, {"CT", "MR"}), ("MR", "ABDOMEN"))
+        self.assertTrue(series_have_modality(responses))
 
-    def test_empty_request_modality_is_not_a_series_modality(self):
-        output = """
-(0008,0060) CS (no value available) # Modality from request dataset
-Find Response: 1 (Pending)
-(0018,0015) CS [ABDOMEN] # BodyPartExamined
-"""
-        self.assertFalse(series_response_has_modality(output))
+    def test_series_body_part_skips_series_without_value(self):
+        responses = [response(BodyPartExamined=""), response(BodyPartExamined="HEAD")]
+        self.assertEqual(first_series_body_part(responses), "HEAD")
+        self.assertFalse(series_have_modality(responses))
+
+    def test_patient_id_is_exact_unless_suffix_is_allowed(self):
+        self.assertTrue(patient_id_matches(" 123 ", "123", allow_suffix=False))
+        self.assertFalse(patient_id_matches("1234", "123", allow_suffix=False))
+        self.assertTrue(patient_id_matches("123-1", "123", allow_suffix=True))
+        self.assertFalse(patient_id_matches("12", "123", allow_suffix=True))
+        self.assertFalse(patient_id_matches("", "123", allow_suffix=True))
+        self.assertFalse(patient_id_matches("123", "", allow_suffix=True))
 
 
 if __name__ == "__main__":

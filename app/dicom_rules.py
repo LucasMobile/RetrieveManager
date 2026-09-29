@@ -39,6 +39,27 @@ ACTIONS = {
 VALUELESS_OPERATORS = frozenset({"exists", "not_exists"})
 LEGACY_RULE_KEY = "legacy_study_id_prefix"
 NON_TEXT_VRS = frozenset({"OB", "OD", "OF", "OL", "OV", "OW", "SQ", "UN"})
+# Rules may read these tags but never replace/remove them: they identify the
+# patient, study or instance (and drive order association), define the pixel
+# data, or are managed by the system (character set and cloud token).
+PROTECTED_ACTION_TAGS = frozenset(
+    {
+        "0008,0005",  # SpecificCharacterSet
+        "0008,0016",  # SOPClassUID
+        "0008,0018",  # SOPInstanceUID
+        "0008,0050",  # AccessionNumber
+        "0008,1040",  # InstitutionalDepartmentName (token da unidade)
+        "0010,0010",  # PatientName
+        "0010,0020",  # PatientID
+        "0010,0021",  # IssuerOfPatientID
+        "0010,0030",  # PatientBirthDate
+        "0020,000D",  # StudyInstanceUID
+        "0020,000E",  # SeriesInstanceUID
+        "0020,0052",  # FrameOfReferenceUID
+    }
+)
+# File meta, Image Pixel/presentation (0028) and Pixel Data groups.
+PROTECTED_ACTION_GROUPS = frozenset({0x0002, 0x0028, 0x7FE0})
 
 
 @dataclass(frozen=True)
@@ -97,6 +118,15 @@ def normalize_dicom_tag(raw: str) -> str:
             "A tag informada não existe no dicionário DICOM padrão."
         ) from exc
     return value
+
+
+def is_protected_tag(raw: str) -> bool:
+    """Whether a rule action on this tag could corrupt identity or pixels."""
+    try:
+        tag = normalize_dicom_tag(raw)
+    except ValueError:
+        return False
+    return tag in PROTECTED_ACTION_TAGS or int(tag[:4], 16) in PROTECTED_ACTION_GROUPS
 
 
 def dicom_tag_name(raw: str) -> str:
@@ -192,6 +222,13 @@ def validate_rule_payload(
     clean_action_value = ""
     if action in {"replace", "remove"}:
         clean_action_tag = normalize_dicom_tag(action_tag)
+        if is_protected_tag(clean_action_tag):
+            raise ValueError(
+                f"A tag {clean_action_tag} ({dicom_tag_name(clean_action_tag)}) é "
+                "protegida: identifica o paciente, o exame ou a imagem, ou é "
+                "gerenciada pelo sistema, e não pode ser alterada por regra. Ela "
+                "ainda pode ser usada nas condições."
+            )
     if action == "replace":
         action_vr = _dicom_tag_vr(clean_action_tag)
         if _has_non_text_vr(action_vr) or " or " in action_vr:
@@ -249,8 +286,14 @@ def load_rule_specs(db: Session, unit_id: int) -> tuple[RuleSpec, ...]:
             ),
         )
         for rule in rules
-        if rule.conditions
+        # Rules saved before a tag became protected are never executed; the
+        # rules page flags them for review. The image keeps the PACS value.
+        if rule.conditions and not modifies_protected_tag(rule.action, rule.action_tag)
     )
+
+
+def modifies_protected_tag(action: str, action_tag: str) -> bool:
+    return action in {"replace", "remove"} and is_protected_tag(action_tag)
 
 
 def _dataset_tag(tag: str) -> BaseTag:
@@ -336,9 +379,7 @@ def migrate_legacy_study_rule(db: Session) -> bool:
     if not prefix:
         return False
     units = list(
-        db.scalars(
-            select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.id)
-        )
+        db.scalars(select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.id))
     )
     if not units:
         return False

@@ -36,9 +36,7 @@ class ObservabilityTest(unittest.TestCase):
             "worker", logging.INFO, __file__, 1, "test", (), None
         )
         record.created = 1789328029.174766
-        with patch(
-            "app.observability.LOG_TIMEZONE", timezone(timedelta(hours=-3))
-        ):
+        with patch("app.observability.LOG_TIMEZONE", timezone(timedelta(hours=-3))):
             payload = json.loads(JsonFormatter().format(record))
 
         self.assertTrue(payload["timestamp"].endswith("-03:00"))
@@ -66,6 +64,28 @@ class ObservabilityTest(unittest.TestCase):
 
         self.assertEqual(len(records), 1)
         self.assertTrue(records[0].event_created)
+
+    def test_exception_stack_has_locations_without_patient_or_secret_text(self):
+        try:
+            raise RuntimeError("patient=PRIVATE; token=SECRET")
+        except RuntimeError:
+            import sys
+
+            record = logging.LogRecord(
+                "worker",
+                logging.ERROR,
+                __file__,
+                1,
+                "upload.failed",
+                (),
+                sys.exc_info(),
+            )
+        rendered = JsonFormatter().format(record)
+        payload = json.loads(rendered)
+        self.assertTrue(payload["error_stack"])
+        self.assertEqual(payload["error_stack"][-1]["file"], "test_observability.py")
+        self.assertNotIn("PRIVATE", rendered)
+        self.assertNotIn("SECRET", rendered)
 
 
 if __name__ == "__main__":

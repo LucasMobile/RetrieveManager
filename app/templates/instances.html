@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% from "icons.html" import icon %}
+{% block title %}Instâncias com pendência · Retrieve Manager{% endblock %}
+{% block body %}
+<div class="page-stack logs-page">
+  <header class="page-header">
+    <div class="page-header__copy">
+      <p class="eyebrow">Recepção DICOM</p>
+      <h1>Instâncias com pendência</h1>
+      <p class="page-header__description">Objetos recebidos que não seguiram o fluxo normal: conteúdo em conflito, arquivo ausente ou erro de processamento.</p>
+    </div>
+  </header>
+
+  <section class="surface logs-summary" aria-label="Resumo das pendências">
+    {% for key, issue in issues.items() %}
+    <div><strong>{{ counts[key] }}</strong><span>{{ issue[0] | lower }}</span></div>
+    {% endfor %}
+  </section>
+
+  <form class="surface filter-bar logs-filter" method="get" action="/instances" aria-label="Filtros das instâncias">
+    <input type="hidden" name="page_size" value="{{ pager.size }}">
+    <div class="filter-grid">
+      <div class="field">
+        <label for="filter-unit">Unidade</label>
+        <select id="filter-unit" name="unit_id">
+          <option value="">Todas as unidades</option>
+          {% for id, name in units %}<option value="{{ id }}" {% if unit_id == id %}selected{% endif %}>{{ name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="filter-state">Situação</label>
+        <select id="filter-state" name="state">
+          <option value="">Todas as pendências</option>
+          {% for key, issue in issues.items() %}<option value="{{ key }}" {% if state == key %}selected{% endif %}>{{ issue[0] }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="filter-actions">
+        <button class="btn btn--primary" type="submit">{{ icon("search") }} Filtrar</button>
+        {% if unit_id or state %}<a class="btn btn--quiet" href="/instances">Limpar</a>{% endif %}
+      </div>
+    </div>
+  </form>
+
+  <section class="surface logs-table-card" aria-labelledby="instances-table-title">
+    <div class="logs-table-card__header">
+      <div><h2 id="instances-table-title">Pendências</h2><p>As mais recentes aparecem primeiro.</p></div>
+      <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+    </div>
+    {% if rows %}
+    <div class="table-wrap">
+      <table class="data-table logs-table">
+        <thead><tr><th scope="col">Recebido em</th><th scope="col">Unidade</th><th scope="col">Situação</th><th scope="col">Origem</th><th scope="col">Arquivo</th><th scope="col">Detalhe</th></tr></thead>
+        <tbody>
+          {% for row in rows %}
+          {% set item = row.instance %}
+          {% set issue = issues[item.state] %}
+          <tr>
+            <td><span class="log-date"><strong>{{ item.received_at.strftime('%d/%m/%Y') }}</strong><span>{{ item.received_at.strftime('%H:%M:%S') }}</span></span></td>
+            <td><span class="table-primary">{{ row.unit_name }}</span><span class="table-secondary">{{ item.modality or 'Modalidade não informada' }}</span></td>
+            <td><span class="status-badge status-badge--{{ issue[1] }}" title="{{ issue[2] }}">{{ issue[0] }}</span></td>
+            <td><span class="table-primary mono">{{ item.calling_aet or '—' }}</span><span class="table-secondary mono">{{ item.peer_ip or 'adotado da pasta' }}</span></td>
+            <td><span class="table-primary mono">{{ row.file_name }}</span>{% if row.order_id %}<a class="table-secondary" href="/orders/{{ row.order_id }}">Ver pedido</a>{% endif %}</td>
+            <td class="logs-table__summary">{{ item.last_error or issue[2] }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "pager.html" %}
+    {% else %}
+    <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("check") }}</div><h2>Nenhuma pendência</h2><p>{% if unit_id or state %}Nada encontrado com esses filtros.{% else %}Todos os objetos recebidos seguiram o fluxo normal.{% endif %}</p>{% if unit_id or state %}<a class="btn btn--secondary" href="/instances">Limpar filtros</a>{% endif %}</div></div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

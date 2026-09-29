@@ -4,8 +4,12 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from app.main import _dashboard_folder_cache, _dashboard_units, _unit_runtime
 from app.models import Order, Unit
+from app.routes.dashboard import (
+    _dashboard_folder_cache,
+    _dashboard_units,
+    _unit_runtime,
+)
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -33,7 +37,7 @@ class DashboardTest(DatabaseTestCase):
             token="token",
         )
 
-    @patch("app.main.port_listening", return_value=True)
+    @patch("app.routes.dashboard.port_listening", return_value=True)
     def test_summary_aggregates_units_and_orders(self, _port_listening):
         with self.Session() as db:
             active = self._unit("A", enabled=True)
@@ -123,7 +127,9 @@ class DashboardTest(DatabaseTestCase):
                 ]
             )
             db.commit()
-            with patch("app.main.port_listening", side_effect=wait_for_other_check):
+            with patch(
+                "app.routes.dashboard.port_listening", side_effect=wait_for_other_check
+            ):
                 units, _pager, _summary = _dashboard_units(db, 1)
 
         self.assertEqual(len(units), 2)
@@ -141,10 +147,10 @@ class DashboardTest(DatabaseTestCase):
         _dashboard_folder_cache.pop(cache_key, None)
         with (
             patch(
-                "app.main.folder_counts",
+                "app.routes.dashboard.folder_counts",
                 return_value={"receive": 10, "send": 2, "error": 1},
             ) as counts,
-            patch("app.main.port_listening", return_value=True) as port,
+            patch("app.routes.dashboard.port_listening", return_value=True) as port,
         ):
             first = _unit_runtime(unit)
             second = _unit_runtime(unit)

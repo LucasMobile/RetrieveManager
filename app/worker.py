@@ -34,7 +34,6 @@ from app.pipeline import (
     run_claimed_move,
     send_unit,
 )
-from app.storescp import StoreSupervisor
 
 log = logging.getLogger("worker")
 
@@ -240,12 +239,7 @@ def _send_job(unit_id: int) -> None:
         has_more = _run_unit_stage(
             unit_id,
             "cloud.send.batch",
-            lambda db, unit: send_unit(
-                db,
-                unit,
-                unit.cloud_url,
-                unit.file_settle_seconds,
-            ),
+            lambda db, unit: send_unit(db, unit, unit.cloud_url),
         )
         if has_more is not True:
             return
@@ -298,7 +292,6 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     init_db()
-    supervisor = StoreSupervisor()
     pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="dicom-move")
     ack_pool = ThreadPoolExecutor(
         max_workers=ORDERS_API_ACK_UNIT_WORKERS,
@@ -349,7 +342,6 @@ def main() -> None:
             _touch_health()
             try:
                 _tick(
-                    supervisor,
                     pool,
                     ack_pool,
                     ack_jobs,
@@ -375,13 +367,12 @@ def main() -> None:
     finally:
         stop_event.set()
         find_scheduler.join(timeout=5)
-        supervisor.stop_all()
-        pool.shutdown(wait=False)
-        ack_pool.shutdown(wait=False, cancel_futures=True)
-        ingest_pool.shutdown(wait=False, cancel_futures=True)
-        find_pool.shutdown(wait=False, cancel_futures=True)
-        compact_pool.shutdown(wait=False, cancel_futures=True)
-        send_pool.shutdown(wait=False, cancel_futures=True)
+        pool.shutdown(wait=True)
+        ack_pool.shutdown(wait=True, cancel_futures=True)
+        ingest_pool.shutdown(wait=True, cancel_futures=True)
+        find_pool.shutdown(wait=True, cancel_futures=True)
+        compact_pool.shutdown(wait=True, cancel_futures=True)
+        send_pool.shutdown(wait=True, cancel_futures=True)
         try:
             WORKER_HEALTH_FILE.unlink(missing_ok=True)
         except OSError as exc:
@@ -404,7 +395,6 @@ def main() -> None:
 
 
 def _tick(
-    supervisor: StoreSupervisor,
     pool: ThreadPoolExecutor,
     ack_pool: ThreadPoolExecutor | None = None,
     ack_jobs: dict[int, Future] | None = None,
@@ -422,19 +412,7 @@ def _tick(
     with SessionLocal() as db:
         units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))
         unit_ids = [unit.id for unit in units if unit.enabled]
-        try:
-            supervisor.reconcile(units)
-        except Exception as exc:
-            log_event(
-                log,
-                logging.ERROR,
-                "worker.stage",
-                resource="storescp",
-                status="failure",
-                error=exc,
-                error_detail=safe_error_detail(exc),
-                stage="storescp.reconcile",
-            )
+        db.commit()
 
     ack_executor = ack_pool or pool
     active_ack_jobs = ack_jobs if ack_jobs is not None else {}
@@ -482,9 +460,7 @@ def _tick(
             _run_unit_stage(
                 unit_id,
                 "cloud.send.batch",
-                lambda db, unit: send_unit(
-                    db, unit, unit.cloud_url, unit.file_settle_seconds
-                ),
+                lambda db, unit: send_unit(db, unit, unit.cloud_url),
             )
 
 
@@ -522,6 +498,7 @@ def _run_db_stage(stage: str, callback):
 
 def _run_unit_stage(unit_id: int, stage: str, callback):
     _touch_health()
+
     def invoke(db):
         unit = db.get(Unit, unit_id)
         if unit is None or unit.deleted_at is not None or not unit.enabled:

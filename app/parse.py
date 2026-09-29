@@ -1,5 +1,11 @@
+"""Interpret C-FIND responses (pydicom datasets) returned by the PACS."""
+
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
+
+from pydicom.dataset import Dataset
+from pydicom.multival import MultiValue
 
 from app.config import KNOWN_MODALITIES
 
@@ -13,6 +19,29 @@ class PriorSeriesResult:
     modality: str = ""
     body_part: str = ""
     description: str = ""
+    patient_id: str = ""
+    birth_date: str = ""
+
+
+@dataclass(frozen=True)
+class StudyFindResponse:
+    study_uid: str = ""
+    patient_id: str = ""
+    birth_date: str = ""
+    accession: str = ""
+    modalities: str = ""
+    patient_name: str = ""
+    body_part: str = ""
+    instance_count: str = ""
+
+
+def dataset_text(ds: Dataset, keyword: str) -> str:
+    """Text value of a response element; multi-values joined with a backslash."""
+    value = ds.get(keyword, "")
+    if isinstance(value, MultiValue | list | tuple):
+        value = "\\".join(str(item) for item in value)
+    # PostgreSQL text columns reject NUL bytes from non-conformant padding.
+    return str(value if value is not None else "").replace("\x00", "").strip()
 
 
 def normalize_modality(
@@ -30,18 +59,47 @@ def normalize_modality(
     return raw.replace("\\", " ").split()[0]
 
 
-def parse_findscu_output(output: str) -> tuple[str, str, str, str]:
-    """Return study UID, modalities, patient name and Body Part Examined."""
-    study_uid = _first_bracket(output, "StudyInstanceUID")
-    modalities = _first_bracket(output, "ModalitiesInStudy")
-    name = _first_bracket(output, "PatientName")
-    body_part = _first_bracket(output, "BodyPartExamined")
-    return study_uid, modalities, name, body_part
+def study_response(ds: Dataset) -> StudyFindResponse:
+    return StudyFindResponse(
+        study_uid=dataset_text(ds, "StudyInstanceUID"),
+        patient_id=dataset_text(ds, "PatientID"),
+        birth_date=dataset_text(ds, "PatientBirthDate"),
+        accession=dataset_text(ds, "AccessionNumber"),
+        modalities=dataset_text(ds, "ModalitiesInStudy"),
+        patient_name=dataset_text(ds, "PatientName"),
+        body_part=dataset_text(ds, "BodyPartExamined"),
+        instance_count=dataset_text(ds, "NumberOfStudyRelatedInstances"),
+    )
 
 
-def parse_series_body_part(output: str) -> str:
-    """Return the first non-empty BodyPartExamined across all SERIES responses."""
-    return _first_bracket(output, "BodyPartExamined")
+def prior_series_results(
+    responses: Iterable[Dataset],
+) -> tuple[PriorSeriesResult, ...]:
+    """One result per Series UID; responses without both UIDs are ignored."""
+    unique: dict[str, PriorSeriesResult] = {}
+    for ds in responses:
+        result = PriorSeriesResult(
+            study_uid=dataset_text(ds, "StudyInstanceUID"),
+            series_uid=dataset_text(ds, "SeriesInstanceUID"),
+            accession=dataset_text(ds, "AccessionNumber"),
+            study_date=dataset_text(ds, "StudyDate"),
+            modality=dataset_text(ds, "Modality"),
+            body_part=dataset_text(ds, "BodyPartExamined"),
+            description=dataset_text(ds, "StudyDescription"),
+            patient_id=dataset_text(ds, "PatientID"),
+            birth_date=dataset_text(ds, "PatientBirthDate"),
+        )
+        if result.study_uid and result.series_uid:
+            unique[result.series_uid] = result
+    return tuple(unique.values())
+
+
+def patient_id_matches(returned: str, expected: str, *, allow_suffix: bool) -> bool:
+    """Compare a PACS PatientID with the order's ID; prefix only when enabled."""
+    returned, expected = (returned or "").strip(), (expected or "").strip()
+    if not returned or not expected:
+        return False
+    return returned == expected or (allow_suffix and returned.startswith(expected))
 
 
 def first_allowed_modality(
@@ -55,132 +113,34 @@ def first_allowed_modality(
     return ""
 
 
-def parse_series_metadata(
-    output: str, allowed_modalities: set[str] | frozenset[str]
+def series_metadata(
+    responses: Iterable[Dataset], allowed_modalities: set[str] | frozenset[str]
 ) -> tuple[str, str]:
-    """Select the first eligible SERIES response and its BodyPartExamined."""
-    current: dict[str, str] | None = None
-    responses: list[tuple[str, str]] = []
-
-    def flush() -> None:
-        nonlocal current
-        if current is not None:
-            responses.append(
-                (current.get("modality", ""), current.get("body_part", ""))
-            )
-        current = None
-
-    for line in (output or "").splitlines():
-        if "Find Response:" in line:
-            flush()
-            current = {} if "Pending" in line else None
-            continue
-        if "Received Final Find Response" in line:
-            flush()
-            continue
-        if current is None:
-            continue
-        if "(0008,0060)" in line:
-            current["modality"] = _bracket_value(line)
-        elif "(0018,0015)" in line:
-            current["body_part"] = _bracket_value(line)
-    flush()
-
+    """Select the first eligible series, preferring one with BodyPartExamined."""
     first_valid: tuple[str, str] | None = None
-    for raw_modality, body_part in responses:
-        modality = first_allowed_modality(raw_modality, allowed_modalities)
+    for ds in responses:
+        modality = first_allowed_modality(
+            dataset_text(ds, "Modality"), allowed_modalities
+        )
         if not modality:
             continue
-        candidate = (modality, body_part)
+        body_part = dataset_text(ds, "BodyPartExamined")
         if body_part:
-            return candidate
+            return modality, body_part
         if first_valid is None:
-            first_valid = candidate
+            first_valid = (modality, body_part)
     return first_valid or ("", "")
 
 
-def series_response_has_modality(output: str) -> bool:
-    """Whether a pending SERIES response contains a non-empty Modality value."""
-    pending = False
-    for line in (output or "").splitlines():
-        if "Find Response:" in line:
-            pending = "Pending" in line
-            continue
-        if "Received Final Find Response" in line:
-            pending = False
-            continue
-        if pending and "(0008,0060)" in line and _bracket_value(line):
-            return True
-    return False
+def series_have_modality(responses: Iterable[Dataset]) -> bool:
+    """Whether any SERIES response carries a non-empty Modality."""
+    return any(dataset_text(ds, "Modality") for ds in responses)
 
 
-def parse_prior_findscu_output(output: str) -> tuple[PriorSeriesResult, ...]:
-    """Parse each pending SERIES response returned by DCMTK findscu."""
-    field_names = {
-        "StudyInstanceUID": "study_uid",
-        "SeriesInstanceUID": "series_uid",
-        "AccessionNumber": "accession",
-        "StudyDate": "study_date",
-        "Modality": "modality",
-        "BodyPartExamined": "body_part",
-        "StudyDescription": "description",
-    }
-    current: dict[str, str] | None = None
-    results: list[PriorSeriesResult] = []
-
-    def flush() -> None:
-        nonlocal current
-        if current and current.get("study_uid") and current.get("series_uid"):
-            results.append(
-                PriorSeriesResult(
-                    **{
-                        field: current.get(field, "")
-                        for field in PriorSeriesResult.__dataclass_fields__
-                    }
-                )
-            )
-        current = None
-
-    for line in (output or "").splitlines():
-        if "Find Response:" in line:
-            flush()
-            current = {} if "Pending" in line else None
-            continue
-        if "Received Final Find Response" in line:
-            flush()
-            continue
-        if current is None:
-            continue
-        for tag_name, field in field_names.items():
-            if tag_name in line:
-                current[field] = _bracket_value(line)
-                break
-    flush()
-
-    unique: dict[str, PriorSeriesResult] = {}
-    for result in results:
-        unique[result.series_uid] = result
-    return tuple(unique.values())
-
-
-def _first_bracket(text: str, tag_name: str) -> str:
-    for line in (text or "").splitlines():
-        if tag_name in line and "[" in line and "]" in line:
-            start = line.find("[")
-            end = line.find("]", start)
-            if start >= 0 and end > start:
-                return _clean_dicom_text(line[start + 1 : end])
+def first_series_body_part(responses: Iterable[Dataset]) -> str:
+    """First non-empty BodyPartExamined across the SERIES responses."""
+    for ds in responses:
+        body_part = dataset_text(ds, "BodyPartExamined")
+        if body_part:
+            return body_part
     return ""
-
-
-def _bracket_value(line: str) -> str:
-    if "[" not in line or "]" not in line:
-        return ""
-    start = line.find("[")
-    end = line.find("]", start)
-    return _clean_dicom_text(line[start + 1 : end]) if end > start else ""
-
-
-def _clean_dicom_text(value: str) -> str:
-    """Remove padding that cannot be persisted in PostgreSQL text columns."""
-    return (value or "").replace("\x00", "").strip()

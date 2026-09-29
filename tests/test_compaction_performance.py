@@ -6,31 +6,14 @@ from unittest.mock import patch
 
 from sqlalchemy import func, select
 
-from app.models import ImageTransfer, Order
-from app.pipeline import (
-    CompactResult,
-    _cleanup_compaction_temps,
-    _persist_compact_chunk,
-    _settled_files,
-    compact_unit,
-)
+from app.compaction import CompactResult
+from app.models import DicomInstance, DicomStudy, ImageTransfer, Order
+from app.pipeline.compact import _cleanup_compaction_temps, compact_unit
+from app.pipeline.records import persist_compact_chunk
 from tests.support import DatabaseTestCase, make_unit
 
 
-class SettledFilesTest(unittest.TestCase):
-    def test_scan_stops_at_batch_limit_and_ignores_hidden_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for index in range(10):
-                (root / f"image-{index}.dcm").write_bytes(b"DICOM")
-            (root / ".compression-in-progress.tmp").write_bytes(b"partial")
-
-            files, errors = _settled_files(root, 0, limit=3)
-
-            self.assertEqual(len(files), 3)
-            self.assertFalse(errors)
-            self.assertTrue(all(not path.name.startswith(".") for path in files))
-
+class CompactionTempsTest(unittest.TestCase):
     def test_only_stale_compaction_temporaries_are_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -62,10 +45,22 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
                 receive_dir=str(receive),
                 send_dir=str(send),
                 error_dir=str(error),
-                file_settle_seconds=0,
                 compact_workers=1,
             )
             db.add(unit)
+            db.flush()
+            study = DicomStudy(unit_id=unit.id, study_uid="1.2.3")
+            db.add(study)
+            db.flush()
+            instance = DicomInstance(
+                unit_id=unit.id,
+                study_id=study.id,
+                sop_uid="1.2.3.4",
+                source_path=str(source),
+                source_sha256="0" * 64,
+                state="received",
+            )
+            db.add(instance)
             db.commit()
             transaction_during_codec = []
 
@@ -75,12 +70,12 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
 
             with (
                 patch(
-                    "app.pipeline.compression_runtime_settings",
-                    return_value=(set(), {"*": "+e1"}),
+                    "app.pipeline.compact.compression_runtime_settings",
+                    return_value=(set(), {"*": "lossless"}),
                 ),
-                patch("app.pipeline.load_rule_specs", return_value=()),
+                patch("app.pipeline.compact.load_rule_specs", return_value=()),
                 patch(
-                    "app.pipeline._compact_one_limited",
+                    "app.pipeline.compact._compact_one_limited",
                     side_effect=fail_codec,
                 ),
             ):
@@ -90,6 +85,9 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
             self.assertFalse(has_more)
             self.assertFalse(source.exists())
             self.assertTrue((error / source.name).is_file())
+            db.refresh(instance)
+            self.assertEqual(instance.state, "error")
+            self.assertEqual(instance.last_error, "RuntimeError")
 
     def test_compact_metadata_is_committed_once_per_chunk(self):
         with self.Session() as db:
@@ -118,9 +116,10 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
             ]
 
             with patch.object(db, "commit", wraps=db.commit) as commit:
-                processed, failed = _persist_compact_chunk(db, unit, results)
+                recorded, failed = persist_compact_chunk(db, unit, results)
 
-            self.assertEqual((processed, failed), (5, 0))
+            self.assertEqual((len(recorded), failed), (5, 0))
+            self.assertEqual({row[2] for row in recorded}, {"publishing"})
             self.assertEqual(commit.call_count, 1)
             self.assertEqual(
                 db.scalar(select(func.count()).select_from(ImageTransfer)),
@@ -143,10 +142,15 @@ class CompactionFailureIsolationTest(DatabaseTestCase):
                 if result.source_name == "bad":
                     raise ValueError("invalid metadata")
 
-            with patch("app.pipeline._record_compact_result", side_effect=persist):
-                processed, failed = _persist_compact_chunk(db, unit, results)
+            with patch(
+                "app.pipeline.records._record_compact_result", side_effect=persist
+            ):
+                recorded, failed = persist_compact_chunk(db, unit, results)
 
-            self.assertEqual((processed, failed), (2, 1))
+            self.assertEqual(
+                [row[0].source_name for row in recorded], ["first", "last"]
+            )
+            self.assertEqual(failed, 1)
 
 
 if __name__ == "__main__":

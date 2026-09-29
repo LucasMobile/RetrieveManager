@@ -4,10 +4,12 @@ import json
 import logging
 import os
 import sys
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -71,6 +73,8 @@ class JsonFormatter(logging.Formatter):
                 record, "correlation_id", correlation_id_var.get()
             ),
             "service": getattr(record, "service", SERVICE_NAME),
+            "worker": f"{SERVICE_NAME}:{record.process}",
+            "thread": record.threadName,
             "env": APP_ENV,
             "action": getattr(record, "action", record.getMessage()),
             "resource": getattr(record, "resource", None),
@@ -88,6 +92,7 @@ class JsonFormatter(logging.Formatter):
                 payload[key] = value
         if record.exc_info:
             payload["error_type"] = record.exc_info[0].__name__
+            payload["error_stack"] = _safe_stack(record.exc_info[2])
         return json.dumps(
             payload, ensure_ascii=False, default=str, separators=(",", ":")
         )
@@ -100,6 +105,19 @@ def configure_logging() -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(LOG_LEVEL)
+
+
+def _safe_stack(tb) -> list[dict[str, Any]]:
+    # Exclude exception messages, source lines and locals: they may contain
+    # tokens, SQL parameters or patient data. Preserve code locations for triage.
+    return [
+        {
+            "file": Path(frame.filename).name,
+            "line": frame.lineno,
+            "function": frame.name,
+        }
+        for frame in traceback.extract_tb(tb)
+    ]
 
 
 def new_correlation_id() -> str:
@@ -146,6 +164,8 @@ def log_event(
         ),
         "error_type": type(error).__name__ if error else None,
     }
+    if error is not None:
+        extra["error_stack"] = _safe_stack(error.__traceback__)
     for key, value in fields.items():
         safe_key = f"event_{key}" if key in _RESERVED_EXTRA_FIELDS else key
         extra[safe_key] = value

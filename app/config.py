@@ -109,6 +109,9 @@ DATABASE_URL = os.getenv(
 )
 
 WORKER_INTERVAL_SECONDS = _env_int("WORKER_INTERVAL_SECONDS", 5)
+DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 5)
+DB_MAX_OVERFLOW = _env_int("DB_MAX_OVERFLOW", 10, minimum=0)
+DB_POOL_TIMEOUT_SECONDS = _env_int("DB_POOL_TIMEOUT_SECONDS", 30)
 ORDERS_API_POLL_SECONDS = _env_int("ORDERS_API_POLL_SECONDS", 30)
 ORDERS_API_TIMEOUT_SECONDS = _env_int("ORDERS_API_TIMEOUT_SECONDS", 60)
 ORDERS_API_MAX_RETRIES = _env_int("ORDERS_API_MAX_RETRIES", 3)
@@ -124,27 +127,28 @@ COMPACT_BATCH_SIZE = _env_int("COMPACT_BATCH_SIZE", 250)
 COMPACT_GLOBAL_WORKERS = _env_int("COMPACT_GLOBAL_WORKERS", 8)
 COMPACT_DB_BATCH_SIZE = _env_int("COMPACT_DB_BATCH_SIZE", 25)
 COMPACT_TEMP_MAX_AGE_SECONDS = _env_int("COMPACT_TEMP_MAX_AGE_SECONDS", 3600)
-DCMCJPEG_TIMEOUT_SECONDS = _env_int("DCMCJPEG_TIMEOUT_SECONDS", 300)
+COMPACT_FILE_TIMEOUT_SECONDS = _env_int("COMPACT_FILE_TIMEOUT_SECONDS", 300)
+# Larger objects are sent as received: encoding them would need several
+# times their size in memory per codec worker.
+COMPACT_MAX_ENCODE_BYTES = _env_int("COMPACT_MAX_ENCODE_BYTES", 256 * 1024 * 1024)
 COMPACT_UNIT_SCHEDULERS = _env_int("COMPACT_UNIT_SCHEDULERS", 4)
 SEND_UNIT_SCHEDULERS = _env_int("SEND_UNIT_SCHEDULERS", 4)
-DASHBOARD_FILE_COUNT_CACHE_SECONDS = _env_int(
-    "DASHBOARD_FILE_COUNT_CACHE_SECONDS", 30
-)
+DASHBOARD_FILE_COUNT_CACHE_SECONDS = _env_int("DASHBOARD_FILE_COUNT_CACHE_SECONDS", 30)
 HTTP_TOTAL_TIMEOUT_SECONDS = _env_int("HTTP_TOTAL_TIMEOUT_SECONDS", 120)
 HTTP_CONNECT_TIMEOUT_SECONDS = _env_int("HTTP_CONNECT_TIMEOUT_SECONDS", 10)
 GLOBAL_RATE_LIMIT_REQUESTS = _env_int("GLOBAL_RATE_LIMIT_REQUESTS", 100)
 GLOBAL_RATE_LIMIT_WINDOW_SECONDS = _env_int("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", 60)
 LOGIN_RATE_LIMIT_FAILURES = _env_int("LOGIN_RATE_LIMIT_FAILURES", 5)
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = _env_int("LOGIN_RATE_LIMIT_WINDOW_SECONDS", 15 * 60)
-SEND_BATCH_SIZE = _env_int("SEND_BATCH_SIZE", 250)
 SEND_DB_BATCH_SIZE = _env_int("SEND_DB_BATCH_SIZE", 50)
-SEND_RECONCILE_BATCH_SIZE = _env_int("SEND_RECONCILE_BATCH_SIZE", 500)
-SEND_RECONCILE_INTERVAL_SECONDS = _env_int(
-    "SEND_RECONCILE_INTERVAL_SECONDS", 30
-)
+SEND_DB_FLUSH_MILLISECONDS = _env_int("SEND_DB_FLUSH_MILLISECONDS", 250)
+# One upload drain keeps refilling its HTTP connections for this long before
+# returning control to the worker scheduler (0 = a single refill per call).
+SEND_DRAIN_SECONDS = _env_int("SEND_DRAIN_SECONDS", 20, minimum=0)
 SEND_GLOBAL_CONCURRENCY = _env_int("SEND_GLOBAL_CONCURRENCY", 32)
-SEND_RETRY_BASE_SECONDS = _env_int("SEND_RETRY_BASE_SECONDS", 10)
-SEND_RETRY_MAX_SECONDS = _env_int("SEND_RETRY_MAX_SECONDS", 900)
+# Failed uploads are retried with growing waits; after this many attempts the
+# transfer stays in send_error until an operator resends it.
+SEND_MAX_ATTEMPTS = _env_int("SEND_MAX_ATTEMPTS", 7)
 CIRCUIT_BREAKER_FAILURES = _env_int("CIRCUIT_BREAKER_FAILURES", 5)
 CIRCUIT_BREAKER_SECONDS = _env_int("CIRCUIT_BREAKER_SECONDS", 60)
 _default_health_file = (
@@ -154,12 +158,33 @@ _default_health_file = (
 )
 WORKER_HEALTH_FILE = Path(os.getenv("WORKER_HEALTH_FILE", _default_health_file))
 
-_DCMTK_BIN = "/opt/dcmtk/bin"
-FINDSCU = os.getenv("FINDSCU", f"{_DCMTK_BIN}/findscu")
-ECHOSCU = os.getenv("ECHOSCU", f"{_DCMTK_BIN}/echoscu")
-MOVESCU = os.getenv("MOVESCU", f"{_DCMTK_BIN}/movescu")
-STORESCP = os.getenv("STORESCP", f"{_DCMTK_BIN}/storescp")
-DCMCJPEG = os.getenv("DCMCJPEG", f"{_DCMTK_BIN}/dcmcjpeg")
+# DICOM receiver (pynetdicom Store SCP), one listener per enabled unit.
+RECEIVER_HEALTH_FILE = Path(
+    os.getenv(
+        "RECEIVER_HEALTH_FILE",
+        "/tmp/retrieve-receiver.ready"
+        if IS_PRODUCTION
+        else str(DATA_DIR / "retrieve-receiver.ready"),
+    )
+)
+# Each association holds one object in memory while it is stored; together with
+# the largest expected object this bounds the receiver's peak memory.
+RECEIVER_MAX_ASSOCIATIONS = _env_int("RECEIVER_MAX_ASSOCIATIONS", 10)
+RECEIVER_MAX_PDU = _env_int("RECEIVER_MAX_PDU", 65534, minimum=4096)
+RECEIVER_MIN_FREE_MB = _env_int("RECEIVER_MIN_FREE_MB", 1024, minimum=0)
+# fsync each received file before acknowledging it. Off by default: the rename
+# is atomic and a process crash keeps the page cache; only a power loss inside
+# the flush window can lose a file already acknowledged (the instance is then
+# marked missing and can be retrieved again).
+RECEIVER_FSYNC = _env_bool("RECEIVER_FSYNC", False)
+# How long a C-STORE waits for its database commit before answering 0xA700.
+RECEIVER_COMMIT_TIMEOUT_SECONDS = _env_int("RECEIVER_COMMIT_TIMEOUT_SECONDS", 30)
+# Files in the receive folder without a database row (legacy storescp files,
+# "reprocessar erros") are adopted after this age, at most once per interval.
+RECEIVE_ADOPT_MIN_AGE_SECONDS = _env_int("RECEIVE_ADOPT_MIN_AGE_SECONDS", 60)
+RECEIVE_ADOPT_INTERVAL_SECONDS = _env_int("RECEIVE_ADOPT_INTERVAL_SECONDS", 30)
+RECEIVE_ADOPT_BATCH_SIZE = _env_int("RECEIVE_ADOPT_BATCH_SIZE", 200)
+
 STORE_PORT_MAP = _env_port_map("STORE_PORT_MAP", "444:10444")
 
 

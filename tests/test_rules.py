@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 from sqlalchemy import select
 
-from app.main import rules_compress_delete, rules_retrieve_delete
 from app.models import CompressRule, ModalityRule
+from app.routes.rules import rules_compress_delete, rules_retrieve_delete
 from app.rules import retrieve_rule_for, schedule_from_now
 from tests.support import DatabaseTestCase
 
@@ -35,8 +35,8 @@ class RulesTest(DatabaseTestCase):
                         second_retrieve=False,
                         second_wait_minutes=90,
                     ),
-                    CompressRule(modality="CT", jpeg_flag="+e1"),
-                    CompressRule(modality="*", jpeg_flag="+e1"),
+                    CompressRule(modality="CT", jpeg_flag="lossless"),
+                    CompressRule(modality="*", jpeg_flag="lossless"),
                 ]
             )
             db.commit()
@@ -96,7 +96,7 @@ class RulesTest(DatabaseTestCase):
             assert ct is not None
             assert default is not None
 
-            with patch("app.main.log_event") as log_event_mock:
+            with patch("app.routes.rules.log_event") as log_event_mock:
                 response = rules_compress_delete(ct.id, request, db, user)
 
             self.assertEqual(response.status_code, 303)
@@ -107,7 +107,7 @@ class RulesTest(DatabaseTestCase):
             )
             self.assertEqual(log_event_mock.call_args.kwargs["modality"], "CT")
 
-            with patch("app.main.log_event") as log_event_mock:
+            with patch("app.routes.rules.log_event") as log_event_mock:
                 response = rules_compress_delete(default.id, request, db, user)
             self.assertEqual(response.status_code, 303)
             self.assertIsNotNone(db.get(CompressRule, default.id))

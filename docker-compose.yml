@@ -1,5 +1,8 @@
 x-service-defaults: &service-defaults
   build: .
+  # One named image for every service: `docker save retrieve-manager:latest`
+  # moves the whole application to a server without internet.
+  image: retrieve-manager:latest
   env_file: .env
   init: true
   read_only: true
@@ -24,7 +27,7 @@ x-service-defaults: &service-defaults
     APP_ENV: production
     TZ: America/Sao_Paulo
     DATA_DIR: /data
-    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-retrieve}:${POSTGRES_PASSWORD:-retrieve-development-password}@postgres:5432/${POSTGRES_DB:-retrieve}
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-retrieve}:${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no .env}@postgres:5432/${POSTGRES_DB:-retrieve}
     ALLOWED_DATA_ROOTS: /mobilemed,/opt/idr
     STORE_PORT_MAP: "444:10444"
 
@@ -37,7 +40,7 @@ services:
       PGTZ: America/Sao_Paulo
       POSTGRES_DB: ${POSTGRES_DB:-retrieve}
       POSTGRES_USER: ${POSTGRES_USER:-retrieve}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-retrieve-development-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no .env}
     volumes:
       - postgres-data:/var/lib/postgresql
     healthcheck:
@@ -56,6 +59,7 @@ services:
 
   data-permissions:
     build: .
+    image: retrieve-manager:latest
     user: "0:0"
     command: ["chown", "-R", "10001:10001", "/data"]
     environment:
@@ -80,9 +84,10 @@ services:
     environment:
       <<: *service-environment
       SERVICE_NAME: retrieve-manager-web
-      STORE_CHECK_HOSTS: worker
+      STORE_CHECK_HOSTS: receiver
     ports:
-      - "${APP_PORT:-8080}:8080"
+      # Somente o proxy reverso local acessa a tela; veja APP_BIND_ADDRESS.
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"
     healthcheck:
       test:
         - CMD
@@ -105,6 +110,28 @@ services:
     environment:
       <<: *service-environment
       SERVICE_NAME: retrieve-manager-worker
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time; p='/tmp/retrieve-worker.ready'; raise SystemExit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<900 else 1)"
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      web:
+        condition: service_healthy
+
+  receiver:
+    <<: *service-defaults
+    command: python -m app.receiver
+    environment:
+      <<: *service-environment
+      SERVICE_NAME: retrieve-manager-receiver
+    # Store SCP (pynetdicom). Outras portas de unidade entram aqui e em
+    # STORE_PORT_MAP.
     ports:
       - "444:10444"
     healthcheck:
@@ -112,7 +139,7 @@ services:
         - CMD
         - python
         - -c
-        - "import os,time; p='/tmp/retrieve-worker.ready'; raise SystemExit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<900 else 1)"
+        - "import os,time; p='/tmp/retrieve-receiver.ready'; raise SystemExit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)"
       interval: 20s
       timeout: 5s
       retries: 3

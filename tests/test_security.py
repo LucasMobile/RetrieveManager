@@ -14,12 +14,17 @@ from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from app.config import BASE_DIR, DEFAULT_CLOUD_URL
-from app.main import app, get_db
+from app.db import get_db
+from app.dicom_net import EchoResult
+from app.main import app
 from app.middleware import _same_origin
 from app.models import (
     AuditLog,
     Base,
+    DicomInstance,
     DicomRule,
+    DicomStudy,
+    ImageTransfer,
     ManualMoveRequest,
     Order,
     Settings,
@@ -192,6 +197,7 @@ class SecurityTest(unittest.TestCase):
             "orders_api_url": "https://example.test/orders",
             "orders_api_token": "integration-token",
             "orders_api_station_id": "",
+            "orders_api_company_id": "1582",
             "retrieve_prior_enabled": "0",
             "move_timeout_prior": "1800",
             "receive_dir": root,
@@ -199,7 +205,6 @@ class SecurityTest(unittest.TestCase):
             "error_dir": root,
             "token": "unit-token",
             "cloud_url": DEFAULT_CLOUD_URL,
-            "file_settle_seconds": "3",
             "move_timeout_first": "600",
             "move_timeout_second": "900",
             "max_parallel_moves": "1",
@@ -249,6 +254,90 @@ class SecurityTest(unittest.TestCase):
             self.client.post("/logout", data={"csrf_token": token}).status_code, 403
         )
 
+    def test_pacs_wildcard_and_store_allowlist_default_off_and_round_trip(self):
+        self.login()
+        token = self.token("/units/new")
+        data = self.unit_form_data(csrf_token=token)
+        self.client.post("/units/new", data=data)
+        with self.Session() as db:
+            unit = db.scalar(select(Unit))
+            unit_id = unit.id
+            self.assertFalse(unit.pacs_patient_id_wildcard)
+            self.assertEqual(unit.store_allowed_aets, "")
+            self.assertEqual(unit.store_allowed_ips, "")
+
+        self.client.post(
+            f"/units/{unit_id}",
+            data={
+                **data,
+                "pacs_patient_id_wildcard": "1",
+                "store_allowed_aets": " srvPACS , SRVPACS;MODALIDADE\n",
+                "store_allowed_ips": "192.168.3.103, 10.10.0.0/24",
+            },
+        )
+        with self.Session() as db:
+            unit = db.get(Unit, unit_id)
+            self.assertTrue(unit.pacs_patient_id_wildcard)
+            self.assertEqual(unit.store_allowed_aets, "srvPACS,MODALIDADE")
+            self.assertEqual(unit.store_allowed_ips, "192.168.3.103,10.10.0.0/24")
+        edit_page = self.client.get(f"/units/{unit_id}").text
+        self.assertIn('value="192.168.3.103,10.10.0.0/24"', edit_page)
+        self.assertRegex(
+            edit_page, r'name="pacs_patient_id_wildcard"[^>]*value="1"[^>]*checked'
+        )
+        self.assertIn('value="srvPACS,MODALIDADE"', edit_page)
+
+        # Unchecked checkbox is omitted by the browser: the option turns off.
+        self.client.post(
+            f"/units/{unit_id}",
+            data={**data, "store_allowed_aets": "PACS*"},
+        )
+        self.client.post(
+            f"/units/{unit_id}",
+            data={**data, "store_allowed_ips": "192.168.3.300"},
+        )
+        with self.Session() as db:
+            unit = db.get(Unit, unit_id)
+            self.assertTrue(unit.pacs_patient_id_wildcard)
+            self.assertEqual(unit.store_allowed_aets, "srvPACS,MODALIDADE")
+            self.assertEqual(unit.store_allowed_ips, "192.168.3.103,10.10.0.0/24")
+        self.client.post(f"/units/{unit_id}", data=data)
+        with self.Session() as db:
+            unit = db.get(Unit, unit_id)
+            self.assertFalse(unit.pacs_patient_id_wildcard)
+            self.assertEqual(unit.store_allowed_aets, "")
+            self.assertEqual(unit.store_allowed_ips, "")
+
+    def test_company_id_required_on_create_and_edit_and_saved_in_form(self):
+        self.login()
+        token = self.token("/units/new")
+        data = self.unit_form_data(csrf_token=token, orders_api_company_id="")
+        self.client.post("/units/new", data=data)
+        with self.Session() as db:
+            self.assertIsNone(db.scalar(select(Unit)))
+        self.client.post("/units/new", data={**data, "orders_api_company_id": "1582"})
+        with self.Session() as db:
+            unit = db.scalar(select(Unit))
+            unit_id = unit.id
+            self.assertEqual(unit.orders_api_company_id, "1582")
+        edit_page = self.client.get(f"/units/{unit_id}")
+        company_input = re.search(
+            r'<input[^>]+name="orders_api_company_id"[^>]*>', edit_page.text
+        )[0]
+        self.assertIn('value="1582"', company_input)
+        self.assertIn("required", company_input)
+        for invalid in ("", "0", "-1", "invalid"):
+            self.client.post(
+                f"/units/{unit_id}", data={**data, "orders_api_company_id": invalid}
+            )
+            with self.Session() as db:
+                self.assertEqual(db.get(Unit, unit_id).orders_api_company_id, "1582")
+        self.client.post(
+            f"/units/{unit_id}", data={**data, "orders_api_company_id": "4232"}
+        )
+        with self.Session() as db:
+            self.assertEqual(db.get(Unit, unit_id).orders_api_company_id, "4232")
+
     def test_cloud_settings_are_saved_per_unit_and_not_mutated_on_error(self):
         self.login()
         token = self.token("/units/new")
@@ -265,7 +354,6 @@ class SecurityTest(unittest.TestCase):
             unit = db.scalar(select(Unit))
             unit_id = unit.id
             self.assertEqual(unit.cloud_url, DEFAULT_CLOUD_URL)
-            self.assertEqual(unit.file_settle_seconds, 3)
 
         edit_page = self.client.get(f"/units/{unit_id}")
         self.assertEqual(edit_page.status_code, 200)
@@ -279,7 +367,6 @@ class SecurityTest(unittest.TestCase):
             csrf_token=token,
             orders_api_token="",
             token="",
-            file_settle_seconds="7",
         )
         self.assertEqual(
             self.client.post(
@@ -287,18 +374,8 @@ class SecurityTest(unittest.TestCase):
             ).status_code,
             303,
         )
-        for value in ("-1", "3601", "invalid"):
-            self.assertEqual(
-                self.client.post(
-                    f"/units/{unit_id}",
-                    data={**update_data, "file_settle_seconds": value},
-                    follow_redirects=False,
-                ).status_code,
-                303,
-            )
         with self.Session() as db:
             unit = db.get(Unit, unit_id)
-            self.assertEqual(unit.file_settle_seconds, 7)
             self.assertEqual(unit.orders_api_token, "integration-token")
             self.assertEqual(unit.token, "unit-token")
         self.assertEqual(
@@ -329,13 +406,10 @@ class SecurityTest(unittest.TestCase):
         data = self.unit_form_data(
             csrf_token=token,
             compress_lossless="MR",
-            compress_lossy_8="CT",
-            compress_lossy_12="US",
+            compress_lossy="CT,US",
             drop_modalities="US,SR",
         )
-        response = self.client.post(
-            "/units/new", data=data, follow_redirects=False
-        )
+        response = self.client.post("/units/new", data=data, follow_redirects=False)
         self.assertEqual(response.status_code, 303)
 
         with self.Session() as db:
@@ -343,26 +417,22 @@ class SecurityTest(unittest.TestCase):
             rules = {
                 row.modality: row.jpeg_flag
                 for row in db.scalars(
-                    select(UnitCompressRule).where(
-                        UnitCompressRule.unit_id == unit.id
-                    )
+                    select(UnitCompressRule).where(UnitCompressRule.unit_id == unit.id)
                 )
             }
             drops = {
                 row.code
                 for row in db.scalars(
-                    select(UnitDropModality).where(
-                        UnitDropModality.unit_id == unit.id
-                    )
+                    select(UnitDropModality).where(UnitDropModality.unit_id == unit.id)
                 )
             }
-            self.assertEqual(rules, {"CT": "+eb", "MR": "+e1"})
+            self.assertEqual(rules, {"CT": "lossy", "MR": "lossless"})
             self.assertEqual(drops, {"SR", "US"})
             unit_id = unit.id
 
         edit_page = self.client.get(f"/units/{unit_id}")
         self.assertEqual(edit_page.status_code, 200)
-        self.assertIn('name="compress_lossy_8" value="CT"', edit_page.text)
+        self.assertIn('name="compress_lossy" value="CT"', edit_page.text)
         self.assertNotIn("/rules/compress", edit_page.text)
 
         token = self.token(f"/units/{unit_id}")
@@ -371,7 +441,7 @@ class SecurityTest(unittest.TestCase):
             orders_api_token="",
             token="",
             compress_lossless="CT",
-            compress_lossy_8="CT",
+            compress_lossy="CT",
         )
         response = self.client.post(
             f"/units/{unit_id}", data=invalid, follow_redirects=False
@@ -381,12 +451,10 @@ class SecurityTest(unittest.TestCase):
             rules = {
                 row.modality: row.jpeg_flag
                 for row in db.scalars(
-                    select(UnitCompressRule).where(
-                        UnitCompressRule.unit_id == unit_id
-                    )
+                    select(UnitCompressRule).where(UnitCompressRule.unit_id == unit_id)
                 )
             }
-            self.assertEqual(rules, {"CT": "+eb", "MR": "+e1"})
+            self.assertEqual(rules, {"CT": "lossy", "MR": "lossless"})
 
     def test_dicom_rule_page_create_and_static_rule_routes(self):
         self.login()
@@ -710,6 +778,88 @@ class SecurityTest(unittest.TestCase):
             observer = db.scalar(select(User).where(User.username == "observer"))
             self.assertTrue(verify_password(new_password, observer.password_hash))
 
+    def _second_browser(self, username: str, password: str) -> TestClient:
+        browser = TestClient(
+            app, base_url="https://testserver", raise_server_exceptions=False
+        )
+        page = browser.get("/login")
+        token = re.search(r'name="csrf_token" value="([^"]+)"', page.text)[1]
+        response = browser.post(
+            "/login",
+            data={"username": username, "password": password, "csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        self.addCleanup(browser.close)
+        return browser
+
+    def test_own_password_change_revokes_other_sessions_but_keeps_current(self):
+        self.login()
+        other_browser = self._second_browser("tester", self.password)
+        self.assertEqual(other_browser.get("/").status_code, 200)
+
+        new_password = "changed-password-456"
+        token = self.token("/account/password")
+        self.client.post(
+            "/account/password",
+            data={
+                "csrf_token": token,
+                "current": self.password,
+                "new_password": new_password,
+                "password_confirmation": new_password,
+            },
+        )
+
+        self.assertEqual(self.client.get("/").status_code, 200)
+        revoked = other_browser.get("/", follow_redirects=False)
+        self.assertEqual(revoked.status_code, 303)
+        self.assertEqual(revoked.headers["location"], "/login")
+        self._second_browser("tester", new_password)
+
+    def test_admin_password_reset_revokes_the_managed_user_sessions(self):
+        observer_password = "observer-password-123"
+        with self.Session() as db:
+            observer = User(
+                username="observer",
+                password_hash=hash_password(observer_password),
+                role="user",
+            )
+            db.add(observer)
+            db.commit()
+            observer_id = observer.id
+        observer_browser = self._second_browser("observer", observer_password)
+        self.assertEqual(observer_browser.get("/").status_code, 200)
+
+        self.login()
+        token = self.token(f"/users/{observer_id}")
+        reset_password = "reset-password-789"
+        self.client.post(
+            f"/users/{observer_id}",
+            data={
+                "csrf_token": token,
+                "role": "user",
+                "new_password": reset_password,
+                "password_confirmation": reset_password,
+            },
+        )
+        self.assertEqual(
+            observer_browser.get("/", follow_redirects=False).status_code, 303
+        )
+
+    def test_unknown_username_still_spends_a_bcrypt_comparison(self):
+        token = self.token()
+        with patch("app.security.bcrypt.checkpw", return_value=False) as checkpw:
+            response = self.client.post(
+                "/login",
+                data={
+                    "username": "does-not-exist",
+                    "password": "whatever-password",
+                    "csrf_token": token,
+                },
+            )
+        self.assertEqual(response.status_code, 401)
+        checkpw.assert_called_once()
+
     def test_headers_on_success_rejection_and_unexpected_errors(self):
         responses = [self.client.get("/health/live"), self.client.post("/logout")]
 
@@ -745,7 +895,7 @@ class SecurityTest(unittest.TestCase):
             "pacs_ip": "127.0.0.1",
             "pacs_port": "2104",
         }
-        with patch("app.main.c_echo", return_value=(0, "OK")) as echo:
+        with patch("app.routes.units.echo", return_value=EchoResult(True, 0)) as echo:
             response = self.client.post(
                 "/units/test-echo",
                 files={key: (None, value) for key, value in fields.items()},
@@ -877,7 +1027,7 @@ class SecurityTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
-        logo = response.text.index('/static/logo-white.png?v=1')
+        logo = response.text.index("/static/logo-white.png?v=1")
         code = response.text.index("ERRO 422")
         title = response.text.index("Dados inválidos")
         self.assertLess(logo, code)
@@ -931,6 +1081,171 @@ class SecurityTest(unittest.TestCase):
             self.assertIsNotNone(move_request)
             self.assertEqual(move_request.order_id, order_id)
             self.assertEqual(move_request.status, "queued")
+
+    def test_instances_page_lists_only_pending_problems(self):
+        self.login()
+        with self.Session() as db:
+            unit = Unit(
+                name="Instances unit",
+                orders_api_url="https://example.test/orders",
+                orders_api_token="token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir=str(BASE_DIR),
+                send_dir=str(BASE_DIR),
+                error_dir=str(BASE_DIR),
+                token="unit-token",
+            )
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                acc="ACC-SECRET",
+                birth_date="20000101",
+                study_uid="1.2.inst",
+                modality="CT",
+                status="done",
+                prior_status="disabled",
+            )
+            db.add(order)
+            db.flush()
+            transfer = ImageTransfer(
+                unit_id=unit.id,
+                order_id=order.id,
+                filename="CT.conflict.dcm",
+                correlation_id="corr",
+                status="uploaded",
+            )
+            db.add(transfer)
+            study = DicomStudy(unit_id=unit.id, study_uid="1.2.inst")
+            db.add(study)
+            db.flush()
+            for index, state in enumerate(("conflict", "missing", "compacted")):
+                db.add(
+                    DicomInstance(
+                        unit_id=unit.id,
+                        study_id=study.id,
+                        sop_uid=f"1.2.inst.{index}",
+                        modality="CT",
+                        source_path=str(BASE_DIR / f"CT.{state}"),
+                        source_sha256=str(index) * 64,
+                        calling_aet="SRVPACS",
+                        peer_ip="192.168.3.103",
+                        state=state,
+                        transfer_id=transfer.id if state == "conflict" else None,
+                    )
+                )
+            db.commit()
+            unit_id, order_id = unit.id, order.id
+
+        page = self.client.get("/instances")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("CT.conflict", page.text)
+        self.assertIn("CT.missing", page.text)
+        self.assertNotIn("CT.compacted", page.text)
+        self.assertIn(f'href="/orders/{order_id}"', page.text)
+        self.assertIn("192.168.3.103", page.text)
+        self.assertNotIn("ACC-SECRET", page.text)
+
+        filtered = self.client.get(
+            "/instances", params={"state": "missing", "unit_id": unit_id}
+        )
+        self.assertIn("CT.missing", filtered.text)
+        self.assertNotIn("CT.conflict", filtered.text)
+        self.assertEqual(
+            self.client.get("/instances", params={"state": "compacted"}).status_code,
+            422,
+        )
+
+    def test_send_failures_can_be_resent_from_order_and_unit(self):
+        self.login()
+        with self.Session() as db:
+            unit = Unit(
+                name="Resend unit",
+                orders_api_url="https://example.test/orders",
+                orders_api_token="token",
+                pacs_aet="PACS",
+                pacs_ip="127.0.0.1",
+                pacs_port=2104,
+                calling_aet="RETRIEVE",
+                store_port=444,
+                receive_dir=str(BASE_DIR),
+                send_dir=str(BASE_DIR),
+                error_dir=str(BASE_DIR),
+                token="unit-token",
+            )
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                acc="resend",
+                birth_date="20000101",
+                study_uid="1.2.resend",
+                modality="CT",
+                status="done",
+                prior_status="disabled",
+            )
+            db.add(order)
+            db.flush()
+            for index, order_id in enumerate((order.id, order.id, None)):
+                db.add(
+                    ImageTransfer(
+                        unit_id=unit.id,
+                        order_id=order_id,
+                        filename=f"{index}.dcm",
+                        correlation_id=f"corr-{index}",
+                        status="send_error",
+                        attempts=7,
+                        last_error="CloudHttpError",
+                    )
+                )
+            db.commit()
+            unit_id, order_id = unit.id, order.id
+
+        page = self.client.get(f"/orders/{order_id}")
+        self.assertIn("Reenviar 2 imagem(ns) com falha de envio", page.text)
+        token = re.search(r'name="csrf_token" value="([^"]+)"', page.text)[1]
+        response = self.client.post(
+            f"/orders/{order_id}/resend-failed",
+            data={"csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            rows = {
+                row.filename: (row.status, row.attempts)
+                for row in db.scalars(select(ImageTransfer))
+            }
+        self.assertEqual(
+            rows,
+            {
+                "0.dcm": ("compressed", 0),
+                "1.dcm": ("compressed", 0),
+                "2.dcm": ("send_error", 7),
+            },
+        )
+        self.assertNotIn(
+            "com falha de envio", self.client.get(f"/orders/{order_id}").text
+        )
+
+        token = self.token(f"/units/{unit_id}")
+        response = self.client.post(
+            f"/units/{unit_id}/resend-failed",
+            data={"csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        with self.Session() as db:
+            self.assertEqual(
+                set(db.scalars(select(ImageTransfer.status))), {"compressed"}
+            )
+            audit = db.scalars(
+                select(AuditLog).where(AuditLog.action == "resend")
+            ).all()
+            self.assertEqual(len(audit), 2)
 
     def test_archiving_unit_preserves_unit_and_orders(self):
         self.login()

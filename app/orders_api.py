@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,12 +11,15 @@ from typing import Any
 import aiohttp
 
 from app.config import ORDERS_API_MAX_RETRIES, ORDERS_API_TIMEOUT_SECONDS
+from app.validation import validate_orders_api_company_id
 
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class OrdersApiError(RuntimeError):
-    pass
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class InvalidApiOrder(ValueError):
@@ -36,6 +40,7 @@ class AckResult:
     accession_number: str
     success: bool
     error: str = ""
+    http_status: int | None = None
 
 
 def _required_text(item: dict[str, Any], key: str, max_length: int) -> str:
@@ -48,9 +53,7 @@ def _required_text(item: dict[str, Any], key: str, max_length: int) -> str:
     if not text:
         raise InvalidApiOrder(f"campo obrigatório ausente: {key}")
     if len(text) > max_length:
-        raise InvalidApiOrder(
-            f"{key} excede o limite de {max_length} caracteres"
-        )
+        raise InvalidApiOrder(f"{key} excede o limite de {max_length} caracteres")
     return text
 
 
@@ -88,6 +91,7 @@ async def _request(
     **kwargs: Any,
 ) -> tuple[int, str]:
     last_error = "falha desconhecida"
+    last_status = None
     for attempt in range(1, ORDERS_API_MAX_RETRIES + 1):
         try:
             async with session.request(
@@ -101,13 +105,15 @@ async def _request(
                     return response.status, body
                 # O corpo pode conter dados clínicos; nunca o inclua no erro/log.
                 last_error = f"HTTP {response.status}"
+                last_status = response.status
                 if response.status not in RETRYABLE_STATUSES:
                     break
         except (aiohttp.ClientError, TimeoutError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            last_status = None
         if attempt < ORDERS_API_MAX_RETRIES:
-            await asyncio.sleep(1.5 * (2 ** (attempt - 1)))
-    raise OrdersApiError(last_error)
+            await asyncio.sleep(random.uniform(0, 1.5 * (2 ** (attempt - 1))))
+    raise OrdersApiError(last_error, last_status)
 
 
 async def fetch_orders(url: str, token: str) -> list[dict[str, Any]]:
@@ -130,6 +136,8 @@ async def acknowledge_orders(
     token: str,
     accessions: list[str],
     concurrency: int = 8,
+    *,
+    company_id: str,
 ) -> list[AckResult]:
     return [
         result
@@ -138,6 +146,7 @@ async def acknowledge_orders(
             token,
             accessions,
             concurrency,
+            company_id=company_id,
         )
     ]
 
@@ -147,10 +156,16 @@ async def iter_acknowledgements(
     token: str,
     accessions: list[str],
     concurrency: int = 8,
+    *,
+    company_id: str,
 ) -> AsyncIterator[AckResult]:
     """Yield bounded-concurrency ACK results as soon as each request finishes."""
     if not accessions:
         return
+    try:
+        company_id = validate_orders_api_company_id(company_id)
+    except ValueError as exc:
+        raise OrdersApiError(str(exc)) from exc
     endpoint = f"{url.rstrip('/')}/"
     timeout = aiohttp.ClientTimeout(total=ORDERS_API_TIMEOUT_SECONDS)
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -167,11 +182,11 @@ async def iter_acknowledgements(
                     endpoint,
                     token,
                     params={"accessionNumber": accession},
-                    json={"mirthReaded": True},
+                    json={"mirthReaded": True, "empresa_id": company_id},
                 )
                 return AckResult(accession, True)
             except OrdersApiError as exc:
-                return AckResult(accession, False, str(exc))
+                return AckResult(accession, False, str(exc), exc.status)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [

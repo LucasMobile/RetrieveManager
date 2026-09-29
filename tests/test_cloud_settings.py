@@ -38,7 +38,7 @@ class UnitCloudSettingsTest(DatabaseTestCase):
         _schedule_ack_job(pool, jobs, 7)
         self.assertEqual(pool.submit.call_count, 2)
 
-    def test_worker_uses_each_units_cloud_destination_and_zero_settle(self):
+    def test_worker_uses_each_units_cloud_destination(self):
         with self.Session() as db:
             db.add_all(
                 [
@@ -57,7 +57,6 @@ class UnitCloudSettingsTest(DatabaseTestCase):
                         error_dir="/error",
                         token="unit-token",
                         cloud_url="https://cloud.example/send",
-                        file_settle_seconds=0,
                     ),
                     make_unit(
                         name="Unidade B",
@@ -74,13 +73,10 @@ class UnitCloudSettingsTest(DatabaseTestCase):
                         error_dir="/error-b",
                         token="unit-token-b",
                         cloud_url="https://cloud-b.example/send",
-                        file_settle_seconds=9,
                     ),
                 ]
             )
             db.commit()
-
-        supervisor = MagicMock()
         pool = MagicMock()
         with (
             patch("app.worker.SessionLocal", self.Session),
@@ -91,17 +87,14 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             patch("app.worker.compact_unit"),
             patch("app.worker.send_unit") as send_unit,
         ):
-            _tick(supervisor, pool)
+            _tick(pool)
 
-        calls = {
-            (call.args[1].name, call.args[2], call.args[3])
-            for call in send_unit.call_args_list
-        }
+        calls = {(call.args[1].name, call.args[2]) for call in send_unit.call_args_list}
         self.assertEqual(
             calls,
             {
-                ("Unidade A", "https://cloud.example/send", 0),
-                ("Unidade B", "https://cloud-b.example/send", 9),
+                ("Unidade A", "https://cloud.example/send"),
+                ("Unidade B", "https://cloud-b.example/send"),
             },
         )
 
@@ -109,8 +102,6 @@ class UnitCloudSettingsTest(DatabaseTestCase):
         with self.Session() as db:
             db.add(make_unit(name="Unidade", enabled=True))
             db.commit()
-
-        supervisor = MagicMock()
         move_pool = MagicMock()
         ingest_pool = MagicMock()
         ingest_pool.submit.return_value = Future()
@@ -130,7 +121,6 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             ingest_jobs = {}
             for _ in range(2):
                 _tick(
-                    supervisor,
                     move_pool,
                     compact_pool=compact_pool,
                     compact_jobs={},
@@ -196,7 +186,6 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             if unit.name == "Unidade com falha":
                 raise RuntimeError("falha isolada")
 
-        supervisor = MagicMock()
         pool = MagicMock()
         with (
             patch("app.worker.SessionLocal", self.Session),
@@ -208,7 +197,7 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             patch("app.worker.compact_unit"),
             patch("app.worker.send_unit") as send_unit,
         ):
-            _tick(supervisor, pool)
+            _tick(pool)
 
         self.assertEqual(send_unit.call_count, 2)
 
