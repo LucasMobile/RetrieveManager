@@ -69,8 +69,6 @@ AUDIT_RESOURCE_LABELS = {
     "order": "Pedido",
     "dicom_rule": "Regra DICOM",
     "retrieve_rule": "Regra de retrieve",
-    "compress_rule": "Regra de compactação",
-    "drop_rule": "Regra de descarte",
     "user": "Usuário",
 }
 

@@ -52,14 +52,6 @@ class AuditLog(Base):
     ip_address: Mapped[str] = mapped_column(String(64), default="", nullable=False)
 
 
-class Settings(Base):
-    __tablename__ = "settings"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Campo legado consumido uma única vez pela migração para DicomRule.
-    drop_study_prefix: Mapped[str] = mapped_column(String(32), default="SLRX")
-
-
 class Unit(Base):
     __tablename__ = "units"
 
@@ -73,11 +65,6 @@ class Unit(Base):
     orders_api_company_id: Mapped[str] = mapped_column(
         String(64), default="", nullable=False
     )
-
-    # Mantidos apenas para que bancos SQLite de desenvolvimento já criados
-    # possam iniciar; não participam mais do cadastro nem do processamento.
-    input_dir: Mapped[str] = mapped_column(String(500), default="")
-    sent_dir: Mapped[str] = mapped_column(String(500), default="")
 
     pacs_aet: Mapped[str] = mapped_column(String(64), nullable=False)
     pacs_ip: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -149,21 +136,6 @@ class ModalityRule(Base):
     wait_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     second_retrieve: Mapped[bool] = mapped_column(Boolean, default=False)
     second_wait_minutes: Mapped[int] = mapped_column(Integer, default=90)
-
-
-class CompressRule(Base):
-    __tablename__ = "compress_rules"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    modality: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)
-    jpeg_flag: Mapped[str] = mapped_column(String(8), nullable=False)
-
-
-class DropModality(Base):
-    __tablename__ = "drop_modalities"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(8), unique=True, nullable=False)
 
 
 class UnitCompressionSettings(Base):
@@ -315,8 +287,6 @@ class Order(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
     source_id: Mapped[str] = mapped_column(String(64), default="")
-    # Compatibilidade física com o SQLite de desenvolvimento anterior.
-    filename: Mapped[str] = mapped_column(String(255), default="")
     pat_id: Mapped[str] = mapped_column(String(64), default="")
     acc: Mapped[str] = mapped_column(String(64), nullable=False)
     birth_date: Mapped[str] = mapped_column(String(16), nullable=False)

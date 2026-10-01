@@ -14,9 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
     DicomRule,
-    DicomRuleCondition,
     DicomRuleUnit,
-    Settings,
     Unit,
 )
 
@@ -37,7 +35,7 @@ ACTIONS = {
     "remove": "Remover tag",
 }
 VALUELESS_OPERATORS = frozenset({"exists", "not_exists"})
-LEGACY_RULE_KEY = "legacy_study_id_prefix"
+DEFAULT_STUDY_ID_RULE_KEY = "default_study_id_prefix"
 NON_TEXT_VRS = frozenset({"OB", "OD", "OF", "OL", "OV", "OW", "SQ", "UN"})
 # Rules may read these tags but never replace/remove them: they identify the
 # patient, study or instance (and drive order association), define the pixel
@@ -371,39 +369,9 @@ def apply_rule_specs(dataset: Dataset, rules: Iterable[RuleSpec]) -> RuleEvaluat
     return RuleEvaluation(False, modified, tuple(matches))
 
 
-def migrate_legacy_study_rule(db: Session) -> bool:
-    settings = db.get(Settings, 1)
-    if settings is None:
-        return False
-    prefix = (settings.drop_study_prefix or "").strip().upper()
-    if not prefix:
-        return False
-    units = list(
-        db.scalars(select(Unit).where(Unit.deleted_at.is_(None)).order_by(Unit.id))
-    )
-    if not units:
-        return False
-    existing = db.scalar(
-        select(DicomRule).where(DicomRule.system_key == LEGACY_RULE_KEY)
-    )
-    if existing is None:
-        existing = DicomRule(
-            name=f"Descartar Study ID {prefix}",
-            enabled=True,
-            priority=10,
-            combinator="and",
-            action="delete",
-            system_key=LEGACY_RULE_KEY,
-        )
-        existing.conditions.append(
-            DicomRuleCondition(
-                position=0,
-                tag="0020,0010",
-                operator="starts_with_digits",
-                value=prefix,
-            )
-        )
-        existing.unit_links.extend(DicomRuleUnit(unit_id=unit.id) for unit in units)
-        db.add(existing)
-    settings.drop_study_prefix = ""
-    return True
+def link_default_rules(db: Session, unit: Unit) -> None:
+    """New units start with the default rules (e.g. discard SLRX study IDs)."""
+    for rule in db.scalars(
+        select(DicomRule).where(DicomRule.system_key == DEFAULT_STUDY_ID_RULE_KEY)
+    ):
+        db.add(DicomRuleUnit(rule_id=rule.id, unit_id=unit.id))

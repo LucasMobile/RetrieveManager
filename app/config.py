@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+from sqlalchemy.engine import URL
 
 load_dotenv()
 
@@ -103,9 +104,22 @@ if IS_PRODUCTION:
             "RETRIEVE_ADMIN_PASSWORD deve ter entre 12 e 72 bytes em produção"
         )
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"sqlite:///{(DATA_DIR / 'retrieve.db').as_posix()}",
+# PostgreSQL is the only supported database. The connection is built from
+# its parts, so the password may contain @, :, / or any other character.
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "127.0.0.1").strip()
+POSTGRES_PORT = _env_int("POSTGRES_PORT", 5432)
+POSTGRES_DB = os.getenv("POSTGRES_DB", "retrieve").strip()
+POSTGRES_USER = os.getenv("POSTGRES_USER", "retrieve").strip()
+POSTGRES_PASSWORD = _read_secret("POSTGRES_PASSWORD", "")
+if not POSTGRES_PASSWORD:
+    raise RuntimeError("Defina POSTGRES_PASSWORD (ou POSTGRES_PASSWORD_FILE) no .env")
+DATABASE_URL = URL.create(
+    "postgresql+psycopg",
+    username=POSTGRES_USER,
+    password=POSTGRES_PASSWORD,
+    host=POSTGRES_HOST,
+    port=POSTGRES_PORT,
+    database=POSTGRES_DB,
 )
 
 WORKER_INTERVAL_SECONDS = _env_int("WORKER_INTERVAL_SECONDS", 5)

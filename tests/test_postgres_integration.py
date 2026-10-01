@@ -1,32 +1,21 @@
-import os
 import unittest
 from datetime import datetime
-from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import create_engine, inspect, select, text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app import db as db_module
 from app.models import Base, Order, UnitCompressionSettings, UnitCompressRule
-from tests.support import make_unit
+from tests.support import _postgres_test_url, make_unit
 
 
 class PostgreSQLRetrieveIntegrationTest(unittest.TestCase):
-    """Opt-in checks for the production database's locking/schema contract."""
+    """Checks for the database's locking and schema contract."""
 
     @classmethod
     def setUpClass(cls):
-        database_url = os.getenv("TEST_POSTGRES_URL", "").strip()
-        if not database_url:
-            raise unittest.SkipTest("TEST_POSTGRES_URL não configurada")
-        parsed = make_url(database_url)
-        if not parsed.drivername.startswith("postgresql"):
-            raise unittest.SkipTest("TEST_POSTGRES_URL não aponta para PostgreSQL")
-        if "test" not in (parsed.database or "").lower():
-            raise unittest.SkipTest("o nome do banco PostgreSQL deve conter 'test'")
+        database_url = _postgres_test_url()
 
         cls.schema = f"retrieve_test_{uuid4().hex}"
         cls.admin_engine = create_engine(database_url, pool_pre_ping=True)
@@ -57,29 +46,6 @@ class PostgreSQLRetrieveIntegrationTest(unittest.TestCase):
             index["name"] for index in inspect(self.engine).get_indexes("orders")
         }
         self.assertIn("ix_orders_unit_study_uid", order_indexes)
-
-    def test_company_id_migration_preserves_existing_units_and_is_repeatable(self):
-        with self.Session() as db:
-            unit = make_unit(name="Legacy company migration")
-            db.add(unit)
-            db.commit()
-            unit_id = unit.id
-        with self.engine.begin() as connection:
-            connection.execute(
-                text("ALTER TABLE units DROP COLUMN orders_api_company_id")
-            )
-        with (
-            patch.object(db_module, "engine", self.engine),
-            patch.object(db_module, "DATABASE_URL", "postgresql://test"),
-        ):
-            db_module._migrate_schema()
-            db_module._migrate_schema()
-        with self.engine.connect() as connection:
-            row = connection.execute(
-                text("SELECT name, orders_api_company_id FROM units WHERE id = :id"),
-                {"id": unit_id},
-            ).one()
-            self.assertEqual(tuple(row), ("Legacy company migration", ""))
 
     def test_compression_modality_is_unique_inside_each_unit(self):
         with self.Session() as db:
@@ -119,57 +85,6 @@ class PostgreSQLRetrieveIntegrationTest(unittest.TestCase):
             with self.assertRaises(IntegrityError):
                 db.commit()
             db.rollback()
-
-    def test_phase_migrations_upgrade_an_older_schema_repeatably(self):
-        with self.Session() as db:
-            unit = make_unit(name="Legacy phases migration", store_port=11140)
-            db.add(unit)
-            db.flush()
-            db.add(UnitCompressRule(unit_id=unit.id, modality="CR", jpeg_flag="+eb"))
-            db.add(UnitCompressionSettings(unit_id=unit.id, default_jpeg_flag="+e1"))
-            db.commit()
-            unit_id = unit.id
-        with self.engine.begin() as connection:
-            connection.execute(text("ALTER TABLE image_transfers DROP COLUMN sha256"))
-            connection.execute(
-                text(
-                    "ALTER TABLE units ADD COLUMN file_settle_seconds "
-                    "INTEGER NOT NULL DEFAULT 3"
-                )
-            )
-        with (
-            patch.object(db_module, "engine", self.engine),
-            patch.object(db_module, "DATABASE_URL", "postgresql://test"),
-        ):
-            for _ in range(2):
-                db_module._migrate_schema()
-                db_module._migrate_compression_profiles()
-
-        inspector = inspect(self.engine)
-        transfer_columns = {c["name"] for c in inspector.get_columns("image_transfers")}
-        unit_columns = {c["name"] for c in inspector.get_columns("units")}
-        self.assertIn("sha256", transfer_columns)
-        self.assertNotIn("file_settle_seconds", unit_columns)
-        with self.engine.connect() as connection:
-            self.assertEqual(
-                connection.scalar(
-                    text(
-                        "SELECT jpeg_flag FROM unit_compress_rules WHERE unit_id = :id"
-                    ),
-                    {"id": unit_id},
-                ),
-                "lossy",
-            )
-            self.assertEqual(
-                connection.scalar(
-                    text(
-                        "SELECT default_jpeg_flag FROM unit_compression_settings "
-                        "WHERE unit_id = :id"
-                    ),
-                    {"id": unit_id},
-                ),
-                "lossless",
-            )
 
     def test_skip_locked_prevents_two_workers_from_claiming_same_order(self):
         with self.Session() as db:

@@ -1,12 +1,11 @@
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from sqlalchemy import select
 
-from app.models import CompressRule, ModalityRule
-from app.routes.rules import rules_compress_delete, rules_retrieve_delete
+from app.models import ModalityRule
+from app.routes.rules import rules_retrieve_delete
 from app.rules import retrieve_rule_for, schedule_from_now
 from tests.support import DatabaseTestCase
 
@@ -35,8 +34,6 @@ class RulesTest(DatabaseTestCase):
                         second_retrieve=False,
                         second_wait_minutes=90,
                     ),
-                    CompressRule(modality="CT", jpeg_flag="lossless"),
-                    CompressRule(modality="*", jpeg_flag="lossless"),
                 ]
             )
             db.commit()
@@ -84,39 +81,6 @@ class RulesTest(DatabaseTestCase):
             self.assertEqual(response.status_code, 303)
             self.assertIsNotNone(db.get(ModalityRule, default.id))
             self.assertEqual(request.session["flash"]["kind"], "err")
-
-    def test_delete_specific_compression_rule_and_protect_default(self):
-        request = SimpleNamespace(session={})
-        user = SimpleNamespace(id=1)
-        with self.Session() as db:
-            ct = db.scalar(select(CompressRule).where(CompressRule.modality == "CT"))
-            default = db.scalar(
-                select(CompressRule).where(CompressRule.modality == "*")
-            )
-            assert ct is not None
-            assert default is not None
-
-            with patch("app.routes.rules.log_event") as log_event_mock:
-                response = rules_compress_delete(ct.id, request, db, user)
-
-            self.assertEqual(response.status_code, 303)
-            self.assertIsNone(db.get(CompressRule, ct.id))
-            log_event_mock.assert_called_once()
-            self.assertEqual(
-                log_event_mock.call_args.args[2], "compression_rule.delete"
-            )
-            self.assertEqual(log_event_mock.call_args.kwargs["modality"], "CT")
-
-            with patch("app.routes.rules.log_event") as log_event_mock:
-                response = rules_compress_delete(default.id, request, db, user)
-            self.assertEqual(response.status_code, 303)
-            self.assertIsNotNone(db.get(CompressRule, default.id))
-            self.assertEqual(request.session["flash"]["kind"], "err")
-            self.assertEqual(log_event_mock.call_args.kwargs["status"], "failure")
-            self.assertEqual(
-                log_event_mock.call_args.kwargs["error_type"],
-                "ProtectedDefaultRule",
-            )
 
 
 if __name__ == "__main__":

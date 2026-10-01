@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from app.compression import (
     compression_form_for_unit,
     compression_modalities_for_form,
-    legacy_unit_compression_form,
+    default_unit_compression_form,
     save_unit_compression_settings,
     validate_unit_compression_form,
 )
@@ -30,7 +30,7 @@ from app.config import (
 from app.db import get_db
 from app.dicom_net import PacsNode, echo
 from app.dicom_rules import (
-    migrate_legacy_study_rule,
+    link_default_rules,
 )
 from app.models import (
     ImageTransfer,
@@ -105,7 +105,7 @@ def units_list(
 def units_new(
     request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
-    compression_settings = legacy_unit_compression_form(db)
+    compression_settings = default_unit_compression_form()
     return templates.TemplateResponse(
         request=request,
         name="units_form.html",
@@ -193,7 +193,7 @@ async def units_create(
     try:
         db.flush()
         save_unit_compression_settings(db, unit, compression_settings)
-        migrate_legacy_study_rule(db)
+        link_default_rules(db, unit)
         audit(
             db,
             request,

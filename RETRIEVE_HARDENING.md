@@ -96,7 +96,7 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - o charset declarado é preservado; `ISO_IR 100` só é gravado quando o
      arquivo não declara charset ou declara ASCII;
    - regras não podem alterar tags de identidade, pixel ou do sistema; regras
-     antigas nessas tags não são carregadas;
+     nessas tags não são executadas;
    - pixel data que já chega comprimido é preservado sem recompressão (só os
      metadados são regravados);
    - o codec JPEG 2000 roda em processo isolado e nunca altera o SOP Instance

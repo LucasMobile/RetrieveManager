@@ -293,7 +293,6 @@ def ingest_unit(db: Session, unit: Unit) -> int:
                 order = Order(
                     unit_id=unit.id,
                     source_id=parsed.source_id,
-                    filename=parsed.accession_number,
                     pat_id=parsed.patient_id,
                     acc=parsed.accession_number,
                     birth_date=parsed.patient_birthdate,
