@@ -7,9 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 from starlette.testclient import TestClient
 
@@ -20,14 +19,12 @@ from app.main import app
 from app.middleware import _same_origin
 from app.models import (
     AuditLog,
-    Base,
     DicomInstance,
     DicomRule,
     DicomStudy,
     ImageTransfer,
     ManualMoveRequest,
     Order,
-    Settings,
     Unit,
     UnitCompressRule,
     UnitDropModality,
@@ -40,6 +37,7 @@ from app.rate_limit import (
 )
 from app.security import hash_password, verify_password
 from app.validation import validate_cloud_url
+from tests.support import postgres_test_engine
 
 
 class SecurityTest(unittest.TestCase):
@@ -50,12 +48,7 @@ class SecurityTest(unittest.TestCase):
 
     def setUp(self):
         reset_rate_limiters()
-        self.engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(self.engine)
+        self.engine = postgres_test_engine(self)
         self.Session = sessionmaker(self.engine)
         with self.Session() as db:
             db.add(
@@ -65,7 +58,6 @@ class SecurityTest(unittest.TestCase):
                     role="admin",
                 )
             )
-            db.add(Settings(id=1))
             db.commit()
 
         def database():
@@ -569,7 +561,6 @@ class SecurityTest(unittest.TestCase):
             "/units/new",
             "/rules",
             "/rules/retrieve",
-            "/rules/compress",
             "/users",
             "/logs",
             "/orders/history",
@@ -581,7 +572,6 @@ class SecurityTest(unittest.TestCase):
         token = self.token("/")
         for path in (
             "/units/1/toggle",
-            "/rules/drop",
             "/orders/1/retry",
             "/orders/1/cancel",
             "/orders/1/delete",
@@ -1404,13 +1394,15 @@ class ProductionConfigTest(unittest.TestCase):
             "RETRIEVE_ADMIN_PASSWORD": "test-password-123",
             "ALLOW_HTTP_FOR_TESTS": "true",
             "PUBLIC_ORIGIN": "",
-            "DATABASE_URL": "sqlite:///:memory:",
+            # Never contacted: the script below does not touch the database.
+            "POSTGRES_PASSWORD": "not-used",
             "LOG_LEVEL": "CRITICAL",
         }
         for key in (
             "SESSION_HTTPS_ONLY",
             "SECRET_KEY_FILE",
             "RETRIEVE_ADMIN_PASSWORD_FILE",
+            "POSTGRES_PASSWORD_FILE",
         ):
             environment.pop(key, None)
         script = """

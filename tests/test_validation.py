@@ -3,7 +3,6 @@ import unittest
 from app.config import BASE_DIR, store_bind_port
 from app.validation import (
     validate_cloud_url,
-    validate_jpeg_flag,
     validate_unit_form,
 )
 
@@ -70,8 +69,6 @@ class ValidationTest(unittest.TestCase):
                     )
 
     def test_rejects_unsafe_values(self):
-        with self.assertRaises(ValueError):
-            validate_jpeg_flag("--arbitrary-option")
         with self.assertRaises(ValueError):
             validate_cloud_url("http://169.254.169.254/latest/meta-data")
 

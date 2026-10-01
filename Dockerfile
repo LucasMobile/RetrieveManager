@@ -27,7 +27,6 @@ COPY --from=python-builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \
     TZ=America/Sao_Paulo \
     DATA_DIR=/data \
-    DATABASE_URL=sqlite:////data/retrieve.db \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 

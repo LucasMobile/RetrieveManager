@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from pydicom.dataset import Dataset
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.dicom_net import (
@@ -20,12 +20,12 @@ from app.dicom_net import (
     move_study,
     prior_series_query,
 )
-from app.models import Base, DicomInstance, Order, OrderEvent, Unit
+from app.models import DicomInstance, Order, OrderEvent, Unit
 from app.parse import study_response
 from app.pipeline.move import _run_move
 from app.receiver import Receiver
 from tests.fake_pacs import FakePacs, free_port
-from tests.support import make_unit
+from tests.support import make_unit, postgres_test_engine
 from tests.test_receiver import ct_image
 
 STUDY = "1.2.826.0.1.3680043.10.1"
@@ -54,11 +54,7 @@ class PacsReceiverFixture:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.receive_dir = root / "receive"
-        self.engine = create_engine(
-            f"sqlite:///{(root / 'net.db').as_posix()}",
-            connect_args={"check_same_thread": False, "timeout": 10},
-        )
-        Base.metadata.create_all(self.engine)
+        self.engine = postgres_test_engine(self)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.receiver_port = free_port()
         self.unit = make_unit(

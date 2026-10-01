@@ -18,7 +18,6 @@ _HOSTNAME = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 _MODALITY = re.compile(r"^(?:\*|[A-Z0-9]{1,8})$")
-_JPEG_FLAGS = frozenset({"lossless", "lossy"})
 
 
 def bounded_int(
@@ -327,10 +326,3 @@ def validate_modality(value: str) -> str:
     if not _MODALITY.fullmatch(modality):
         raise ValueError("Modalidade inválida")
     return modality
-
-
-def validate_jpeg_flag(value: str) -> str:
-    flag = value.strip()
-    if flag not in _JPEG_FLAGS:
-        raise ValueError("Perfil de compactação inválido")
-    return flag

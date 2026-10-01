@@ -13,17 +13,17 @@ from pydicom.uid import (
     SecondaryCaptureImageStorage,
     generate_uid,
 )
-from sqlalchemy import select
 
 from app.codec_worker import CodecTimeout
 from app.compaction import file_sha256
 from app.dicom_rules import (
+    DEFAULT_STUDY_ID_RULE_KEY,
     RuleConditionSpec,
     RuleSpec,
     apply_rule_specs,
     condition_matches,
+    link_default_rules,
     load_rule_specs,
-    migrate_legacy_study_rule,
     normalize_dicom_tag,
     validate_rule_payload,
 )
@@ -31,7 +31,6 @@ from app.models import (
     DicomRule,
     DicomRuleCondition,
     DicomRuleUnit,
-    Settings,
     Unit,
 )
 from app.pipeline.compact import _compact_one
@@ -395,6 +394,24 @@ class DicomRulesTest(DatabaseTestCase):
             self.assertEqual(saved.InstitutionName, "Mobilemed")
             self.assertEqual(saved.file_meta.TransferSyntaxUID, JPEGLosslessSV1)
 
+    def test_new_units_get_the_default_study_id_rule(self):
+        with self.Session() as db:
+            rule = DicomRule(
+                name="Descartar Study ID SLRX",
+                action="delete",
+                system_key=DEFAULT_STUDY_ID_RULE_KEY,
+            )
+            db.add(rule)
+            unit = make_unit(name="nova")
+            db.add(unit)
+            db.flush()
+            link_default_rules(db, unit)
+            db.commit()
+            self.assertEqual(
+                [link.unit_id for link in db.get(DicomRule, rule.id).unit_links],
+                [unit.id],
+            )
+
     def test_payload_validates_units_conditions_and_action_tag(self):
         payload = validate_rule_payload(
             name="Normalizar instituição",
@@ -501,31 +518,6 @@ class DicomRulesTest(DatabaseTestCase):
                 ["Prioridade alta", "Prioridade baixa"],
             )
             self.assertEqual(load_rule_specs(db, second.id), ())
-
-    def test_legacy_setting_is_migrated_to_all_existing_units(self):
-        with self.Session() as db:
-            db.add(
-                Settings(
-                    id=1,
-                    drop_study_prefix="SLRX",
-                )
-            )
-            db.add_all([self._unit("A"), self._unit("B")])
-            db.commit()
-
-            self.assertTrue(migrate_legacy_study_rule(db))
-            db.commit()
-
-            migrated = db.scalar(select(DicomRule))
-            self.assertEqual(migrated.action, "delete")
-            self.assertEqual(migrated.conditions[0].tag, "0020,0010")
-            self.assertEqual(
-                migrated.conditions[0].operator,
-                "starts_with_digits",
-            )
-            self.assertEqual(len(migrated.unit_links), 2)
-            self.assertEqual(db.get(Settings, 1).drop_study_prefix, "")
-            self.assertFalse(migrate_legacy_study_rule(db))
 
 
 if __name__ == "__main__":

@@ -487,14 +487,12 @@ def _register_store_received_order(
 
     study_uid = bounded_db_text(result.study_uid, 128)
     accession = bounded_db_text(result.accession, 64)
-    bind = db.get_bind()
-    if bind.dialect.name == "postgresql":
-        # Results from the compression pool are persisted serially today, but
-        # this database lock keeps the invariant if more workers are deployed.
-        db.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-            {"key": f"storescp:{unit.id}:{study_uid}"},
-        )
+    # Results from the compression pool are persisted serially today, but this
+    # database lock keeps the invariant if more workers are deployed.
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"storescp:{unit.id}:{study_uid}"},
+    )
     order = db.scalar(
         select(Order)
         .where(Order.unit_id == unit.id, Order.study_uid == study_uid)
@@ -522,7 +520,6 @@ def _register_store_received_order(
                 f"storescp:{unit.id}:{accession}",
                 64,
             ),
-            filename=accession,
             pat_id=bounded_db_text(result.patient_id, 64),
             acc=accession,
             birth_date=bounded_db_text(result.birth_date, 16),

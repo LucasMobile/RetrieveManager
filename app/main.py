@@ -111,8 +111,6 @@ async def _request_validation_error(request: Request, exc: RequestValidationErro
             "/account/password": "/account/password",
             "/users/new": "/users/new",
             "/rules/retrieve": "/rules/retrieve",
-            "/rules/compress": "/rules/compress",
-            "/rules/drop": "/rules/compress",
             "/rules": "/rules",
             "/login": "/login",
         }.get(request.url.path, "/"),

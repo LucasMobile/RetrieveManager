@@ -16,7 +16,12 @@ env:
   APP_ENV: development
   SESSION_HTTPS_ONLY: "false"
   PUBLIC_ORIGIN: ""
-  DATABASE_URL: "sqlite:///:memory:"
+  # Same settings as the app; each database test gets its own schema.
+  POSTGRES_HOST: 127.0.0.1
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: retrieve_test
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: ci-only-password
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
@@ -32,12 +37,7 @@ jobs:
       - run: ruff format --check app tests
 
   tests:
-    name: tests (${{ matrix.database }})
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        database: [sqlite, postgresql]
     services:
       postgres:
         image: postgres:18
@@ -61,11 +61,7 @@ jobs:
             requirements.txt
             requirements-dev.txt
       - run: pip install -r requirements-dev.txt
-      - name: Run tests
-        env:
-          # Each database test gets its own throwaway schema (tests/support.py).
-          TEST_POSTGRES_URL: ${{ matrix.database == 'postgresql' && 'postgresql+psycopg://postgres:ci-only-password@127.0.0.1:5432/retrieve_test' || '' }}
-        run: python -m unittest discover -s tests -q
+      - run: python -m unittest discover -s tests -q
 
   image:
     runs-on: ubuntu-latest
@@ -74,7 +70,8 @@ jobs:
       - run: docker build -t retrieve-manager:ci .
       - name: Codec works inside the image
         run: >-
-          docker run --rm retrieve-manager:ci python -c
+          docker run --rm -e POSTGRES_PASSWORD=not-used
+          retrieve-manager:ci python -c
           "import numpy, pydicom, pynetdicom, openjpeg, psycopg;
           from app.codec import encode, PROFILE_LOSSLESS;
           print('ok')"

@@ -5,10 +5,8 @@ from dataclasses import dataclass
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.codec import PROFILE_LOSSLESS, PROFILES
+from app.codec import PROFILE_LOSSLESS, PROFILE_LOSSY, PROFILES
 from app.models import (
-    CompressRule,
-    DropModality,
     Unit,
     UnitCompressionSettings,
     UnitCompressRule,
@@ -135,27 +133,15 @@ def save_unit_compression_settings(
     )
 
 
-def migrate_legacy_unit_compression(db: Session) -> None:
-    """Clone the former global configuration once for every existing unit."""
-    settings = legacy_unit_compression_form(db)
-    configured_units = set(db.scalars(select(UnitCompressionSettings.unit_id)))
-    for unit in db.scalars(select(Unit)):
-        if unit.id not in configured_units:
-            save_unit_compression_settings(db, unit, settings)
+# Starting point for a new unit's form; each unit is configured on its own.
+DEFAULT_LOSSY_MODALITIES = frozenset({"CR", "DX", "MG", "OT", "XA"})
+DEFAULT_DROP_MODALITIES = frozenset({"PR", "PS", "SG", "SR", "RA", "US"})
 
 
-def legacy_unit_compression_form(db: Session) -> UnitCompressionForm:
-    """Return safe defaults for migration and newly-created units."""
-    legacy_drops = {row.code.upper() for row in db.scalars(select(DropModality))}
-    legacy_profiles = {name: set() for name in PROFILES}
-    for row in db.scalars(select(CompressRule)):
-        if row.modality == "*" or row.modality.upper() in legacy_drops:
-            continue
-        if row.jpeg_flag in legacy_profiles:
-            legacy_profiles[row.jpeg_flag].add(row.modality.upper())
+def default_unit_compression_form() -> UnitCompressionForm:
     return UnitCompressionForm(
-        {name: frozenset(values) for name, values in legacy_profiles.items()},
-        frozenset(legacy_drops),
+        {PROFILE_LOSSLESS: frozenset(), PROFILE_LOSSY: DEFAULT_LOSSY_MODALITIES},
+        DEFAULT_DROP_MODALITIES,
     )
 
 

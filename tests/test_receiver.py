@@ -15,17 +15,17 @@ from pydicom.uid import (
     generate_uid,
 )
 from pynetdicom import AE
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
-from app.models import Base, DicomInstance, DicomStudy
+from app.models import DicomInstance, DicomStudy
 from app.receiver import (
     STATUS_CANNOT_UNDERSTAND,
     STATUS_OUT_OF_RESOURCES,
     STATUS_SUCCESS,
     Receiver,
 )
-from tests.support import make_unit
+from tests.support import make_unit, postgres_test_engine
 
 
 def free_port() -> int:
@@ -72,13 +72,8 @@ class ReceiverTest(unittest.TestCase):
         root = Path(self.tmp.name)
         self.receive_dir = root / "receive"
         self.error_dir = root / "error"
-        # File database: the writer thread and handler threads use their own
-        # connections, as with PostgreSQL in production.
-        self.engine = create_engine(
-            f"sqlite:///{(root / 'receiver.db').as_posix()}",
-            connect_args={"check_same_thread": False, "timeout": 10},
-        )
-        Base.metadata.create_all(self.engine)
+        # The writer thread and handler threads use their own connections.
+        self.engine = postgres_test_engine(self)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.port = free_port()
         self.unit = make_unit(

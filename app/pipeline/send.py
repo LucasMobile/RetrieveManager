@@ -226,7 +226,7 @@ async def _stream_uploads(
     buffered_at = monotonic()
 
     def persist_results(results: list[SendResult]) -> tuple[int, int]:
-        # Runs in a writer thread on PostgreSQL. Never pass the caller's Session
+        # Runs in a writer thread. Never pass the caller's Session
         # or ORM instances across threads; keep HTTP's event loop responsive.
         with Session(bind=bind, expire_on_commit=False) as result_db:
             return _record_send_results(
@@ -238,11 +238,7 @@ async def _stream_uploads(
         buffer.clear()
         for offset in range(0, len(results), chunk_size):
             chunk = results[offset : offset + chunk_size]
-            if bind.dialect.name == "sqlite":
-                # Development in-memory SQLite belongs to the event-loop thread.
-                failures, successes = persist_results(chunk)
-            else:
-                failures, successes = await asyncio.to_thread(persist_results, chunk)
+            failures, successes = await asyncio.to_thread(persist_results, chunk)
             _update_send_circuit(unit_id, circuit, failures, len(chunk))
             totals["files"] += len(chunk)
             totals["failure"] += failures

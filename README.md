@@ -45,12 +45,10 @@ obrigatório. Todos os PUTs de confirmação enviam `mirthReaded` e `empresa_id`
 corpo JSON, com o Token de Integração da respectiva unidade no header `token`.
 O Token da unidade usado no DICOM é uma configuração separada.
 
-Ao atualizar uma instalação existente, a migração adiciona o campo no SQLite e
-no PostgreSQL sem presumir a empresa das unidades antigas. Preencha Empresa ID
-em cada cadastro antes de liberar suas confirmações: São Cristóvão (posto 25),
-`1582`; CDB (posto 48), `4232`. Enquanto o campo estiver vazio ou inválido, os
-pedidos continuam sendo lidos e persistidos, mas seus PUTs ficam bloqueados e
-pendentes de confirmação. A lista de unidades sinaliza o cadastro incompleto.
+Valores conhecidos: São Cristóvão (posto 25), `1582`; CDB (posto 48), `4232`.
+Enquanto o campo estiver vazio ou inválido, os pedidos continuam sendo lidos e
+persistidos, mas seus PUTs ficam bloqueados e pendentes de confirmação. A lista
+de unidades sinaliza o cadastro incompleto.
 
 ## Subir no Linux
 
@@ -67,8 +65,11 @@ e `worker`. Os dados do banco ficam no volume `postgres-data`; o volume
 `retrieve-data` continua reservado aos dados locais da aplicação. Não remova o
 volume do PostgreSQL ao recriar os containers.
 
-Como o projeto ainda está em desenvolvimento, o banco PostgreSQL começa vazio e
-nenhum arquivo SQLite antigo é importado automaticamente.
+O PostgreSQL é o único banco suportado. A conexão é montada a partir de
+`POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` e
+`POSTGRES_PASSWORD` (ou `POSTGRES_PASSWORD_FILE`), as mesmas variáveis do
+container do banco; a senha pode conter `@`, `:`, `/` ou qualquer caractere, sem
+codificação. No Compose, `POSTGRES_HOST` já aponta para o serviço `postgres`.
 
 ### Servidor sem acesso ao Docker Hub
 
@@ -220,10 +221,14 @@ dcm4che e sem binário no host. A imagem usa Python 3.14, pydicom 3.0.2 e aiohtt
 
 ## Desenvolvimento (Windows / sem Docker)
 
+Suba um PostgreSQL local (por exemplo `docker compose up -d postgres`, ou um
+container avulso) e informe a senha dele:
+
 ```powershell
 cd Documents\retrieve-manager
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
+$env:POSTGRES_PASSWORD = "<senha>"
 .\.venv\Scripts\python -m uvicorn app.main:app --reload --port 8080
 ```
 
@@ -239,32 +244,28 @@ Receptor DICOM (outro terminal):
 .\.venv\Scripts\python -m app.receiver
 ```
 
-Testes (incluindo sessões, CSRF e headers HTTP, com banco isolado):
+A compactação não depende de binários externos: basta o `requirements.txt`.
+
+Testes (sessões, CSRF, headers HTTP, receptor, PACS de teste): usam as mesmas
+variáveis `POSTGRES_*`, apontando para um PostgreSQL descartável cujo banco tenha
+`test` no nome. Cada teste cria e apaga o próprio schema:
 
 ```powershell
 .\.venv\Scripts\pip install -r requirements-dev.txt
+docker run -d --name retrieve-pg-test -e POSTGRES_PASSWORD=<senha> -e POSTGRES_DB=retrieve_test -p 127.0.0.1:55432:5432 postgres:18
 $env:APP_ENV = "development"
 $env:SESSION_HTTPS_ONLY = "false"
 $env:PUBLIC_ORIGIN = ""
-$env:DATABASE_URL = "sqlite:///:memory:"
-.\.venv\Scripts\python -m unittest discover -s tests -q
-```
-
-A compactação não depende de binários externos: basta o `requirements.txt`.
-
-Para rodar a mesma suíte no PostgreSQL, suba um banco descartável e aponte
-`TEST_POSTGRES_URL` para ele (o nome do banco precisa conter `test`). Cada teste
-de banco cria e apaga o próprio schema:
-
-```powershell
-docker run -d --name retrieve-pg-test -e POSTGRES_PASSWORD=<senha> -e POSTGRES_DB=retrieve_test -p 127.0.0.1:55432:5432 postgres:18
-$env:TEST_POSTGRES_URL = "postgresql+psycopg://postgres:<senha>@127.0.0.1:55432/retrieve_test"
+$env:POSTGRES_PORT = "55432"
+$env:POSTGRES_DB = "retrieve_test"
+$env:POSTGRES_USER = "postgres"
+$env:POSTGRES_PASSWORD = "<senha>"
 .\.venv\Scripts\python -m unittest discover -s tests -q
 docker rm -f retrieve-pg-test
 ```
 
-O GitHub Actions (`.github/workflows/ci.yml`) roda o ruff, a suíte em SQLite e
-em PostgreSQL 18 e o build da imagem a cada push na `main` e em pull requests.
+O GitHub Actions (`.github/workflows/ci.yml`) roda o ruff, a suíte em PostgreSQL
+18 e o build da imagem a cada push na `main` e em pull requests.
 
 ## Retenção e desempenho dos pedidos
 
@@ -356,8 +357,8 @@ se houver proxy de porta (userland-proxy, Docker Desktop, balanceador) o recepto
 pode ver o IP do gateway — confira o `peer_ip` no log da primeira associação
 antes de restringir. O firewall do host continua sendo a primeira barreira.
 
-Arquivos que aparecem na pasta de recebimento sem registro no banco (sobras do
-`storescp` antigo, arquivos devolvidos por **Reprocessar erros**) são adotados pelo
+Arquivos que aparecem na pasta de recebimento sem registro no banco (por
+exemplo, devolvidos por **Reprocessar erros**) são adotados pelo
 worker depois de `RECEIVE_ADOPT_MIN_AGE_SECONDS` (60 s) e seguem o mesmo fluxo;
 uma instância que falhou na compactação volta para a fila quando o mesmo conteúdo
 chega de novo.
@@ -368,9 +369,10 @@ tomossíntese ou multiframe muito grande, reduza `RECEIVER_MAX_ASSOCIATIONS`.
 
 ## Recriar o banco de desenvolvimento
 
-Esta versão altera diretamente o schema de desenvolvimento e não inclui migração
-de bancos anteriores. Antes de iniciar a versão atualizada, descarte o banco ou o
-volume antigo somente se os dados de desenvolvimento puderem ser perdidos.
+O banco é criado do zero na primeira inicialização (tabelas, índices, usuário
+administrador, tempos de retrieve e a regra padrão **Descartar Study ID SLRX**).
+Não há migração de bancos anteriores: ao trocar de versão durante o
+desenvolvimento, descarte o banco ou o volume antigo.
 
 No Docker, `docker compose down -v` remove o volume `retrieve-data`. No ambiente
 local, remova `data/retrieve.db`. A próxima inicialização cria o schema novo e a
@@ -456,13 +458,12 @@ consegue comprimir. Se o codec cair ou estourar o tempo duas vezes, uma última
 tentativa grava a imagem sem recompressão; só se ela também falhar a origem vai
 para a pasta de erro. Uma modalidade pode
 pertencer a somente um perfil; modalidades sem perfil explícito usam Lossless.
-Os antigos perfis do DCMTK são migrados na inicialização: `+e1` vira Lossless
-e `+eb`/`+ee` viram Lossy. O descarte tem precedência e remove a
-modalidade de qualquer perfil de compactação.
+O descarte tem precedência e remove a modalidade de qualquer perfil de
+compactação.
 
-Na primeira inicialização após a atualização, as antigas regras globais são
-copiadas para todas as unidades existentes. Novas unidades começam com esses
-mesmos padrões e podem ser configuradas independentemente.
+Uma unidade nova começa com CR, DX, MG, OT e XA em Lossy, o descarte de PR, PS,
+SG, SR, RA e US e a regra padrão **Descartar Study ID SLRX**; tudo pode ser
+alterado no cadastro de cada unidade.
 
 ## Regras DICOM
 
@@ -483,9 +484,9 @@ ou são gerenciadas pelo sistema: `SpecificCharacterSet`, `SOPClassUID`,
 `SOPInstanceUID`, `AccessionNumber`, o token da unidade (`0008,1040`),
 `PatientName`, `PatientID`, `IssuerOfPatientID`, `PatientBirthDate`,
 `StudyInstanceUID`, `SeriesInstanceUID`, `FrameOfReferenceUID` e os grupos
-`0002` (meta), `0028` (módulo de pixel) e `7FE0` (Pixel Data). Regras antigas que
-alteram uma dessas tags não são executadas e aparecem na tela com o aviso
-**Ignorada: tag protegida**; edite ou exclua a regra.
+`0002` (meta), `0028` (módulo de pixel) e `7FE0` (Pixel Data). A tela não aceita
+regras nessas tags e, por segurança, o worker também não executa uma regra que
+as altere (ela aparece com o aviso **Ignorada: tag protegida**).
 
 O charset declarado pelo equipamento é preservado. Apenas quando o arquivo não
 declara `SpecificCharacterSet` (ou declara ASCII) o sistema grava `ISO_IR 100`,
