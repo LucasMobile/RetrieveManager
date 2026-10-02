@@ -6,13 +6,13 @@
 <div class="page-stack units-page">
   <header class="page-header">
     <div class="page-header__copy">
-      <p class="eyebrow">Cadastro</p>
+      <p class="eyebrow">Operação</p>
       <h1>Unidades</h1>
       <p class="page-header__description">Gerencie a API de pedidos, as conexões PACS e o recebimento de cada unidade.</p>
     </div>
-    <div class="page-header__actions">
+    {% if summary.total %}<div class="page-header__actions">
       <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
-    </div>
+    </div>{% endif %}
   </header>
 
   <section class="units-summary summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das unidades">
@@ -86,9 +86,9 @@
               </span>
             </td>
             <td>
-              <span class="table-primary mono units-table__path">{{ u.orders_api_url }}</span>
+              <span class="table-primary units-table__path">{{ u.orders_api_url }}</span>
               <span class="table-secondary">{% if u.orders_api_company_id %}Empresa ID {{ u.orders_api_company_id }}{% else %}Empresa ID pendente · confirmação de leitura bloqueada{% endif %}</span>
-              <span class="table-secondary">{% if u.orders_api_station_id %}ID Posto {{ u.orders_api_station_id }}{% else %}Todos os postos liberados pelo token{% endif %} · Histórico {{ 'ativo' if u.retrieve_prior_enabled else 'inativo' }}</span>
+              <span class="table-secondary">{% if u.orders_api_station_id %}ID Posto {{ u.orders_api_station_id }}{% else %}Todos os postos liberados pelo token{% endif %} · Histórico {% if u.retrieve_prior_enabled %}{% set prior_codes = u.prior_modalities | map(attribute='code') | list %}ativo · {{ 'todas as modalidades' if not prior_codes or 'ALL' in prior_codes else prior_codes | join(', ') }}{% else %}inativo{% endif %}</span>
             </td>
             <td>
               <div class="table-actions units-table__actions">
@@ -99,7 +99,7 @@
                 </form>
                 <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Arquivar a unidade {{ u.name }}? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
         {{ csrf_input(request) }}
-                  <button class="action-icon action-icon--danger" type="submit" data-tooltip="Arquivar unidade" aria-label="Arquivar unidade">{{ icon("trash") }}</button>
+                  <button class="action-icon" type="submit" data-tooltip="Arquivar unidade" aria-label="Arquivar unidade">{{ icon("archive") }}</button>
                 </form>
               </div>
             </td>

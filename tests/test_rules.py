@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.models import ModalityRule
 from app.routes.rules import rules_retrieve_delete
-from app.rules import retrieve_rule_for, schedule_from_now
+from app.rules import monitor_plan_for, retrieve_rule_for, schedule_from_now
 from tests.support import DatabaseTestCase
 
 
@@ -19,20 +19,19 @@ class RulesTest(DatabaseTestCase):
                     ModalityRule(
                         modality="CT",
                         wait_minutes=15,
-                        second_retrieve=True,
-                        second_wait_minutes=90,
+                        monitor_enabled=True,
                     ),
                     ModalityRule(
                         modality="MR",
                         wait_minutes=15,
-                        second_retrieve=True,
-                        second_wait_minutes=90,
+                        monitor_enabled=True,
+                        monitor_interval_minutes=10,
+                        monitor_max_hours=12,
                     ),
                     ModalityRule(
                         modality="*",
                         wait_minutes=10,
-                        second_retrieve=False,
-                        second_wait_minutes=90,
+                        monitor_enabled=False,
                     ),
                 ]
             )
@@ -43,24 +42,28 @@ class RulesTest(DatabaseTestCase):
             ct = retrieve_rule_for(db, "CT")
             cr = retrieve_rule_for(db, "CR")
             self.assertEqual(ct.wait_minutes, 15)
-            self.assertTrue(ct.second_retrieve)
+            self.assertTrue(ct.monitor_enabled)
             self.assertEqual(cr.wait_minutes, 10)
-            self.assertFalse(cr.second_retrieve)
+            self.assertFalse(cr.monitor_enabled)
 
     def test_schedule_minutes(self):
         with self.Session() as db:
-            _mod, first, second = schedule_from_now(db, "MR")
+            _mod, first = schedule_from_now(db, "MR")
             delta = first - datetime.now()
             self.assertAlmostEqual(delta.total_seconds() / 60, 15, delta=0.2)
-            assert second is not None
-            self.assertAlmostEqual(
-                (second - datetime.now()).total_seconds() / 60, 90, delta=0.2
-            )
-            _mod, first, second = schedule_from_now(db, "DX")
-            self.assertIsNone(second)
+            _mod, first = schedule_from_now(db, "DX")
             self.assertAlmostEqual(
                 (first - datetime.now()).total_seconds() / 60, 10, delta=0.2
             )
+
+    def test_monitor_plan_per_modality(self):
+        with self.Session() as db:
+            ct = monitor_plan_for(db, "CT")
+            mr = monitor_plan_for(db, "MR")
+            assert ct is not None and mr is not None
+            self.assertEqual((ct.interval_minutes, ct.max_hours), (5, 6))
+            self.assertEqual((mr.interval_minutes, mr.max_hours), (10, 12))
+            self.assertIsNone(monitor_plan_for(db, "DX"))
 
     def test_delete_specific_rule_and_protect_default(self):
         request = SimpleNamespace(session={})

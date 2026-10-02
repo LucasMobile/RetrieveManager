@@ -18,6 +18,7 @@ from app.models import (
     ModalityRule,
     Order,
     OrderEvent,
+    UnitPriorModality,
 )
 from app.pipeline.records import _record_compact_result
 from app.pipeline.send import CircuitState, SendResult, _record_send_results
@@ -28,18 +29,8 @@ class TransferTrackingTest(DatabaseTestCase):
     def _add_retrieve_rules(self, db) -> None:
         db.add_all(
             [
-                ModalityRule(
-                    modality="CT",
-                    wait_minutes=15,
-                    second_retrieve=True,
-                    second_wait_minutes=90,
-                ),
-                ModalityRule(
-                    modality="*",
-                    wait_minutes=10,
-                    second_retrieve=False,
-                    second_wait_minutes=90,
-                ),
+                ModalityRule(modality="CT", wait_minutes=10, monitor_enabled=True),
+                ModalityRule(modality="*", wait_minutes=10, monitor_enabled=False),
             ]
         )
         db.flush()
@@ -353,7 +344,7 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertIsNotNone(link)
             self.assertEqual(link.historical_study_id, study.id)
 
-    def test_unsolicited_study_creates_one_order_waiting_for_second_retrieve(self):
+    def test_unsolicited_study_creates_one_monitored_order(self):
         with self.Session() as db:
             unit = make_unit(name="unit")
             db.add(unit)
@@ -384,9 +375,15 @@ class TransferTrackingTest(DatabaseTestCase):
             orders = list(db.scalars(select(Order)))
             self.assertEqual(len(orders), 1)
             order = orders[0]
-            self.assertEqual(order.status, "wait_second")
+            self.assertEqual(order.status, "monitoring")
             self.assertIsNone(order.retrieve_at)
-            self.assertIsNotNone(order.second_retrieve_at)
+            self.assertIsNone(order.done_at)
+            self.assertAlmostEqual(
+                (order.monitor_until - observed_at).total_seconds() / 3600,
+                6,
+                delta=0.01,
+            )
+            self.assertIsNotNone(order.monitor_next_at)
             self.assertEqual(order.study_uid, "1.2.unsolicited")
             self.assertEqual(order.acc, "ACC-DIRECT")
             self.assertEqual(order.pat_id, "123456")
@@ -418,7 +415,7 @@ class TransferTrackingTest(DatabaseTestCase):
             )
             self.assertEqual(len(list(db.scalars(select(OrderEvent)))), 1)
 
-    def test_unsolicited_study_respects_rule_without_second_retrieve(self):
+    def test_unsolicited_study_respects_rule_without_monitoring(self):
         with self.Session() as db:
             unit = make_unit(name="unit")
             db.add(unit)
@@ -445,7 +442,7 @@ class TransferTrackingTest(DatabaseTestCase):
 
             order = db.scalar(select(Order))
             self.assertEqual(order.status, "done")
-            self.assertIsNone(order.second_retrieve_at)
+            self.assertIsNone(order.monitor_until)
             self.assertIsNotNone(order.done_at)
 
     def test_later_series_fills_missing_body_part_on_received_order(self):
@@ -489,6 +486,52 @@ class TransferTrackingTest(DatabaseTestCase):
             db.refresh(order)
             self.assertEqual(order.body_part, "ABDOMEN")
 
+    def test_received_study_outside_prior_list_skips_prior_retrieve(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit", retrieve_prior_enabled=True)
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+            db.add(UnitPriorModality(unit_id=unit.id, code="MR"))
+            order = Order(
+                unit_id=unit.id,
+                source_id="api-order",
+                acc="ACC-CT",
+                pat_id="123456",
+                birth_date="19800102",
+                status="watching",
+                api_read_status="confirmed",
+            )
+            db.add(order)
+            db.commit()
+
+            _record_compact_result(
+                db,
+                unit,
+                CompactResult(
+                    "image",
+                    "image.dcm",
+                    "1.2.ct",
+                    "compressed",
+                    patient_id="123456",
+                    birth_date="19800102",
+                    study_date="20260915",
+                    accession="ACC-CT",
+                    modality="CT",
+                    observed_at=datetime.now(),
+                ),
+            )
+            db.commit()
+
+            db.refresh(order)
+            self.assertEqual(order.status, "monitoring")
+            self.assertEqual(order.prior_status, "disabled")
+            self.assertIn(
+                "Histórico não solicitado: CT não está nas modalidades de exames "
+                "anteriores da unidade (MR)",
+                [event.message for event in order.events],
+            )
+
     def test_received_study_satisfies_watching_order_by_accession(self):
         with self.Session() as db:
             unit = make_unit(name="unit", retrieve_prior_enabled=True)
@@ -528,8 +571,8 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertEqual(len(list(db.scalars(select(Order)))), 1)
             db.refresh(order)
             self.assertEqual(order.study_uid, "1.2.queued")
-            self.assertEqual(order.status, "wait_second")
-            self.assertIsNotNone(order.second_retrieve_at)
+            self.assertEqual(order.status, "monitoring")
+            self.assertIsNotNone(order.monitor_until)
             self.assertEqual(order.prior_status, "queued")
             self.assertIsNotNone(order.prior_due_at)
 
@@ -577,8 +620,8 @@ class TransferTrackingTest(DatabaseTestCase):
             restored = db.get(Order, order_id)
             self.assertIsNone(restored.archived_at)
             self.assertEqual(restored.archive_reason, "")
-            self.assertEqual(restored.status, "wait_second")
-            self.assertIsNotNone(restored.second_retrieve_at)
+            self.assertEqual(restored.status, "monitoring")
+            self.assertIsNotNone(restored.monitor_until)
             audit = db.scalar(select(AuditLog).where(AuditLog.action == "restore"))
             self.assertIsNotNone(audit)
 

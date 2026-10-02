@@ -7,6 +7,20 @@ from app.validation import (
 )
 
 
+class PriorModalitiesValidationTest(unittest.TestCase):
+    def test_empty_or_all_means_every_modality(self):
+        from app.validation import validate_prior_modalities
+
+        self.assertEqual(validate_prior_modalities(""), ("ALL",))
+        self.assertEqual(validate_prior_modalities(" , "), ("ALL",))
+        self.assertEqual(validate_prior_modalities("ct,ALL,mr"), ("ALL",))
+        self.assertEqual(validate_prior_modalities("mr, ct,CT"), ("CT", "MR"))
+        with self.assertRaises(ValueError):
+            validate_prior_modalities("C-T")
+        with self.assertRaises(ValueError):
+            validate_prior_modalities("*")
+
+
 class ValidationTest(unittest.TestCase):
     def test_external_store_port_maps_to_unprivileged_listener(self):
         self.assertEqual(store_bind_port(444), 10444)
@@ -34,7 +48,7 @@ class ValidationTest(unittest.TestCase):
             "token": "unit-token",
             "cloud_url": "https://idr.mobilemed.com.br/api/router/send-image",
             "move_timeout_first": "600",
-            "move_timeout_second": "900",
+            "move_timeout_update": "900",
             "max_parallel_moves": "2",
             "find_interval_seconds": "30",
             "compact_workers": "4",

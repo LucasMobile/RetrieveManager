@@ -151,6 +151,25 @@ def validate_orders_api_company_id(value: str | None) -> str:
     return str(int(company_id))
 
 
+def validate_prior_modalities(raw: str) -> tuple[str, ...]:
+    """Chip list of the prior-exams retrieve; empty or ALL means every one."""
+    if len(raw) > 2048:
+        raise ValueError("A lista de modalidades excede o limite permitido.")
+    values: set[str] = set()
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        modality = validate_modality(item)
+        if modality == "*":
+            raise ValueError("Use ALL para buscar exames anteriores de todas.")
+        values.add(modality)
+        if len(values) > 128:
+            raise ValueError("A lista aceita no máximo 128 modalidades.")
+    if not values or "ALL" in values:
+        return ("ALL",)
+    return tuple(sorted(values))
+
+
 def validate_unit_form(
     form: dict[str, str], *, creating: bool = False
 ) -> dict[str, str | int | bool]:
@@ -201,6 +220,7 @@ def validate_unit_form(
             form.get("orders_api_company_id", "")
         ),
         "retrieve_prior_enabled": form.get("retrieve_prior_enabled", "0") == "1",
+        "prior_modalities": validate_prior_modalities(form.get("prior_modalities", "")),
         "move_timeout_prior": bounded_int(
             form.get("move_timeout_prior"),
             "Timeout do retrieve de exames anteriores",
@@ -222,9 +242,9 @@ def validate_unit_form(
             maximum=7200,
             default=600,
         ),
-        "move_timeout_second": bounded_int(
-            form.get("move_timeout_second"),
-            "Timeout do 2º C-MOVE",
+        "move_timeout_update": bounded_int(
+            form.get("move_timeout_update"),
+            "Timeout do C-MOVE de novas imagens",
             minimum=10,
             maximum=7200,
             default=900,

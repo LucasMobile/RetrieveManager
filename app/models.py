@@ -93,7 +93,7 @@ class Unit(Base):
     cloud_url: Mapped[str] = mapped_column(String(500), default="", nullable=False)
 
     move_timeout_first: Mapped[int] = mapped_column(Integer, default=600)
-    move_timeout_second: Mapped[int] = mapped_column(Integer, default=900)
+    move_timeout_update: Mapped[int] = mapped_column(Integer, default=900)
     retrieve_prior_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     move_timeout_prior: Mapped[int] = mapped_column(Integer, default=1800)
     max_parallel_moves: Mapped[int] = mapped_column(Integer, default=1)
@@ -126,6 +126,11 @@ class Unit(Base):
     drop_modalities: Mapped[list["UnitDropModality"]] = relationship(
         back_populates="unit", cascade="all, delete-orphan"
     )
+    prior_modalities: Mapped[list["UnitPriorModality"]] = relationship(
+        back_populates="unit",
+        cascade="all, delete-orphan",
+        order_by="UnitPriorModality.code",
+    )
 
 
 class ModalityRule(Base):
@@ -134,8 +139,11 @@ class ModalityRule(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     modality: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)
     wait_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
-    second_retrieve: Mapped[bool] = mapped_column(Boolean, default=False)
-    second_wait_minutes: Mapped[int] = mapped_column(Integer, default=90)
+    # After the 1st retrieve, C-FIND the study every interval and fetch the
+    # series whose PACS count grew, until the window closes.
+    monitor_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    monitor_interval_minutes: Mapped[int] = mapped_column(Integer, default=5)
+    monitor_max_hours: Mapped[int] = mapped_column(Integer, default=6)
 
 
 class UnitCompressionSettings(Base):
@@ -183,6 +191,27 @@ class UnitDropModality(Base):
     code: Mapped[str] = mapped_column(String(8), nullable=False)
 
     unit: Mapped["Unit"] = relationship(back_populates="drop_modalities")
+
+
+class UnitPriorModality(Base):
+    """Modalities of the current exam that trigger the prior-exams retrieve.
+
+    The code ``ALL`` (also assumed when the unit has no row) means every
+    modality.
+    """
+
+    __tablename__ = "unit_prior_modalities"
+    __table_args__ = (
+        UniqueConstraint("unit_id", "code", name="uq_unit_prior_modality"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    unit_id: Mapped[int] = mapped_column(
+        ForeignKey("units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(8), nullable=False)
+
+    unit: Mapped["Unit"] = relationship(back_populates="prior_modalities")
 
 
 class DicomRule(Base):
@@ -245,10 +274,10 @@ class Order(Base):
         Index("ix_orders_unit_status_retrieve", "unit_id", "status", "retrieve_at"),
         Index("ix_orders_unit_status_find", "unit_id", "status", "last_find_at"),
         Index(
-            "ix_orders_unit_status_second_retrieve",
+            "ix_orders_unit_status_monitor_next",
             "unit_id",
             "status",
-            "second_retrieve_at",
+            "monitor_next_at",
         ),
         Index(
             "ix_orders_unit_prior_status_due",
@@ -314,7 +343,15 @@ class Order(Base):
     prior_last_error: Mapped[str] = mapped_column(Text, default="")
 
     retrieve_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
-    second_retrieve_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    # Monitoring window opened by the 1st retrieve (see app.pipeline.monitor).
+    monitor_interval_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    monitor_next_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    monitor_until: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    monitor_checks: Mapped[int] = mapped_column(Integer, default=0)
+    monitor_new_images: Mapped[int] = mapped_column(Integer, default=0)
+    # Series the last check found incomplete, one UID per line; empty while
+    # waiting for an update move means the whole study.
+    monitor_pending_series: Mapped[str] = mapped_column(Text, default="")
     last_find_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
@@ -577,8 +614,9 @@ STATUSES = {
     "watching": "Aguardando PACS",
     "wait_retrieve": "Na fila do 1º retrieve",
     "retrieving": "1º retrieve em andamento",
-    "wait_second": "Na fila do 2º retrieve",
-    "retrieving_second": "2º retrieve em andamento",
+    "monitoring": "Monitorando novas imagens",
+    "wait_update": "Na fila de novas imagens",
+    "retrieving_update": "Buscando novas imagens",
     "receiving": "Recebendo imagens",
     "done": "Retrieve concluído",
     "error": "Erro",

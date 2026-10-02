@@ -15,7 +15,11 @@ from app.models import (
 )
 from app.order_state import ACTIVE_ORDER_STATUSES
 from app.pipeline.find import find_pending
-from app.pipeline.orders import archive_completed_orders, cleanup_unmatched_orders
+from app.pipeline.orders import (
+    archive_completed_orders,
+    cleanup_unmatched_orders,
+    recover_stale_locks,
+)
 from app.routes.orders import (
     _delete_order_record,
     _reset_order_for_reprocess,
@@ -167,10 +171,35 @@ class OrderActionsTest(DatabaseTestCase):
             self.assertIsNotNone(preserved)
             self.assertEqual(preserved.order_id, order_id)
 
+    def test_interrupted_update_move_returns_to_monitoring(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                acc="ACC-UPDATE",
+                birth_date="20000101",
+                study_uid="1.2.3",
+                status="retrieving_update",
+                heartbeat_at=datetime.now() - timedelta(hours=2),
+                monitor_until=datetime.now() + timedelta(hours=4),
+                monitor_pending_series="1.2.3.1",
+            )
+            db.add(order)
+            db.commit()
+
+            recover_stale_locks(db)
+
+            self.assertEqual(order.status, "monitoring")
+            self.assertLessEqual(order.monitor_next_at, datetime.now())
+            self.assertEqual(order.monitor_pending_series, "")
+            self.assertEqual(order.last_error, "")
+
     def test_active_statuses_protect_inflight_orders(self):
         self.assertEqual(
             ACTIVE_ORDER_STATUSES,
-            {"retrieving", "retrieving_second", "receiving"},
+            {"retrieving", "retrieving_update", "receiving"},
         )
 
     def test_reprocess_restarts_completed_order(self):
@@ -182,8 +211,7 @@ class OrderActionsTest(DatabaseTestCase):
                     ModalityRule(
                         modality="CT",
                         wait_minutes=15,
-                        second_retrieve=True,
-                        second_wait_minutes=90,
+                        monitor_enabled=True,
                     ),
                 ]
             )
@@ -196,6 +224,8 @@ class OrderActionsTest(DatabaseTestCase):
                 modality="CT",
                 study_uid="1.2.3",
                 status="done",
+                monitor_until=datetime.now(),
+                monitor_checks=72,
                 attempts=3,
                 correlation_id="old-correlation",
                 last_error="old error",
@@ -211,7 +241,8 @@ class OrderActionsTest(DatabaseTestCase):
             self.assertNotEqual(order.correlation_id, "old-correlation")
             self.assertEqual(order.last_error, "")
             self.assertIsNotNone(order.retrieve_at)
-            self.assertIsNotNone(order.second_retrieve_at)
+            self.assertIsNone(order.monitor_until)
+            self.assertEqual(order.monitor_checks, 0)
             event = db.scalar(select(OrderEvent).where(OrderEvent.order_id == order.id))
             self.assertEqual(event.message, "Reprocessamento manual solicitado")
 

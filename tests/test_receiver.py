@@ -151,7 +151,7 @@ class ReceiverTest(unittest.TestCase):
         saved = pydicom.dcmread(row.source_path)
         self.assertEqual(saved.file_meta.TransferSyntaxUID, ImplicitVRLittleEndian)
 
-    def test_second_retrieve_of_same_content_is_a_duplicate(self):
+    def test_repeated_retrieve_of_same_content_is_a_duplicate(self):
         image = ct_image()
         self.send(image)
         _assoc, statuses = self.send(image)
@@ -245,7 +245,7 @@ class ReceiverTest(unittest.TestCase):
         self.assertEqual(statuses, [STATUS_CANNOT_UNDERSTAND])
         self.assertEqual(self.rows(), [])
 
-    def test_received_image_flows_to_compaction_and_second_retrieve_is_skipped(self):
+    def test_received_image_flows_to_compaction_and_a_repeated_move_is_skipped(self):
         from app.models import ImageTransfer
         from app.pipeline.compact import compact_unit
 

@@ -64,7 +64,7 @@ def recover_stale_locks(db: Session) -> None:
     cutoff = now - STALE_LOCK
     candidates = list(
         db.execute(
-            select(Order, Unit.move_timeout_first, Unit.move_timeout_second)
+            select(Order, Unit.move_timeout_first, Unit.move_timeout_update)
             .join(Unit, Unit.id == Order.unit_id)
             .where(
                 Order.archived_at.is_(None),
@@ -75,7 +75,7 @@ def recover_stale_locks(db: Session) -> None:
     )
     rows = [
         order
-        for order, first_timeout, second_timeout in candidates
+        for order, first_timeout, update_timeout in candidates
         if order.heartbeat_at is None
         or order.heartbeat_at
         < now
@@ -83,8 +83,8 @@ def recover_stale_locks(db: Session) -> None:
             STALE_LOCK,
             timedelta(
                 seconds=max(
-                    second_timeout
-                    if order.status == "retrieving_second"
+                    update_timeout
+                    if order.status == "retrieving_update"
                     else first_timeout,
                     60,
                 )
@@ -94,11 +94,14 @@ def recover_stale_locks(db: Session) -> None:
     ]
     for order in rows:
         correlation_id = ensure_order_correlation(order)
-        if order.status == "retrieving_second":
-            order.status = "wait_second"
+        if order.status == "retrieving_update":
+            # Check again: the counts tell what the interrupted move missed.
+            order.status = "monitoring"
+            order.monitor_next_at = now
+            order.monitor_pending_series = ""
         else:
             order.status = "wait_retrieve"
-        order.last_error = "lock órfão recuperado"
+            order.last_error = "lock órfão recuperado"
         add_event(db, order, "Lock órfão recuperado após queda do worker", level="warn")
         with log_context(correlation_id):
             log_event(

@@ -23,7 +23,7 @@
         <span class="status-badge {{ badge }}">{{ status_label }}</span>
         {% if order.archived_at %}<span class="status-badge neutral">Arquivado</span>{% endif %}
       </div>
-      <p class="page-header__description mono">Origem API{% if order.source_id %} · {{ order.source_id }}{% endif %}</p>
+      <p class="page-header__description">Origem API{% if order.source_id %} · <span class="mono">{{ order.source_id }}</span>{% endif %}</p>
     </div>
     <div class="page-header__actions order-detail-actions">
       <div class="order-detail-actions__group" aria-label="Navegação e atualização">
@@ -31,23 +31,40 @@
         <a class="action-icon order-action-icon" href="/orders/{{ order.id }}?{{ detail_return_qs }}" aria-label="Atualizar informações" data-tooltip="Atualizar informações" title="Atualizar informações">{{ icon("refresh") }}</a>
       </div>
       {% if user.role == 'admin' and not order.archived_at %}
-      <div class="order-detail-actions__group order-detail-actions__group--operations" aria-label="Ações do pedido">
+      {% set can_retry = order.can_reprocess and order.can_archive %}
+      {% set can_stop_monitor = order.status in ('monitoring', 'wait_update') %}
+      <div class="order-detail-actions__ops" role="group" aria-label="Ações do pedido">
       {% if order.study_uid %}
+      {% set move_reason = 'C-MOVE manual já solicitado' if manual_move_active else 'Aguarde o C-MOVE atual terminar' %}
       <form class="inline-form" method="post" action="/orders/{{ order.id }}/retrieve-now" data-confirm="Executar um C-MOVE adicional do exame atual agora? O agendamento normal será mantido." data-confirm-label="Executar retrieve agora">
         {{ csrf_input(request) }}
-        <button class="action-icon order-action-icon order-action-icon--primary{% if not can_manual_move %} is-disabled{% endif %}" type="submit" aria-label="Retrieve agora" data-tooltip="{{ 'Retrieve agora' if can_manual_move else ('C-MOVE manual já solicitado' if manual_move_active else 'Aguarde o C-MOVE atual terminar') }}" title="{{ 'Retrieve agora' if can_manual_move else ('C-MOVE manual já solicitado' if manual_move_active else 'Aguarde o C-MOVE atual terminar') }}"{% if not can_manual_move %} disabled{% endif %}>{{ icon("play") }}</button>
+        <button class="btn btn--secondary" type="submit"{% if not can_manual_move %} disabled title="{{ move_reason }}" aria-describedby="retrieve-now-reason"{% endif %}>{{ icon("play") }} Retrieve agora</button>
       </form>
       {% endif %}
-      {% if order.can_reprocess and order.can_archive %}
-      {{ post_action(request, '/orders/' ~ order.id ~ '/retry', 'action-icon order-action-icon order-action-icon--primary', 'Reprocessar pedido', icon_name='retry', tooltip='Reprocessar pedido', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
+      {% if order.status == 'monitoring' %}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/monitor-now', 'btn btn--secondary', 'Verificar novas imagens agora', icon_name='search', text='Verificar novas imagens agora') }}
       {% endif %}
-      {% if order.can_cancel %}
-      {{ post_action(request, '/orders/' ~ order.id ~ '/cancel', 'action-icon order-action-icon', 'Cancelar pedido', icon_name='x-circle', tooltip='Cancelar pedido', confirm='Cancelar este pedido? O processamento atual será interrompido.', confirm_label='Cancelar pedido') }}
+      {% if can_retry %}
+      {{ post_action(request, '/orders/' ~ order.id ~ '/retry', 'btn btn--primary', 'Reprocessar pedido', icon_name='retry', text='Reprocessar', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
       {% endif %}
-      {% if order.can_reprocess and order.can_archive %}
-      {{ post_action(request, '/orders/' ~ order.id ~ '/delete', 'action-icon action-icon--danger order-action-icon', 'Arquivar pedido', icon_name='trash', tooltip='Arquivar pedido', confirm='Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados.', confirm_label='Arquivar pedido') }}
+      {% if can_stop_monitor or order.can_cancel or can_retry %}
+      <div class="action-menu" data-menu>
+        <button class="btn btn--secondary" type="button" aria-expanded="false" aria-controls="order-more-actions" data-menu-toggle>Mais ações {{ icon("chevron-down") }}</button>
+        <div class="action-menu__panel" id="order-more-actions" data-menu-panel hidden>
+          {% if can_stop_monitor %}
+          {{ post_action(request, '/orders/' ~ order.id ~ '/monitor-stop', 'action-menu__item', 'Encerrar monitoramento', icon_name='check', text='Encerrar monitoramento', confirm='Encerrar o monitoramento de novas imagens deste pedido? Ele será marcado como concluído e o PACS não será mais consultado.', confirm_label='Encerrar monitoramento') }}
+          {% endif %}
+          {% if order.can_cancel %}
+          {{ post_action(request, '/orders/' ~ order.id ~ '/cancel', 'action-menu__item', 'Cancelar pedido', icon_name='x-circle', text='Cancelar pedido', confirm='Cancelar este pedido? O processamento atual será interrompido.', confirm_label='Cancelar pedido') }}
+          {% endif %}
+          {% if can_retry %}
+          {{ post_action(request, '/orders/' ~ order.id ~ '/delete', 'action-menu__item', 'Arquivar pedido', icon_name='archive', text='Arquivar pedido', confirm='Arquivar este pedido? Todos os dados, eventos e vínculos serão preservados.', confirm_label='Arquivar pedido') }}
+          {% endif %}
+        </div>
+      </div>
       {% endif %}
       </div>
+      {% if order.study_uid and not can_manual_move %}<p class="order-detail-actions__reason" id="retrieve-now-reason">{{ move_reason }}</p>{% endif %}
       {% endif %}
     </div>
   </header>
@@ -85,7 +102,9 @@
         </header>
         <div class="retrieve-schedule">
           <div><span>1º retrieve</span><strong>{{ order.retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.retrieve_at else 'Não agendado' }}</strong></div>
-          <div><span>2º retrieve</span><strong>{{ order.second_retrieve_at.strftime('%d/%m/%Y às %H:%M') if order.second_retrieve_at else 'Não agendado' }}</strong></div>
+          <div><span>Monitoramento</span><strong>{% if order.monitor_until %}Até {{ order.monitor_until.strftime('%d/%m/%Y às %H:%M') }} · a cada {{ order.monitor_interval_minutes }} min{% else %}Não aplicável{% endif %}</strong></div>
+          <div><span>Próxima verificação</span><strong>{% if order.status == 'monitoring' and order.monitor_next_at %}{{ order.monitor_next_at.strftime('%d/%m/%Y às %H:%M') }}{% elif order.status in ('wait_update', 'retrieving_update') %}Buscando novas imagens{% else %}—{% endif %}</strong></div>
+          <div><span>Verificações</span><strong>{{ order.monitor_checks }} · {{ order.monitor_new_images }} imagem(ns) nova(s)</strong></div>
         </div>
         {% if order.last_error %}<div class="order-error"><strong>Último erro</strong><span>{{ order.last_error }}</span></div>{% endif %}
       </section>
@@ -107,7 +126,7 @@
       <div class="flow-progress" aria-label="Progresso do pedido">
         <div class="is-done"><span>01 · Entrada</span><strong>Recebido</strong></div>
         <div{% if order.study_uid %} class="is-done"{% endif %}><span>02 · Busca</span><strong>{% if order.study_uid %}Encontrado{% else %}Pendente{% endif %}</strong></div>
-        <div{% if order.status in ('wait_second', 'retrieving_second', 'done') %} class="is-done"{% endif %}><span>03 · Retrieve</span><strong>{% if order.status in ('wait_second', 'retrieving_second', 'done') %}Concluído{% else %}Em curso{% endif %}</strong></div>
+        <div{% if order.status in ('monitoring', 'wait_update', 'retrieving_update', 'done') %} class="is-done"{% endif %}><span>03 · Retrieve</span><strong>{% if order.status in ('monitoring', 'wait_update', 'retrieving_update') %}Monitorando{% elif order.status == 'done' %}Concluído{% else %}Em curso{% endif %}</strong></div>
         <div{% if transfer_counts.get('uploaded', 0) %} class="is-done"{% endif %}><span>04 · Envio</span><strong>{% if transfer_counts.get('uploaded', 0) %}{{ transfer_counts.get('uploaded') }} enviadas{% elif transfer_stats %}Em curso{% else %}Pendente{% endif %}</strong></div>
       </div>
       {% if not events %}

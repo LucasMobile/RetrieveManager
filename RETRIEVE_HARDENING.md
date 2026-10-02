@@ -25,7 +25,7 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - cada resposta `Pending` é lida separadamente; mais de um Study UID ou
      PatientID/nascimento/accession divergente leva o pedido a `error`
      (`dicom.find status=conflict`) sem agendar C-MOVE;
-   - quando encontrado, agenda primeiro e segundo retrieve a partir do C-FIND.
+   - quando encontrado, agenda o primeiro retrieve a partir do C-FIND.
 3. **Claim de C-MOVE (`dicom.move.claim`)**
    - respeita `max_parallel_moves` da unidade;
    - usa bloqueio de linha com `SKIP LOCKED`, evitando claim duplicado quando há
@@ -37,14 +37,22 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
      parcial (0xB000), destino desconhecido (0xA801) ou tempo esgotado (a
      associação é abortada) contam como tentativa com erro; o evento e o log
      trazem as contagens enviadas/falhas/avisos;
-   - primeiro e segundo retrieve possuem até três tentativas cada;
+   - o primeiro retrieve possui até três tentativas;
    - retries usam espera de 60 e 300 segundos;
    - uma exceção inesperada é persistida imediatamente, sem aguardar o recovery
      de lock;
-   - o segundo retrieve continua baseado no horário calculado após o C-FIND.
-   - o segundo retrieve é incremental: só as séries em que o PACS tem mais
-     SOPs do que os já recebidos; sem contagem confiável, o estudo inteiro;
-     sem nada novo, termina sem C-MOVE (evento "2º C-MOVE dispensado").
+   - ao concluir, modalidades com monitoramento passam a `monitoring`; as demais
+     terminam em `done`.
+   - **Monitoramento (`dicom.monitor.check`)**: a cada intervalo da regra, um
+     C-FIND SERIES compara `NumberOfSeriesRelatedInstances` com os SOPs
+     recebidos (qualquer estado). Só as séries que cresceram vão para
+     `wait_update` → `retrieving_update` (`dicom.move retrieve_number=update`);
+     sem contagem, o estudo inteiro. Toda verificação vira evento do pedido.
+     Falhas de C-FIND ou C-MOVE não levam a `error`: a próxima verificação
+     repete a comparação. A janela fecha `monitor_max_hours` após o fim do 1º
+     retrieve, com uma última verificação no limite; então o pedido vai para
+     `done`. Um lock órfão de `retrieving_update` volta a `monitoring` com
+     verificação imediata.
 5. **Retrieve histórico (`dicom.move.prior`)**
    - o C-FIND histórico sem séries conclui como “nenhum exame anterior” e não
      dispara C-MOVE;

@@ -1,0 +1,9 @@
+{% from "icons.html" import icon %}
+
+{# Item da faixa de resumo (.summary-strip). tone: warning, success ou danger tinge o ícone. #}
+{% macro summary_item(icon_name, value, label, tone='') -%}
+<div class="summary-strip__item{% if tone %} summary-strip__item--{{ tone }}{% endif %}">
+  <span class="summary-strip__icon">{{ icon(icon_name) }}</span>
+  <div class="summary-strip__copy"><strong>{{ value }}</strong><span>{{ label }}</span></div>
+</div>
+{%- endmacro %}

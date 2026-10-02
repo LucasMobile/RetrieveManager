@@ -339,7 +339,7 @@ def rules_retrieve(
             rules=rules,
             summary={
                 "total": len(rules),
-                "second_enabled": sum(rule.second_retrieve for rule in rules),
+                "monitor_enabled": sum(rule.monitor_enabled for rule in rules),
                 "default_wait": default_rule.wait_minutes if default_rule else None,
             },
         ),
@@ -351,8 +351,9 @@ def rules_retrieve_add(
     request: Request,
     modality: str = Form(...),
     wait_minutes: int = Form(..., ge=0, le=1440),
-    second_retrieve: Literal["0", "1"] = Form("0"),
-    second_wait_minutes: int = Form(90, ge=0, le=2880),
+    monitor_enabled: Literal["0", "1"] = Form("0"),
+    monitor_interval_minutes: int = Form(5, ge=1, le=240),
+    monitor_max_hours: int = Form(6, ge=1, le=72),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -362,8 +363,9 @@ def rules_retrieve_add(
             rule,
             modality=modality,
             wait_minutes=wait_minutes,
-            second_retrieve=second_retrieve,
-            second_wait_minutes=second_wait_minutes,
+            monitor_enabled=monitor_enabled,
+            monitor_interval_minutes=monitor_interval_minutes,
+            monitor_max_hours=monitor_max_hours,
         )
     except ValueError as exc:
         flash(request, str(exc), "err")
@@ -395,8 +397,9 @@ def rules_retrieve_update(
     request: Request,
     modality: str = Form(...),
     wait_minutes: int = Form(..., ge=0, le=1440),
-    second_retrieve: Literal["0", "1"] = Form("0"),
-    second_wait_minutes: int = Form(90, ge=0, le=2880),
+    monitor_enabled: Literal["0", "1"] = Form("0"),
+    monitor_interval_minutes: int = Form(5, ge=1, le=240),
+    monitor_max_hours: int = Form(6, ge=1, le=72),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
@@ -407,8 +410,9 @@ def rules_retrieve_update(
                 rule,
                 modality=modality,
                 wait_minutes=wait_minutes,
-                second_retrieve=second_retrieve,
-                second_wait_minutes=second_wait_minutes,
+                monitor_enabled=monitor_enabled,
+                monitor_interval_minutes=monitor_interval_minutes,
+                monitor_max_hours=monitor_max_hours,
             )
         except ValueError as exc:
             flash(request, str(exc), "err")
@@ -437,16 +441,23 @@ def _apply_retrieve_rule(
     *,
     modality: str,
     wait_minutes: int,
-    second_retrieve: Literal["0", "1"],
-    second_wait_minutes: int,
+    monitor_enabled: Literal["0", "1"],
+    monitor_interval_minutes: int,
+    monitor_max_hours: int,
 ) -> None:
     safe_modality = validate_modality(modality)
     if rule.modality != "*":
         rule.modality = safe_modality
+    if monitor_interval_minutes > monitor_max_hours * 60:
+        raise ValueError(
+            "O intervalo entre as consultas não pode ser maior que o tempo máximo."
+        )
     rule.wait_minutes = wait_minutes
-    rule.second_retrieve = second_retrieve == "1"
-    if rule.second_retrieve or rule.id is None:
-        rule.second_wait_minutes = second_wait_minutes
+    rule.monitor_enabled = monitor_enabled == "1"
+    # Disabled fields are not posted: keep the stored values.
+    if rule.monitor_enabled or rule.id is None:
+        rule.monitor_interval_minutes = monitor_interval_minutes
+        rule.monitor_max_hours = monitor_max_hours
 
 
 @router.post("/rules/retrieve/{rule_id}/delete")

@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -20,9 +20,10 @@ from app.dicom_net import (
     move_study,
     prior_series_query,
 )
-from app.models import DicomInstance, Order, OrderEvent, Unit
+from app.models import DicomInstance, ModalityRule, Order, OrderEvent, Unit
 from app.parse import study_response
-from app.pipeline.move import _run_move
+from app.pipeline.monitor import check_monitoring
+from app.pipeline.move import _run_move, claim_due_moves, run_claimed_move
 from app.receiver import Receiver
 from tests.fake_pacs import FakePacs, free_port
 from tests.support import make_unit, postgres_test_engine
@@ -222,11 +223,12 @@ def move_status(code, **counts):
     return status
 
 
-class IncrementalSecondMoveTest(PacsReceiverFixture, unittest.TestCase):
-    """The 2nd C-MOVE asks only for what the PACS has and we do not."""
+class MonitoringTest(PacsReceiverFixture, unittest.TestCase):
+    """After the 1st retrieve, each check fetches only what the PACS gained."""
 
     def setUp(self):
         super().setUp()
+        now = datetime.now()
         with self.Session() as db:
             unit = db.get(Unit, self.unit.id)
             unit.pacs_port = self.pacs.port
@@ -236,9 +238,11 @@ class IncrementalSecondMoveTest(PacsReceiverFixture, unittest.TestCase):
                 birth_date="19691027",
                 study_uid=STUDY,
                 modality="CT",
-                status="wait_second",
+                status="monitoring",
                 prior_status="disabled",
-                second_retrieve_at=datetime.now(),
+                monitor_interval_minutes=5,
+                monitor_next_at=now,
+                monitor_until=now + timedelta(hours=6),
             )
             db.add(order)
             db.commit()
@@ -246,57 +250,136 @@ class IncrementalSecondMoveTest(PacsReceiverFixture, unittest.TestCase):
         self.assertTrue(move_study(self.node, STUDY, timeout=30).ok)
         self.moves_before = len(self.pacs.moves)
 
-    def run_second(self):
+    def run_check(self):
+        """One monitoring check plus the update move it may have queued."""
+        with self.Session() as db:
+            unit = db.get(Unit, self.unit.id)
+            self.assertEqual(check_monitoring(db, unit), 1)
+            for resource_id, kind in claim_due_moves(db, unit):
+                run_claimed_move(db, resource_id, kind)
         with self.Session() as db:
             order = db.get(Order, self.order_id)
-            _run_move(db, db.get(Unit, order.unit_id), order, second=True)
             events = list(
                 db.scalars(
-                    select(OrderEvent.message).where(
-                        OrderEvent.order_id == self.order_id
-                    )
+                    select(OrderEvent.message)
+                    .where(OrderEvent.order_id == self.order_id)
+                    .order_by(OrderEvent.id)
                 )
             )
-            return order.status, events
+            return order, events
 
-    def test_nothing_new_skips_the_move(self):
-        status, events = self.run_second()
-        self.assertEqual(status, "done")
-        self.assertIn("2º C-MOVE dispensado", events)
+    def test_nothing_new_keeps_monitoring_and_logs_the_check(self):
+        order, events = self.run_check()
+        self.assertEqual(order.status, "monitoring")
+        self.assertEqual(order.monitor_checks, 1)
         self.assertEqual(len(self.pacs.moves), self.moves_before)
+        self.assertAlmostEqual(
+            (order.monitor_next_at - datetime.now()).total_seconds() / 60, 5, delta=0.2
+        )
+        self.assertTrue(events[0].startswith("Verificação 1: nenhuma imagem nova"))
+        self.assertIn("PACS: 3 imagem(ns) em 1 série(s); recebidas: 3.", events[0])
 
-    def test_only_series_with_missing_images_are_moved(self):
+    def test_only_series_with_new_images_are_moved(self):
         self.pacs.images.extend(study_images(count=2, series_uid=f"{STUDY}.2"))
-        status, _events = self.run_second()
-        self.assertEqual(status, "done")
+        order, events = self.run_check()
+        self.assertEqual(order.status, "monitoring")
         self.assertEqual(len(self.pacs.moves), self.moves_before + 1)
         self.assertEqual(self.stored(), 5)
+        self.assertEqual(order.monitor_new_images, 2)
+        self.assertIn("Imagens novas em 1 série(s)", events[0])
+        self.assertTrue(events[1].startswith("C-MOVE de novas imagens concluído"))
 
-    def test_lost_image_is_requested_again(self):
+        # The next check sees everything received.
         with self.Session() as db:
-            lost = db.scalar(select(DicomInstance).limit(1))
-            lost.state = "missing"
-            Path(lost.source_path).unlink()
+            db.get(Order, self.order_id).monitor_next_at = datetime.now()
             db.commit()
-            lost_id = lost.id
-        status, _events = self.run_second()
-        self.assertEqual(status, "done")
+        order, events = self.run_check()
         self.assertEqual(len(self.pacs.moves), self.moves_before + 1)
+        self.assertTrue(events[-1].startswith("Verificação 2: nenhuma imagem nova"))
+
+    def test_images_failed_after_reception_are_not_requested_again(self):
         with self.Session() as db:
-            revived = db.get(DicomInstance, lost_id)
-            self.assertEqual(revived.state, "received")
-            self.assertTrue(Path(revived.source_path).is_file())
+            for state, row in zip(
+                ("error", "missing"),
+                db.scalars(select(DicomInstance).limit(2)),
+                strict=True,
+            ):
+                row.state = state
+            db.commit()
+        order, _events = self.run_check()
+        self.assertEqual(order.status, "monitoring")
+        self.assertEqual(len(self.pacs.moves), self.moves_before)
 
     def test_without_series_counts_the_whole_study_is_moved(self):
         response = Dataset()
         response.SeriesInstanceUID = f"{STUDY}.1"
         with mock.patch(
-            "app.pipeline.move.find_study_series",
+            "app.pipeline.monitor.find_study_series",
             return_value=FindResult(True, (response,), 0x0000),
         ):
-            status, _events = self.run_second()
-        self.assertEqual(status, "done")
+            order, events = self.run_check()
+        self.assertEqual(order.status, "monitoring")
         self.assertEqual(len(self.pacs.moves), self.moves_before + 1)
+        self.assertIn("estudo completo solicitado", events[0])
+
+    def test_failed_find_is_retried_without_error(self):
+        with mock.patch(
+            "app.pipeline.monitor.find_study_series",
+            return_value=FindResult(False, error="tempo esgotado"),
+        ):
+            order, events = self.run_check()
+        self.assertEqual(order.status, "monitoring")
+        self.assertEqual(order.last_error, "")
+        self.assertTrue(events[0].startswith("Verificação 1: C-FIND falhou"))
+
+    def test_check_at_window_end_closes_the_order(self):
+        with self.Session() as db:
+            db.get(Order, self.order_id).monitor_until = datetime.now()
+            db.commit()
+        order, events = self.run_check()
+        self.assertEqual(order.status, "done")
+        self.assertIsNotNone(order.done_at)
+        self.assertIsNone(order.monitor_next_at)
+        self.assertTrue(events[-1].startswith("Verificação 1: nenhuma imagem nova"))
+        self.assertIn(
+            "Monitoramento de novas imagens encerrado: 1 verificação(ões)", events[-1]
+        )
+
+    def test_stopped_order_is_left_alone_by_an_inflight_check(self):
+        def stop_meanwhile(*_args, **_kwargs):
+            with self.Session() as other:
+                other.get(Order, self.order_id).status = "cancelled"
+                other.commit()
+            return FindResult(True, (), 0x0000)
+
+        with mock.patch(
+            "app.pipeline.monitor.find_study_series", side_effect=stop_meanwhile
+        ):
+            order, events = self.run_check()
+        self.assertEqual(order.status, "cancelled")
+        self.assertEqual(order.monitor_checks, 0)
+        self.assertEqual(events, [])
+
+    def test_first_move_opens_the_window_only_for_monitored_modalities(self):
+        with self.Session() as db:
+            db.add(ModalityRule(modality="CT", wait_minutes=10, monitor_enabled=True))
+            order = db.get(Order, self.order_id)
+            order.status = "retrieving"
+            order.monitor_until = None
+            db.commit()
+            _run_move(db, db.get(Unit, order.unit_id), order)
+            self.assertEqual(order.status, "monitoring")
+            self.assertAlmostEqual(
+                (order.monitor_until - datetime.now()).total_seconds() / 3600,
+                6,
+                delta=0.01,
+            )
+
+            order.status = "retrieving"
+            order.modality = "DX"
+            db.commit()
+            _run_move(db, db.get(Unit, order.unit_id), order)
+            self.assertEqual(order.status, "done")
 
 
 class MoveCountsTest(unittest.TestCase):

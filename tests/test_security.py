@@ -3,7 +3,7 @@ import re
 import subprocess
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,10 +24,12 @@ from app.models import (
     DicomStudy,
     ImageTransfer,
     ManualMoveRequest,
+    ModalityRule,
     Order,
     Unit,
     UnitCompressRule,
     UnitDropModality,
+    UnitPriorModality,
     User,
 )
 from app.rate_limit import (
@@ -37,7 +39,7 @@ from app.rate_limit import (
 )
 from app.security import hash_password, verify_password
 from app.validation import validate_cloud_url
-from tests.support import postgres_test_engine
+from tests.support import make_unit, postgres_test_engine
 
 
 class SecurityTest(unittest.TestCase):
@@ -198,7 +200,7 @@ class SecurityTest(unittest.TestCase):
             "token": "unit-token",
             "cloud_url": DEFAULT_CLOUD_URL,
             "move_timeout_first": "600",
-            "move_timeout_second": "900",
+            "move_timeout_update": "900",
             "max_parallel_moves": "1",
             "find_interval_seconds": "30",
             "compact_workers": "8",
@@ -206,6 +208,52 @@ class SecurityTest(unittest.TestCase):
         }
         data.update(overrides)
         return data
+
+    def test_unit_saves_prior_modalities_and_keeps_them_while_disabled(self):
+        self.login()
+        new_form = self.client.get("/units/new")
+        self.assertIn('name="prior_modalities" value="CT,MR"', new_form.text)
+        token = self.token("/units/new")
+        self.client.post(
+            "/units/new",
+            data=self.unit_form_data(
+                csrf_token=token,
+                retrieve_prior_enabled="1",
+                prior_modalities="mr,CT,US",
+            ),
+        )
+        with self.Session() as db:
+            unit = db.scalar(select(Unit))
+            codes = [row.code for row in unit.prior_modalities]
+            self.assertEqual(codes, ["CT", "MR", "US"])
+            unit_id = unit.id
+        self.assertIn("Histórico ativo · CT, MR, US", self.client.get("/units").text)
+
+        # Disabled: the saved list is kept and comes back on the next edit.
+        self.client.post(
+            f"/units/{unit_id}",
+            data=self.unit_form_data(
+                csrf_token=token,
+                retrieve_prior_enabled="0",
+                prior_modalities="CT,MR,US",
+            ),
+        )
+        edit = self.client.get(f"/units/{unit_id}")
+        self.assertIn('name="prior_modalities" value="CT,MR,US"', edit.text)
+
+        # An empty list means every modality.
+        self.client.post(
+            f"/units/{unit_id}",
+            data=self.unit_form_data(
+                csrf_token=token, retrieve_prior_enabled="1", prior_modalities=""
+            ),
+        )
+        with self.Session() as db:
+            codes = [row.code for row in db.scalars(select(UnitPriorModality))]
+            self.assertEqual(codes, ["ALL"])
+        self.assertIn(
+            "Histórico ativo · todas as modalidades", self.client.get("/units").text
+        )
 
     def test_all_post_routes_require_csrf(self):
         self.login()
@@ -581,6 +629,131 @@ class SecurityTest(unittest.TestCase):
                     self.client.post(path, data={"csrf_token": token}).status_code,
                     403,
                 )
+
+    def test_retrieve_rules_configure_monitoring_per_modality(self):
+        self.login()
+        token = self.token("/rules/retrieve")
+        form = {
+            "csrf_token": token,
+            "modality": "CT",
+            "wait_minutes": "10",
+            "monitor_enabled": "1",
+            "monitor_interval_minutes": "5",
+            "monitor_max_hours": "6",
+        }
+        response = self.client.post("/rules/retrieve", data=form)
+        self.assertEqual(response.status_code, 200)
+        invalid = dict(
+            form, modality="MR", monitor_interval_minutes="120", monitor_max_hours="1"
+        )
+        response = self.client.post("/rules/retrieve", data=invalid)
+        self.assertIn("não pode ser maior que o tempo máximo", response.text)
+        # A disabled toggle does not post its fields; stored values are kept.
+        with self.Session() as db:
+            rule = db.scalar(select(ModalityRule).where(ModalityRule.modality == "CT"))
+            self.assertTrue(rule.monitor_enabled)
+            self.assertEqual(
+                (rule.monitor_interval_minutes, rule.monitor_max_hours), (5, 6)
+            )
+            self.assertIsNone(
+                db.scalar(select(ModalityRule).where(ModalityRule.modality == "MR"))
+            )
+            rule_id = rule.id
+        response = self.client.post(
+            f"/rules/retrieve/{rule_id}",
+            data={
+                "csrf_token": token,
+                "modality": "CT",
+                "wait_minutes": "10",
+                "monitor_enabled": "0",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("com monitoramento", response.text)
+        with self.Session() as db:
+            rule = db.get(ModalityRule, rule_id)
+            self.assertFalse(rule.monitor_enabled)
+            self.assertEqual(rule.monitor_interval_minutes, 5)
+
+    def test_order_queue_polls_summary_and_table_only(self):
+        self.login()
+        page = self.client.get("/orders?status=done")
+        self.assertIn('data-poll="/orders?status=done"', page.text)
+        self.assertIn("Atualização automática a cada 10 segundos", page.text)
+        partial = self.client.get("/orders?status=done", headers={"X-Partial": "1"})
+        self.assertEqual(partial.status_code, 200)
+        self.assertNotIn("<html", partial.text)
+        self.assertIn('data-poll-slot="summary"', partial.text)
+        self.assertIn('data-poll-slot="table"', partial.text)
+        # O formulário de filtros não volta no polling.
+        self.assertNotIn("orders-filter", partial.text)
+
+    def test_order_history_does_not_poll(self):
+        self.login()
+        page = self.client.get("/orders/history", headers={"X-Partial": "1"})
+        self.assertIn("<html", page.text)
+        self.assertNotIn("data-poll=", page.text)
+        self.assertNotIn("Atualização automática", page.text)
+
+    def test_missing_order_detail_redirects_with_notice(self):
+        self.login()
+        response = self.client.get("/orders/999999", follow_redirects=False)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/orders")
+        queue = self.client.get("/orders")
+        self.assertIn("Pedido não encontrado.", queue.text)
+
+    def test_monitoring_can_be_checked_now_or_stopped(self):
+        self.login()
+        now = datetime.now()
+        with self.Session() as db:
+            unit = make_unit()
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                acc="ACC-MON",
+                birth_date="19800102",
+                study_uid="1.2.3",
+                modality="CT",
+                status="monitoring",
+                monitor_interval_minutes=5,
+                monitor_next_at=now + timedelta(minutes=5),
+                monitor_until=now + timedelta(hours=6),
+                monitor_checks=3,
+            )
+            db.add(order)
+            db.commit()
+            order_id = order.id
+
+        detail = self.client.get(f"/orders/{order_id}")
+        self.assertIn("Verificar novas imagens agora", detail.text)
+        self.assertIn("Encerrar monitoramento", detail.text)
+        token = self.token(f"/orders/{order_id}")
+        self.client.post(f"/orders/{order_id}/monitor-now", data={"csrf_token": token})
+        with self.Session() as db:
+            self.assertLessEqual(
+                db.get(Order, order_id).monitor_next_at, datetime.now()
+            )
+
+        self.client.post(f"/orders/{order_id}/monitor-stop", data={"csrf_token": token})
+        with self.Session() as db:
+            order = db.get(Order, order_id)
+            self.assertEqual(order.status, "done")
+            self.assertIsNotNone(order.done_at)
+            self.assertIsNone(order.monitor_next_at)
+            messages = [event.message for event in order.events]
+            self.assertIn("Verificação imediata solicitada por tester", messages)
+            self.assertTrue(
+                messages[-1].startswith(
+                    "Monitoramento de novas imagens encerrado manualmente por tester"
+                )
+            )
+        # Done orders are no longer monitored.
+        response = self.client.post(
+            f"/orders/{order_id}/monitor-now", data={"csrf_token": token}
+        )
+        self.assertIn("não está monitorando", response.text)
 
     def test_audit_logs_record_changes_and_are_filterable(self):
         self.login()
