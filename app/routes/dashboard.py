@@ -104,7 +104,7 @@ def _dashboard_units(
                     func.sum(
                         case(
                             (
-                                Order.status.in_(("wait_retrieve", "wait_second"))
+                                Order.status.in_(("wait_retrieve", "wait_update"))
                                 | Order.prior_status.in_(("queued", "retry_wait")),
                                 1,
                             ),
@@ -114,7 +114,7 @@ def _dashboard_units(
                     func.sum(
                         case(
                             (
-                                Order.status.in_(("retrieving", "retrieving_second"))
+                                Order.status.in_(("retrieving", "retrieving_update"))
                                 | (Order.prior_status == "retrieving"),
                                 1,
                             ),
@@ -142,9 +142,9 @@ def _dashboard_units(
                             (
                                 "watching",
                                 "wait_retrieve",
-                                "wait_second",
+                                "wait_update",
                                 "retrieving",
-                                "retrieving_second",
+                                "retrieving_update",
                                 "error",
                             )
                         ),

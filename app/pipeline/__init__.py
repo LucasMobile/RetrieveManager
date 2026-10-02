@@ -3,6 +3,7 @@
 from app.pipeline.common import folder_counts
 from app.pipeline.compact import compact_unit
 from app.pipeline.find import find_pending
+from app.pipeline.monitor import check_monitoring
 from app.pipeline.move import claim_due_moves, fail_claimed_move, run_claimed_move
 from app.pipeline.orders import (
     acknowledge_pending_orders,
@@ -16,6 +17,7 @@ from app.pipeline.send import resend_failed_transfers, send_unit
 __all__ = [
     "acknowledge_pending_orders",
     "archive_completed_orders",
+    "check_monitoring",
     "claim_due_moves",
     "cleanup_unmatched_orders",
     "compact_unit",

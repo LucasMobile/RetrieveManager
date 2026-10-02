@@ -45,6 +45,25 @@
   });
 
   const customSelects = () => Array.from(document.querySelectorAll("[data-custom-select]"));
+  // Fixed to the viewport so cards with overflow: hidden never clip the menu;
+  // it opens upwards when there is no room below the trigger.
+  const placeCustomSelectMenu = (trigger, menu) => {
+    const rect = trigger.getBoundingClientRect();
+    const gap = 7;
+    const height = Math.min(menu.scrollHeight, 288);
+    const below = window.innerHeight - rect.bottom;
+    menu.style.position = "fixed";
+    menu.style.left = `${rect.left}px`;
+    menu.style.right = "auto";
+    menu.style.width = `${rect.width}px`;
+    if (below < height + gap * 2 && rect.top > below) {
+      menu.style.top = "auto";
+      menu.style.bottom = `${window.innerHeight - rect.top + gap}px`;
+    } else {
+      menu.style.top = `${rect.bottom + gap}px`;
+      menu.style.bottom = "auto";
+    }
+  };
   const setCustomSelectOpen = (select, open, restoreFocus = false) => {
     const trigger = select?.querySelector("[data-custom-select-trigger]");
     const menu = select?.querySelector("[data-custom-select-menu]");
@@ -52,6 +71,7 @@
     trigger.setAttribute("aria-expanded", String(open));
     menu.hidden = !open;
     select.classList.toggle("is-open", open);
+    if (open) placeCustomSelectMenu(trigger, menu);
     if (open) {
       const selected = menu.querySelector('[aria-selected="true"]');
       (selected || menu.querySelector("[data-custom-select-option]"))?.focus();
@@ -66,7 +86,9 @@
     });
   };
 
-  const initCustomSelects = (scope = document) => scope.querySelectorAll("[data-custom-select]").forEach((select) => {
+  const bindCustomSelect = (select) => {
+    if (select.dataset.customSelectBound) return;
+    select.dataset.customSelectBound = "1";
     const trigger = select.querySelector("[data-custom-select-trigger]");
     const menu = select.querySelector("[data-custom-select-menu]");
     const value = select.querySelector("[data-custom-select-value]");
@@ -85,6 +107,11 @@
         if (label) label.textContent = option.querySelector("span")?.textContent || option.textContent.trim();
         options.forEach((item) => item.setAttribute("aria-selected", String(item === option)));
         setCustomSelectOpen(select, false, true);
+        const native = select.nativeSelect;
+        if (native && native.value !== (option.dataset.value || "")) {
+          native.value = option.dataset.value || "";
+          native.dispatchEvent(new Event("change", { bubbles: true }));
+        }
         if (select.hasAttribute("data-custom-select-submit")) select.closest("form")?.requestSubmit();
       });
       option.addEventListener("keydown", (event) => {
@@ -114,12 +141,102 @@
         setCustomSelectOpen(select, false, true);
       }
     });
-  });
+  };
+  const initCustomSelects = (scope = document) =>
+    scope.querySelectorAll("[data-custom-select]").forEach(bindCustomSelect);
+
+  // Every native <select> gets the themed dropdown. The native element stays
+  // in the form, hidden, and keeps its name, value and "change" listeners.
+  const svgIcon = (path) =>
+    `<svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="${path}" /></svg>`;
+  let nativeSelectCount = 0;
+  const enhanceNativeSelect = (native) => {
+    if (native.dataset.nativeSelect !== undefined || native.multiple || native.size > 1) return;
+    native.dataset.nativeSelect = "enhanced";
+    nativeSelectCount += 1;
+    const baseId = native.id || `select-${nativeSelectCount}`;
+    const label = native.id ? document.querySelector(`label[for="${native.id}"]`) : null;
+    const labelId = label ? label.id || `${baseId}-label` : "";
+    if (label) label.id = labelId;
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "custom-select custom-select--native";
+    wrapper.setAttribute("data-custom-select", "");
+    wrapper.nativeSelect = native;
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "custom-select__trigger";
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("data-custom-select-trigger", "");
+    trigger.disabled = native.disabled;
+    const current = document.createElement("span");
+    current.id = `${baseId}-value`;
+    current.setAttribute("data-custom-select-label", "");
+    trigger.append(current);
+    trigger.insertAdjacentHTML("beforeend", svgIcon("m6 9 6 6 6-6"));
+    if (labelId) trigger.setAttribute("aria-labelledby", `${labelId} ${current.id}`);
+    else if (native.getAttribute("aria-label")) trigger.setAttribute("aria-label", native.getAttribute("aria-label"));
+
+    const menu = document.createElement("div");
+    menu.className = "custom-select__menu";
+    menu.setAttribute("role", "listbox");
+    menu.setAttribute("data-custom-select-menu", "");
+    if (labelId) menu.setAttribute("aria-labelledby", labelId);
+    menu.hidden = true;
+    Array.from(native.options).forEach((item) => {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "custom-select__option";
+      option.setAttribute("role", "option");
+      option.setAttribute("data-custom-select-option", "");
+      option.dataset.value = item.value;
+      option.disabled = item.disabled;
+      option.setAttribute("aria-selected", String(item.selected));
+      const text = document.createElement("span");
+      text.textContent = item.textContent.trim();
+      option.append(text);
+      option.insertAdjacentHTML("beforeend", svgIcon("m5 12 4 4L19 6"));
+      menu.append(option);
+    });
+    current.textContent = native.selectedOptions[0]?.textContent.trim() || "";
+
+    // The label now points at the visible trigger; the native id stays for scripts.
+    trigger.id = `${baseId}-trigger`;
+    if (label) label.htmlFor = trigger.id;
+    native.classList.add("custom-select__native");
+    native.tabIndex = -1;
+    native.setAttribute("aria-hidden", "true");
+    wrapper.append(trigger, menu);
+    native.after(wrapper);
+    bindCustomSelect(wrapper);
+  };
+  const enhanceNativeSelects = (scope = document) => {
+    if (scope.matches?.("select")) enhanceNativeSelect(scope);
+    scope.querySelectorAll?.("select").forEach(enhanceNativeSelect);
+  };
+  enhanceNativeSelects();
   initCustomSelects();
+  // Rows added later (e.g. DICOM rule conditions) are enhanced as they appear.
+  new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => mutation.addedNodes.forEach((node) => {
+      if (node.nodeType === Node.ELEMENT_NODE) enhanceNativeSelects(node);
+    }));
+  }).observe(document.body, { childList: true, subtree: true });
 
   document.addEventListener("click", (event) => {
     if (!event.target.closest("[data-custom-select]")) closeCustomSelects();
   });
+  // A fixed menu would drift away from its trigger: close it instead.
+  window.addEventListener("resize", () => closeCustomSelects());
+  window.addEventListener(
+    "scroll",
+    (event) => {
+      if (!event.target.closest?.("[data-custom-select-menu]")) closeCustomSelects();
+    },
+    true,
+  );
 
   const accountMenu = document.querySelector("[data-account-menu]");
   const accountMenuToggle = accountMenu?.querySelector("[data-account-menu-toggle]");
@@ -139,12 +256,45 @@
     if (accountMenu && !accountMenu.contains(event.target)) setAccountMenu(false);
   });
 
+  const actionMenus = [...document.querySelectorAll("[data-menu]")];
+  const setActionMenu = (menu, open, restoreFocus = false) => {
+    const toggle = menu.querySelector("[data-menu-toggle]");
+    const panel = menu.querySelector("[data-menu-panel]");
+    if (!toggle || !panel) return;
+    toggle.setAttribute("aria-expanded", String(open));
+    panel.hidden = !open;
+    if (open) panel.querySelector("button:not([disabled])")?.focus();
+    if (restoreFocus) toggle.focus();
+  };
+
+  actionMenus.forEach((menu) => {
+    const toggle = menu.querySelector("[data-menu-toggle]");
+    toggle?.addEventListener("click", () => {
+      setActionMenu(menu, toggle.getAttribute("aria-expanded") !== "true");
+    });
+    // Fecha antes do diálogo de confirmação abrir sobre o menu.
+    menu.addEventListener("submit", () => setActionMenu(menu, false));
+  });
+
+  document.addEventListener("click", (event) => {
+    actionMenus.forEach((menu) => {
+      if (!menu.contains(event.target)) setActionMenu(menu, false);
+    });
+  });
+
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && body.classList.contains("sidebar-is-open")) {
       setSidebar(false);
     }
     if (event.key === "Escape" && accountMenuToggle?.getAttribute("aria-expanded") === "true") {
       setAccountMenu(false, true);
+    }
+    if (event.key === "Escape") {
+      actionMenus.forEach((menu) => {
+        if (menu.querySelector("[data-menu-toggle]")?.getAttribute("aria-expanded") === "true") {
+          setActionMenu(menu, false, true);
+        }
+      });
     }
   });
 
@@ -241,9 +391,47 @@
     pendingForm = null;
   });
 
+  // Idade do último conteúdo recebido. O texto muda em degraus de 10 s para
+  // não repetir anúncios na região aria-live enquanto o polling está em dia.
+  const formatAge = (seconds) => {
+    if (seconds < 10) return "agora";
+    if (seconds < 60) return `há ${Math.floor(seconds / 10) * 10} s`;
+    return `há ${Math.floor(seconds / 60)} min`;
+  };
+
+  const renderPollAge = (element) => {
+    const updatedAt = Number(element.dataset.updatedAt || Date.now());
+    const interval = Number.parseInt(element.dataset.interval || "5000", 10);
+    const ageMs = Date.now() - updatedAt;
+    element.classList.toggle("is-stale", ageMs > interval * 3);
+    const age = formatAge(Math.floor(ageMs / 1000));
+    element.querySelectorAll("[data-age]").forEach((node) => {
+      const text = node.dataset.age ? `${node.dataset.age} ${age}` : age.charAt(0).toUpperCase() + age.slice(1);
+      if (node.textContent !== text) node.textContent = text;
+    });
+  };
+
+  // Regiões com [data-poll-slot] trocam só esses blocos (o resto, como um
+  // formulário de filtros, fica intacto); as demais trocam todo o conteúdo.
+  const applyPartial = (element, html) => {
+    const slots = element.querySelectorAll("[data-poll-slot]");
+    if (!slots.length) {
+      element.innerHTML = html;
+      return;
+    }
+    const incoming = new DOMParser().parseFromString(html, "text/html");
+    slots.forEach((slot) => {
+      const next = incoming.querySelector(`[data-poll-slot="${slot.dataset.pollSlot}"]`);
+      if (next) slot.replaceWith(document.importNode(next, true));
+    });
+  };
+
   const refreshPartial = async (element) => {
     if (element.dataset.loading === "true" || document.hidden) return;
     if (element.contains(document.activeElement)) return;
+    // Uma confirmação aberta aponta para um formulário da região; trocá-lo
+    // agora faria o "Confirmar" enviar um formulário que saiu da página.
+    if (document.querySelector("dialog[open]")) return;
 
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 8000);
@@ -256,9 +444,13 @@
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      element.innerHTML = await response.text();
+      // Sessão expirada redireciona para o login; não injetar essa página na região.
+      if (response.redirected) throw new Error("redirected");
+      applyPartial(element, await response.text());
       initCustomSelects(element);
       element.removeAttribute("data-poll-error");
+      element.dataset.updatedAt = String(Date.now());
+      renderPollAge(element);
     } catch (_error) {
       element.setAttribute("data-poll-error", "true");
     } finally {
@@ -268,9 +460,60 @@
     }
   };
 
-  document.querySelectorAll("[data-poll]").forEach((element) => {
+  const pollRegions = [...document.querySelectorAll("[data-poll]")];
+  pollRegions.forEach((element) => {
     const interval = Number.parseInt(element.dataset.interval || "5000", 10);
+    element.dataset.updatedAt = String(Date.now());
     window.setInterval(() => refreshPartial(element), Math.max(interval, 2000));
+  });
+  if (pollRegions.some((element) => element.querySelector("[data-age]"))) {
+    window.setInterval(() => pollRegions.forEach(renderPollAge), 1000);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) pollRegions.forEach(refreshPartial);
+  });
+
+  // Índice de seções: marca como atual a última seção cujo topo passou de
+  // 35% da altura da janela; no fim da página, a última seção.
+  document.querySelectorAll("[data-section-nav]").forEach((nav) => {
+    const entries = [...nav.querySelectorAll('a[href^="#"]')]
+      .map((link) => {
+        const target = document.getElementById(link.getAttribute("href").slice(1));
+        return target ? { link, section: target.closest("section") || target } : null;
+      })
+      .filter(Boolean);
+    if (!entries.length) return;
+
+    let current = null;
+    const update = () => {
+      const threshold = window.innerHeight * 0.35;
+      const atBottom =
+        window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+      let next = entries[0];
+      if (atBottom) {
+        next = entries[entries.length - 1];
+      } else {
+        entries.forEach((entry) => {
+          if (entry.section.getBoundingClientRect().top <= threshold) next = entry;
+        });
+      }
+      if (next === current) return;
+      current?.link.removeAttribute("aria-current");
+      next.link.setAttribute("aria-current", "location");
+      current = next;
+    };
+
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        update();
+      });
+    };
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    update();
   });
 
   const unitForm = document.querySelector("[data-unit-form]");
@@ -509,32 +752,114 @@
     renderCompressionSettings();
   }
 
-  document.querySelectorAll("[data-second-rule]").forEach((rule) => {
-    const toggle = rule.querySelector("[data-second-toggle]");
-    const value = rule.querySelector("[data-second-value]");
-    const field = rule.querySelector("[data-second-field]");
-    const input = rule.querySelector("[data-second-input]");
-    const label = rule.querySelector("[data-second-label]");
-    const description = rule.querySelector("[data-second-description]");
-    const attempt = toggle?.closest(".retrieve-attempt");
-    if (!toggle || !value || !field || !input || !label || !description) return;
+  const priorField = unitForm?.querySelector("[data-prior-modalities]");
+  if (priorField) {
+    const ALL = "ALL";
+    const priorValue = priorField.querySelector("[data-prior-value]");
+    const priorInput = priorField.querySelector("[data-prior-input]");
+    const priorChips = priorField.querySelector("[data-prior-chips]");
+    const priorToggle = unitForm.querySelector("#retrieve-prior-enabled");
+    const priors = new Set(
+      (priorValue?.value || "").split(",").map((value) => value.trim()).filter(Boolean),
+    );
+    const sortedPriors = () =>
+      Array.from(priors).sort((left, right) => left.localeCompare(right));
+    const priorEnabled = () => !priorToggle || priorToggle.checked;
 
-    const setSecondRetrieve = (active) => {
+    // ALL is exclusive: it stands alone and comes back when the list empties.
+    const renderPriors = () => {
+      if (!priors.size) priors.add(ALL);
+      if (priorValue) priorValue.value = sortedPriors().join(",");
+      const enabled = priorEnabled();
+      priorField.classList.toggle("is-disabled", !enabled);
+      if (priorInput) priorInput.disabled = !enabled;
+      if (!priorChips) return;
+      priorChips.replaceChildren();
+      sortedPriors().forEach((value) => {
+        const chip = document.createElement("span");
+        chip.className = "modality-selection-chip";
+        chip.textContent = value === ALL ? "ALL · todas" : value;
+        if (value !== ALL) {
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.disabled = !enabled;
+          remove.setAttribute("aria-label", `Remover ${value} dos exames anteriores`);
+          remove.textContent = "×";
+          remove.addEventListener("click", () => {
+            priors.delete(value);
+            renderPriors();
+          });
+          chip.append(remove);
+        }
+        priorChips.append(chip);
+      });
+    };
+
+    const addPrior = () => {
+      if (!priorInput || priorInput.disabled) return true;
+      const modality = priorInput.value.trim().toUpperCase();
+      if (!modality) return true;
+      if (!/^[A-Z0-9]{1,8}$/.test(modality)) {
+        priorInput.setCustomValidity("Use um código DICOM com até 8 letras ou números.");
+        priorInput.reportValidity();
+        return false;
+      }
+      priorInput.setCustomValidity("");
+      if (modality === ALL) priors.clear();
+      else priors.delete(ALL);
+      priors.add(modality);
+      priorInput.value = "";
+      renderPriors();
+      return true;
+    };
+    priorInput?.addEventListener("input", () => priorInput.setCustomValidity(""));
+    priorInput?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === ",") {
+        event.preventDefault();
+        addPrior();
+      } else if (event.key === "Backspace" && !priorInput.value && !priors.has(ALL)) {
+        priors.delete(sortedPriors().at(-1));
+        renderPriors();
+      }
+    });
+    priorInput?.addEventListener("blur", addPrior);
+    priorToggle?.addEventListener("change", renderPriors);
+    unitForm.addEventListener("submit", (event) => {
+      if (!addPrior()) event.preventDefault();
+    });
+    renderPriors();
+  }
+
+  document.querySelectorAll("[data-monitor-rule]").forEach((rule) => {
+    const toggle = rule.querySelector("[data-monitor-toggle]");
+    const value = rule.querySelector("[data-monitor-value]");
+    const fields = rule.querySelectorAll("[data-monitor-field]");
+    const inputs = rule.querySelectorAll("[data-monitor-input]");
+    const label = rule.querySelector("[data-monitor-label]");
+    const description = rule.querySelector("[data-monitor-description]");
+    const attempt = toggle?.closest(".retrieve-attempt");
+    if (!toggle || !value || !inputs.length || !label || !description) return;
+
+    const setMonitoring = (active) => {
       toggle.setAttribute("aria-checked", String(active));
       toggle.setAttribute(
         "aria-label",
-        `${active ? "Desativar" : "Ativar"} segunda tentativa`,
+        `${active ? "Desativar" : "Ativar"} monitoramento de novas imagens`,
       );
       value.value = active ? "1" : "0";
-      input.disabled = !active;
-      field.classList.toggle("is-disabled", !active);
+      inputs.forEach((input) => {
+        input.disabled = !active;
+      });
+      fields.forEach((field) => field.classList.toggle("is-disabled", !active));
       attempt?.classList.toggle("is-off", !active);
-      label.textContent = active ? "Ativada" : "Desativada";
-      description.textContent = active ? "Nova busca automática" : "Uma única busca";
+      label.textContent = active ? "Ativado" : "Desativado";
+      description.textContent = active
+        ? "Consulta periódica no PACS"
+        : "Somente o 1º retrieve";
     };
 
     toggle.addEventListener("click", () => {
-      setSecondRetrieve(toggle.getAttribute("aria-checked") !== "true");
+      setMonitoring(toggle.getAttribute("aria-checked") !== "true");
     });
   });
 

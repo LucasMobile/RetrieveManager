@@ -126,24 +126,9 @@ def _seed(db: Session) -> None:
     if db.scalar(select(ModalityRule).limit(1)) is None:
         db.add_all(
             [
-                ModalityRule(
-                    modality="CT",
-                    wait_minutes=15,
-                    second_retrieve=True,
-                    second_wait_minutes=90,
-                ),
-                ModalityRule(
-                    modality="MR",
-                    wait_minutes=15,
-                    second_retrieve=True,
-                    second_wait_minutes=90,
-                ),
-                ModalityRule(
-                    modality="*",
-                    wait_minutes=10,
-                    second_retrieve=False,
-                    second_wait_minutes=90,
-                ),
+                ModalityRule(modality="CT", wait_minutes=10, monitor_enabled=True),
+                ModalityRule(modality="MR", wait_minutes=10, monitor_enabled=True),
+                ModalityRule(modality="*", wait_minutes=10, monitor_enabled=False),
             ]
         )
 

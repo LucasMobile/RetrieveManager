@@ -78,7 +78,11 @@ class UnitCompressionTest(DatabaseTestCase):
 
     def test_new_unit_form_starts_from_the_defaults(self):
         settings = default_unit_compression_form()
-        self.assertEqual(settings.profiles["lossless"], set())
+        self.assertEqual(settings.profiles["lossless"], {"CT", "MR", "SC"})
+        self.assertEqual(
+            settings.profiles["lossy"],
+            {"BMD", "CP", "CR", "DX", "ECG", "EEG", "ES", "MG", "NM", "OT", "US", "XA"},
+        )
         self.assertIn("CR", settings.profiles["lossy"])
         self.assertIn("SR", settings.drops)
         self.assertFalse(settings.profiles["lossy"] & settings.drops)

@@ -239,10 +239,11 @@ def badge_for(status: str) -> str:
         "cancelled": "off",
         "watching": "info",
         "wait_retrieve": "warn",
-        "wait_second": "warn",
-        "retrieving": "accent",
-        "retrieving_second": "accent",
-        "receiving": "accent",
+        "wait_update": "warn",
+        "monitoring": "info",
+        "retrieving": "progress",
+        "retrieving_update": "progress",
+        "receiving": "progress",
     }.get(status, "off")
 
 

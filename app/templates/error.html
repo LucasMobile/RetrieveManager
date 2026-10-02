@@ -8,13 +8,14 @@
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>{{ status_code }} · Retrieve Manager</title>
   <script src="/static/theme.js?v=1"></script>
-  <link rel="stylesheet" href="/static/app.css?v=34">
+  <link rel="stylesheet" href="/static/app.css?v=54">
 </head>
 <body>
 <main class="error-page">
   <section class="surface error-panel" aria-labelledby="error-title">
     <a class="brand" href="{{ home_href }}" aria-label="Retrieve Manager — início">
-      <img class="error-panel__logo" src="/static/logo-white.png?v=1" alt="Mobilemed" width="965" height="174">
+      <img class="error-panel__logo theme-logo--light" src="/static/logo-white.png?v=1" alt="Mobilemed" width="965" height="174">
+      <img class="error-panel__logo theme-logo--dark" src="/static/logo-dark.png?v=1" alt="Mobilemed" width="964" height="174">
       <span class="visually-hidden">Retrieve Manager</span>
     </a>
     <div class="error-panel__code">ERRO {{ status_code }}</div>

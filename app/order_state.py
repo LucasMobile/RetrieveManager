@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.models import Order
 
-ACTIVE_ORDER_STATUSES = frozenset({"retrieving", "retrieving_second", "receiving"})
+ACTIVE_ORDER_STATUSES = frozenset({"retrieving", "retrieving_update", "receiving"})
 ACTIVE_PRIOR_STATUSES = frozenset({"queued", "retry_wait", "retrieving"})
 
 

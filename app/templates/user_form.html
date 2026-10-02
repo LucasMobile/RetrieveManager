@@ -9,7 +9,6 @@
       <nav class="breadcrumb" aria-label="Navegação estrutural">
         <a href="/users">Usuários</a><span aria-hidden="true">/</span><span>{% if managed_user %}{{ managed_user.username }}{% else %}Novo usuário{% endif %}</span>
       </nav>
-      <p class="eyebrow">Controle de acesso</p>
       <h1>{% if managed_user %}Editar usuário{% else %}Novo usuário{% endif %}</h1>
       <p class="page-header__description">{% if managed_user %}Altere o perfil ou redefina a senha da conta.{% else %}Crie uma credencial e escolha as permissões iniciais.{% endif %}</p>
     </div>

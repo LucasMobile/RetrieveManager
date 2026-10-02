@@ -37,7 +37,8 @@ from app.parse import (
 )
 from app.pipeline.common import bounded_db_text, ensure_order_correlation, log
 from app.pipeline.find import prior_date_range
-from app.rules import schedule_from_now
+from app.pipeline.monitor import reset_monitoring, start_monitoring
+from app.rules import monitor_plan_for, prior_skip_reason, schedule_from_now
 
 
 class InboundDicomRejected(RuntimeError):
@@ -511,7 +512,8 @@ def _register_store_received_order(
         )
 
     now = datetime.now()
-    modality, _ignored_first_at, second_at = schedule_from_now(db, result.modality)
+    modality, _ignored_first_at = schedule_from_now(db, result.modality)
+    monitor = monitor_plan_for(db, modality)
     if order is None:
         correlation_id = new_correlation_id()
         order = Order(
@@ -527,18 +529,18 @@ def _register_store_received_order(
             correlation_id=correlation_id,
             api_read_status="confirmed",
             api_read_at=now,
-            status="wait_second" if second_at else "done",
+            status="done",
             study_uid=study_uid,
             modality=bounded_db_text(modality, 32),
             body_part=bounded_db_text(result.body_part, 64),
             prior_status="disabled",
             retrieve_at=None,
-            second_retrieve_at=second_at,
             found_at=now,
-            done_at=None if second_at else now,
+            done_at=now,
         )
         db.add(order)
         db.flush()
+        window = start_monitoring(order, monitor, now) if monitor else ""
         db.add(
             AuditLog(
                 actor_id=None,
@@ -555,15 +557,12 @@ def _register_store_received_order(
                 ip_address="",
             )
         )
-        if second_at:
-            message = (
-                "Exame recebido diretamente pelo Store SCP; "
-                f"2º retrieve agendado para {second_at:%d/%m/%Y às %H:%M}"
-            )
+        if window:
+            message = f"Exame recebido diretamente pelo Store SCP. {window}"
         else:
             message = (
                 "Exame recebido diretamente pelo Store SCP; modalidade sem "
-                "2º retrieve configurado"
+                "monitoramento de novas imagens"
             )
         add_event(db, order, message)
         action = "created"
@@ -579,16 +578,25 @@ def _register_store_received_order(
         # A direct delivery can satisfy a queued order that had not yet found
         # the study. An archived order is restored as requested. A completed,
         # non-archived order is merely reused, so every image in the same batch
-        # cannot repeatedly schedule a new second retrieve.
+        # cannot repeatedly restart the monitoring window.
         if order.status == "watching" or was_archived:
-            order.status = "wait_second" if second_at else "done"
             order.retrieve_at = None
-            order.second_retrieve_at = second_at
             order.attempts = 0
             order.last_error = ""
             order.heartbeat_at = None
-            order.done_at = None if second_at else now
-        if was_watching and unit.retrieve_prior_enabled:
+            reset_monitoring(order)
+            if monitor:
+                add_event(
+                    db,
+                    order,
+                    "Exame recebido diretamente pelo Store SCP. "
+                    + start_monitoring(order, monitor, now),
+                )
+            else:
+                order.status = "done"
+                order.done_at = now
+        prior_skip = prior_skip_reason(db, unit, order.modality) if was_watching else ""
+        if prior_skip is None:
             prior_from, prior_to = prior_date_range(now.date())
             order.prior_status = "queued"
             order.prior_date_from = prior_from
@@ -599,6 +607,8 @@ def _register_store_received_order(
             order.prior_heartbeat_at = None
             order.prior_attempts = 0
             order.prior_last_error = ""
+        elif prior_skip:
+            add_event(db, order, prior_skip)
         if was_archived:
             order.archived_at = None
             order.archive_reason = ""
@@ -626,13 +636,13 @@ def _register_store_received_order(
                 "Pedido arquivado restaurado após recebimento direto do estudo",
             )
             action = "restored"
-        elif order.status in ("wait_second", "done") and matched_by == "accession":
+        elif order.status in ("monitoring", "done") and matched_by == "accession":
             add_event(
                 db,
                 order,
                 "Exame recebido diretamente e associado ao pedido pelo accession",
             )
-            if was_watching and unit.retrieve_prior_enabled:
+            if prior_skip is None:
                 add_event(
                     db,
                     order,
@@ -654,10 +664,8 @@ def _register_store_received_order(
             result=action,
             matched_by=matched_by if action != "created" else None,
             modality=order.modality,
-            second_retrieve_at=(
-                order.second_retrieve_at.isoformat()
-                if order.second_retrieve_at
-                else None
+            monitor_until=(
+                order.monitor_until.isoformat() if order.monitor_until else None
             ),
         )
     return order, f"storescp_{action}"

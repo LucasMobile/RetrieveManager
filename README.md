@@ -334,6 +334,9 @@ Campos principais:
 - Token (identificação na nuvem)
 - Endpoint de envio para a nuvem
 - Retrieve de exames anteriores (opcional) e timeout, com padrão de 30 minutos
+- Modalidades com exames anteriores: só exames destas modalidades buscam
+  anteriores (CT e MR numa unidade nova; `ALL` ou lista vazia = todas). A lista
+  fica salva mesmo com o histórico desligado.
 
 Depois de salvar, cadastre o Dest AET + porta **no PACS**.
 
@@ -401,7 +404,8 @@ primeira modalidade aceita pelo catálogo de compactação da unidade, desconsid
 modalidades descartadas como SR e PR. O `BodyPartExamined (0018,0015)` vem da mesma
 série selecionada; se nenhuma série clínica válida existir, o pedido continua em
 observação e a consulta é repetida. Quando o retrieve de exames anteriores está
-ativo, o worker executa outro C-FIND em nível de série usando paciente, nascimento,
+ativo e a modalidade do exame está na lista da unidade, o worker executa outro
+C-FIND em nível de série usando paciente, nascimento,
 essa modalidade, body part e o intervalo entre três anos atrás e ontem. O Patient
 ID é consultado exatamente como veio do PLERES e body part vazio é permitido.
 Cada série devolvida precisa trazer o mesmo `PatientID` e a mesma data de
@@ -415,14 +419,15 @@ nenhum C-MOVE é executado. O processo compartilha o limite de paralelismo da
 unidade, mas não bloqueia um retrieve atual que já esteja no horário e haja
 capacidade disponível. Cada série histórica concluída recebe um checkpoint e não
 é repetida se outra série precisar de retry. O exame atual continua sendo
-recuperado pelo Study UID; seus tempos e eventual segundo retrieve não se aplicam
-aos exames anteriores.
+recuperado pelo Study UID; seus tempos e o monitoramento de novas imagens não se
+aplicam aos exames anteriores.
 
 Quando um estudo chega diretamente ao Store SCP sem pedido correspondente, o
 recebimento conta como o primeiro retrieve. O worker cria somente um pedido por
-unidade e Study UID, preenche-o com as tags do DICOM e agenda apenas o segundo
-retrieve, quando ele estiver habilitado na regra da modalidade. Modalidades sem
-segundo retrieve terminam sem um novo C-MOVE. Antes de criar, o worker prioriza um
+unidade e Study UID, preenche-o com as tags do DICOM e abre a janela de
+monitoramento de novas imagens, quando ela estiver habilitada na regra da
+modalidade. Modalidades sem monitoramento terminam sem um novo C-MOVE. Antes de
+criar, o worker prioriza um
 pedido atual pelo Study UID, depois um histórico ativo e por fim um pedido anterior
 do mesmo Study UID — ou um pedido ainda sem UID com o mesmo accession. Pedidos
 arquivados do mesmo estudo são restaurados.
@@ -435,16 +440,43 @@ O fluxo operacional, os limites de falha e o catálogo de logs estão detalhados
 Na página do pedido, **Retrieve agora** cria uma solicitação persistente para um
 C-MOVE adicional apenas do Study UID do exame atual. A solicitação só fica
 disponível depois que o C-FIND encontra o estudo, respeita o limite de movimentos
-paralelos da unidade e não substitui os horários normais do primeiro e do segundo
-retrieve. O botão **Atualizar** recarrega o estado e os eventos da página.
+paralelos da unidade e não substitui o 1º retrieve nem o monitoramento. O botão
+**Atualizar** recarrega o estado e os eventos da página.
+
+## Monitoramento de novas imagens
+
+Muitos exames continuam chegando ao PACS depois de encontrados. Quando o 1º
+C-MOVE termina, o pedido de uma modalidade com monitoramento fica em
+**Monitorando novas imagens**: a cada intervalo (5 min por padrão) o worker faz
+um C-FIND no nível SERIES e compara o `NumberOfSeriesRelatedInstances` de cada
+série com as imagens já **recebidas** pela unidade, em qualquer estado.
+Imagens que falharam depois na compactação ou no envio contam como recebidas e
+não são pedidas de novo ao PACS. As séries que ganharam imagens são recuperadas
+por Study UID + Series UID; se o PACS não informar a contagem, o estudo inteiro
+é pedido. Cada verificação gera um evento na linha do tempo do pedido (contagens
+do PACS e recebidas, por série, nos detalhes técnicos), assim como cada C-MOVE
+de novas imagens.
+
+O monitoramento dura o tempo máximo da regra (6 h por padrão), contado a partir
+do fim do 1º retrieve; a última verificação ocorre no fim da janela. Só então o
+pedido fica **Retrieve concluído**. Falhas de C-FIND ou de C-MOVE durante o
+monitoramento não colocam o pedido em erro: a verificação seguinte compara as
+contagens de novo. Na página do pedido, **Verificar novas imagens agora** antecipa
+a próxima consulta e **Encerrar monitoramento** conclui o pedido imediatamente.
+
+As verificações usam threads próprias (`MONITOR_UNIT_SCHEDULERS`, com
+`MONITOR_CHECKS_PER_UNIT` consultas simultâneas por unidade e até
+`MONITOR_BATCH_SIZE` pedidos por rodada), separadas do C-FIND de exames novos.
+O C-MOVE de novas imagens usa o timeout **Timeout do C-MOVE de novas imagens**
+da unidade e respeita o limite de C-MOVE em paralelo.
 
 ## Regras padrão (editáveis na tela)
 
-| Modalidade | 1º retrieve | 2º retrieve |
-|---|---|---|
-| CT | 15 min | 90 min |
-| MR | 15 min | 90 min |
-| * (demais) | 10 min | não |
+| Modalidade | 1º retrieve | Monitoramento | Intervalo | Tempo máximo |
+|---|---|---|---|---|
+| CT | 10 min | sim | 5 min | 6 h |
+| MR | 10 min | sim | 5 min | 6 h |
+| * (demais) | 10 min | não | — | — |
 
 Compactação e descarte são configurados separadamente em cada unidade. Os perfis
 são JPEG 2000 Lossless e JPEG 2000 Lossy. No Lossy a taxa depende de

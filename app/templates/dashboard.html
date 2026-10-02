@@ -9,7 +9,7 @@
       <h1>Visão geral</h1>
       <p class="page-header__description">Disponibilidade das unidades e volume em cada etapa do processamento.</p>
     </div>
-    {% if user.role == 'admin' %}<div class="page-header__actions">
+    {% if user.role == 'admin' and (units or (pager and pager.total)) %}<div class="page-header__actions">
       <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
     </div>{% endif %}
   </header>

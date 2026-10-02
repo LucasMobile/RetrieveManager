@@ -10,8 +10,8 @@
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>{% block title %}Retrieve Manager{% endblock %}</title>
   <script src="/static/theme.js?v=2"></script>
-  <link rel="stylesheet" href="/static/app.css?v=35">
-  <script src="/static/app.js?v=14" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=54">
+  <script src="/static/app.js?v=21" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Pular para o conteúdo</a>
@@ -49,7 +49,7 @@
 
       <p class="nav__label">Configurações</p>
       <a href="/rules" class="nav__item{% if nav == 'rules' %} is-active{% endif %}"{% if nav == 'rules' %} aria-current="page"{% endif %}>
-        {{ icon("sliders-horizontal") }}<span>Regras</span>
+        {{ icon("sliders-horizontal") }}<span>Regras DICOM</span>
       </a>
       <a href="/rules/retrieve" class="nav__item{% if nav == 'retrieve' %} is-active{% endif %}"{% if nav == 'retrieve' %} aria-current="page"{% endif %}>
         {{ icon("clock") }}<span>Tempo de retrieve</span>

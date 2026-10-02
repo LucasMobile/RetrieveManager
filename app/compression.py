@@ -134,13 +134,22 @@ def save_unit_compression_settings(
 
 
 # Starting point for a new unit's form; each unit is configured on its own.
-DEFAULT_LOSSY_MODALITIES = frozenset({"CR", "DX", "MG", "OT", "XA"})
-DEFAULT_DROP_MODALITIES = frozenset({"PR", "PS", "SG", "SR", "RA", "US"})
+DEFAULT_LOSSLESS_MODALITIES = frozenset({"CT", "MR", "SC"})
+DEFAULT_DROP_MODALITIES = frozenset({"PR", "PS", "SG", "SR", "RA"})
+# Every other catalog modality that is not discarded on reception.
+DEFAULT_LOSSY_MODALITIES = (
+    frozenset(COMPRESSION_MODALITIES)
+    - DEFAULT_LOSSLESS_MODALITIES
+    - DEFAULT_DROP_MODALITIES
+)
 
 
 def default_unit_compression_form() -> UnitCompressionForm:
     return UnitCompressionForm(
-        {PROFILE_LOSSLESS: frozenset(), PROFILE_LOSSY: DEFAULT_LOSSY_MODALITIES},
+        {
+            PROFILE_LOSSLESS: DEFAULT_LOSSLESS_MODALITIES,
+            PROFILE_LOSSY: DEFAULT_LOSSY_MODALITIES,
+        },
         DEFAULT_DROP_MODALITIES,
     )
 

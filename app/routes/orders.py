@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.db import get_db
+from app.events import add_event
 from app.models import (
     STATUSES,
     HistoricalImageLink,
@@ -35,8 +36,9 @@ from app.order_state import (
 )
 from app.pager import cursor_page_links, paginate, query_keep
 from app.pipeline import resend_failed_transfers
+from app.pipeline.monitor import finish_monitoring, reset_monitoring
 from app.retention import archive_order
-from app.rules import schedule_from_now
+from app.rules import prior_skip_reason
 from app.web import (
     DEFAULT_PAGE_SIZE,
     EVENTS_PAGE,
@@ -54,6 +56,8 @@ from app.web import (
 )
 
 router = APIRouter()
+
+MONITOR_STOPPABLE = frozenset({"monitoring", "wait_update"})
 
 
 @router.post("/orders/{order_id}/resend-failed")
@@ -96,6 +100,10 @@ def _order_send_failures(db: Session, order_id: int) -> int:
         )
         or 0
     )
+
+
+# Intervalo do auto-refresh da fila; a consulta é mais pesada que a da visão geral.
+ORDERS_POLL_SECONDS = 10
 
 
 @router.get("/orders", response_class=HTMLResponse)
@@ -217,7 +225,7 @@ def _orders_response(
                 case(
                     (
                         filtered_orders.c.status.in_(
-                            ("watching", "wait_retrieve", "wait_second")
+                            ("watching", "wait_retrieve", "wait_update")
                         )
                         | filtered_orders.c.prior_status.in_(("queued", "retry_wait")),
                         1,
@@ -315,13 +323,16 @@ def _orders_response(
     return_to = request.url.path
     if request.url.query:
         return_to = f"{return_to}?{request.url.query}"
+    # O polling da fila pede só resumo e tabela; o histórico não muda sozinho.
+    partial = not history and request.headers.get("x-partial") == "1"
     return templates.TemplateResponse(
         request=request,
-        name="orders.html",
+        name="orders_partial.html" if partial else "orders.html",
         context=ctx(
             request,
             db,
             "order_history" if history else "orders",
+            poll_seconds=0 if history else ORDERS_POLL_SECONDS,
             orders=rows,
             units=units,
             statuses=STATUSES,
@@ -378,6 +389,7 @@ def order_detail(
         select(Order).options(selectinload(Order.unit)).where(Order.id == order_id)
     )
     if order is None:
+        flash(request, "Pedido não encontrado.", "err")
         return RedirectResponse("/orders", status_code=303)
     default_return_path = "/orders/history" if order.archived_at else "/orders"
     parsed_return = urlsplit(return_to)
@@ -678,6 +690,81 @@ def order_retry_prior(
     return RedirectResponse(f"/orders/{order_id}", status_code=303)
 
 
+@router.post("/orders/{order_id}/monitor-now")
+def order_monitor_now(
+    order_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    order = db.get(Order, order_id)
+    if order is None:
+        flash(request, "Pedido não encontrado.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    if order.archived_at is not None or order.status != "monitoring":
+        flash(request, "O pedido não está monitorando novas imagens.", "err")
+    else:
+        order.monitor_next_at = datetime.now()
+        add_event(db, order, f"Verificação imediata solicitada por {user.username}")
+        audit(
+            db,
+            request,
+            user,
+            action="retry",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary="Verificação imediata de novas imagens solicitada.",
+        )
+        db.commit()
+        flash(request, "Verificação de novas imagens colocada na fila imediata.")
+    return RedirectResponse(f"/orders/{order_id}", status_code=303)
+
+
+@router.post("/orders/{order_id}/monitor-stop")
+def order_monitor_stop(
+    order_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    order = db.scalar(select(Order).where(Order.id == order_id).with_for_update())
+    if order is None:
+        flash(request, "Pedido não encontrado.", "err")
+        return RedirectResponse("/orders", status_code=303)
+    if order.archived_at is not None or order.status not in MONITOR_STOPPABLE:
+        flash(
+            request,
+            "Só é possível encerrar um monitoramento sem C-MOVE em andamento.",
+            "err",
+        )
+    else:
+        finish_monitoring(db, order, datetime.now(), user.username)
+        audit(
+            db,
+            request,
+            user,
+            action="update",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary="Monitoramento de novas imagens encerrado manualmente.",
+        )
+        db.commit()
+        log_event(
+            log,
+            logging.INFO,
+            "order.monitor.stop",
+            resource=f"order:{order.id}",
+            status="success",
+            order_id=order.id,
+            unit_id=order.unit_id,
+            user_id=user.id,
+        )
+        flash(request, "Monitoramento de novas imagens encerrado.")
+    return RedirectResponse(f"/orders/{order_id}", status_code=303)
+
+
 def _reset_order_for_reprocess(db: Session, order: Order) -> None:
     order.correlation_id = new_correlation_id()
     order.attempts = 0
@@ -685,7 +772,8 @@ def _reset_order_for_reprocess(db: Session, order: Order) -> None:
     order.heartbeat_at = None
     order.last_error = ""
     if order.prior_status == "cancelled":
-        if order.unit.retrieve_prior_enabled:
+        prior_skip = prior_skip_reason(db, order.unit, order.modality)
+        if prior_skip is None:
             order.prior_status = "queued"
             order.prior_due_at = datetime.now()
             order.prior_started_at = None
@@ -695,16 +783,17 @@ def _reset_order_for_reprocess(db: Session, order: Order) -> None:
             order.prior_last_error = ""
         else:
             order.prior_status = "disabled"
+            if prior_skip:
+                add_event(db, order, prior_skip)
     if order.study_uid:
         order.status = "wait_retrieve"
         order.retrieve_at = datetime.now()
-        _, _, order.second_retrieve_at = schedule_from_now(db, order.modality)
     else:
         order.status = "watching"
         order.last_find_at = None
         order.retrieve_at = None
-        order.second_retrieve_at = None
         order.found_at = None
+    reset_monitoring(order)
     db.add(
         OrderEvent(
             order_id=order.id,

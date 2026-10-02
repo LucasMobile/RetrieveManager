@@ -14,6 +14,7 @@ from app.models import (
     Order,
     OrderEvent,
     Unit,
+    UnitPriorModality,
 )
 from app.pipeline.find import _find_one, find_pending, prior_date_range
 from app.pipeline.move import (
@@ -66,7 +67,7 @@ class PriorRetrieveTest(DatabaseTestCase):
         super().setUp()
         # No test may reach a real PACS: the complementary SERIES query
         # defaults to "no series"; tests that need series patch it again.
-        for module in ("find", "move"):
+        for module in ("find", "monitor"):
             series = patch(
                 f"app.pipeline.{module}.find_study_series",
                 return_value=FindResult(True),
@@ -152,7 +153,7 @@ class PriorRetrieveTest(DatabaseTestCase):
                 patch("app.pipeline.find.find_study", return_value=output),
                 patch(
                     "app.pipeline.find.schedule_from_now",
-                    return_value=("MR", first_at, None),
+                    return_value=("MR", first_at),
                 ),
             ):
                 _find_one(db, unit, order, found_at)
@@ -165,6 +166,53 @@ class PriorRetrieveTest(DatabaseTestCase):
             self.assertEqual(order.prior_date_from, "20230911")
             self.assertEqual(order.prior_date_to, "20260910")
             self.assertEqual(order.prior_due_at, found_at)
+
+    def test_find_queues_prior_only_for_modalities_of_the_unit_list(self):
+        for modality, expected in (("CT", "queued"), ("DX", "disabled")):
+            with self.subTest(modality=modality), self.Session() as db:
+                unit = self._unit()
+                unit.name = f"unit-{modality}"
+                db.add(unit)
+                db.flush()
+                db.add_all(
+                    UnitPriorModality(unit_id=unit.id, code=code)
+                    for code in ("CT", "MR")
+                )
+                order = self._order(
+                    unit.id,
+                    status="watching",
+                    study_uid="",
+                    modality="",
+                    body_part="",
+                    prior_status="disabled",
+                    prior_due_at=None,
+                )
+                db.add(order)
+                db.commit()
+                output = study_find_output(
+                    {
+                        "StudyInstanceUID": f"1.2.3.{modality}",
+                        "ModalitiesInStudy": modality,
+                        "BodyPartExamined": "CHEST",
+                    }
+                )
+                with (
+                    patch("app.pipeline.find.find_study", return_value=output),
+                    patch(
+                        "app.pipeline.find.schedule_from_now",
+                        return_value=(modality, datetime.now()),
+                    ),
+                ):
+                    _find_one(db, unit, order, datetime.now())
+
+                self.assertEqual(order.status, "wait_retrieve")
+                self.assertEqual(order.prior_status, expected)
+                messages = [event.message for event in order.events]
+                skipped = (
+                    "Histórico não solicitado: DX não está nas modalidades de "
+                    "exames anteriores da unidade (CT, MR)"
+                )
+                self.assertEqual(skipped in messages, expected == "disabled")
 
     def test_find_skips_sr_series_and_uses_next_clinical_modality(self):
         with self.Session() as db:
@@ -206,7 +254,7 @@ class PriorRetrieveTest(DatabaseTestCase):
                 ),
                 patch(
                     "app.pipeline.find.schedule_from_now",
-                    return_value=("MR", first_at, None),
+                    return_value=("MR", first_at),
                 ) as schedule,
             ):
                 _find_one(db, unit, order, found_at)
@@ -291,7 +339,7 @@ class PriorRetrieveTest(DatabaseTestCase):
                 ) as series_find,
                 patch(
                     "app.pipeline.find.schedule_from_now",
-                    return_value=("CT", datetime.now(), None),
+                    return_value=("CT", datetime.now()),
                 ),
             ):
                 _find_one(db, unit, order, datetime.now())
@@ -328,7 +376,7 @@ class PriorRetrieveTest(DatabaseTestCase):
                 patch("app.pipeline.find.find_study", return_value=output),
                 patch(
                     "app.pipeline.find.schedule_from_now",
-                    return_value=("MR", datetime.now(), None),
+                    return_value=("MR", datetime.now()),
                 ),
             ):
                 _find_one(db, unit, order, datetime.now())
@@ -368,7 +416,7 @@ class PriorRetrieveTest(DatabaseTestCase):
             ) as series,
             patch(
                 "app.pipeline.find.schedule_from_now",
-                return_value=("MR", datetime.now(), None),
+                return_value=("MR", datetime.now()),
             ) as schedule,
         ):
             _find_one(db, unit, order, datetime.now())
@@ -628,7 +676,7 @@ class PriorRetrieveTest(DatabaseTestCase):
             db.commit()
 
             with patch("app.pipeline.move.move_study", return_value=move_failed()):
-                _run_move(db, unit, order, second=False)
+                _run_move(db, unit, order)
 
             self.assertEqual(order.status, "wait_retrieve")
             self.assertEqual(order.attempts, 1)

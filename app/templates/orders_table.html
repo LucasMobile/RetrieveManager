@@ -1,0 +1,64 @@
+{% from "icons.html" import icon %}
+{% from "components/forms.html" import post_action %}
+  <section class="surface orders-table-card" aria-labelledby="orders-table-title" data-poll-slot="table">
+    <div class="orders-table-card__header">
+      <div><h2 id="orders-table-title">{{ 'Pedidos arquivados' if history else 'Pedidos encontrados' }}</h2><p>Ordenados dos mais recentes para os mais antigos.</p></div>
+      <div class="orders-table-card__meta">
+        {% if poll_seconds %}<span class="live-indicator"><i aria-hidden="true"></i>Atualização automática a cada {{ poll_seconds }} segundos</span>{% endif %}
+        <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+        <a class="orders-refresh" href="{{ orders_path }}{% if qs %}?{{ qs }}{% endif %}" title="Atualizar pedidos" aria-label="Atualizar tabela de pedidos">{{ icon("retry") }} Atualizar</a>
+      </div>
+    </div>
+    {% if not orders %}
+    <div class="empty-state">
+      <div class="empty-state__content">
+        <div class="empty-state__icon">{{ icon("orders") }}</div>
+        {% if unit_id or status or q %}<h2>Nenhum pedido encontrado</h2><p>Revise os filtros ou limpe a busca.</p><a class="btn btn--secondary" href="{{ orders_path }}">Limpar filtros</a>{% elif history %}<h2>O histórico está vazio</h2><p>Pedidos arquivados aparecerão aqui para consulta futura.</p>{% else %}<h2>A fila está vazia</h2><p>Os pedidos aparecerão aqui assim que forem detectados nas unidades ativas.</p>{% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="table-wrap">
+      <table class="data-table orders-table">
+        <thead><tr><th scope="col">Recebido</th><th scope="col">Unidade</th><th scope="col">Paciente / accession</th><th scope="col">Modalidade</th><th scope="col">Status</th><th scope="col">Próximo passo</th><th scope="col" class="align-right">Ações</th></tr></thead>
+        <tbody>
+          {% for o in orders %}
+          <tr>
+            <td><span class="order-date"><span>{{ o.created_at.strftime('%d/%m/%Y') }}</span><strong>{{ o.created_at.strftime('%H:%M') }}</strong>{% if history and o.archived_at %}<small>Arquivado em {{ o.archived_at.strftime('%d/%m/%Y %H:%M') }}</small>{% endif %}</span></td>
+            <td><span class="order-unit">{{ o.unit.name }}</span></td>
+            <td><span class="order-identity"><a href="/orders/{{ o.id }}?{{ detail_return_qs }}">{{ o.pat_id or 'Paciente não informado' }}</a><span>{{ o.acc }}</span></span></td>
+            <td><span class="modality-mark">{{ o.modality or '—' }}</span><span class="table-secondary">{{ o.body_part or 'Body Part não informado' }}</span></td>
+            <td><span class="status-badge {{ o.badge }}">{{ o.status_label }}</span>{% if o.prior_status != 'disabled' %}<span class="table-secondary">Histórico: {{ o.prior_status_label }}</span>{% endif %}</td>
+            <td><span class="order-next">
+              {% if o.prior_status == 'retrieving' %}<strong>Histórico em andamento</strong><small>{{ o.prior_date_from }}–{{ o.prior_date_to }}</small>
+              {% elif o.prior_status in ('queued', 'retry_wait') %}<strong>Histórico na fila</strong><small>{% if o.prior_status == 'retry_wait' %}Nova tentativa automática{% else %}Execução imediata{% endif %}</small>
+              {% elif o.prior_status == 'error' %}<strong class="text-danger">Erro no histórico</strong><small>Disponível para reprocessamento</small>
+              {% elif o.retrieve_at and o.status == 'wait_retrieve' %}<strong>1º retrieve às {{ o.retrieve_at.strftime('%H:%M') }}</strong><small>Execução automática</small>
+              {% elif o.status in ('wait_update', 'retrieving_update') %}<strong>Buscando novas imagens</strong><small>{% if o.monitor_until %}Monitorando até {{ o.monitor_until.strftime('%d/%m %H:%M') }}{% else %}C-MOVE de atualização{% endif %}</small>
+              {% elif o.status == 'monitoring' and o.monitor_next_at %}<strong>Próxima verificação às {{ o.monitor_next_at.strftime('%H:%M') }}</strong><small>Monitorando até {{ o.monitor_until.strftime('%d/%m %H:%M') }} · {{ o.monitor_checks }} verificaç{{ 'ão' if o.monitor_checks == 1 else 'ões' }}</small>
+              {% elif o.last_error %}<strong class="text-danger">Reprocessamento necessário</strong><small>{{ o.last_error[:70] }}</small>
+              {% elif o.status == 'done' %}<strong>Fluxo finalizado</strong><small>Sem ações pendentes</small>
+              {% elif o.status == 'cancelled' %}<strong>Pedido cancelado</strong><small>Sem processamento ativo</small>
+              {% else %}<strong>Processamento automático</strong><small>Acompanhe pelo detalhe</small>{% endif %}
+            </span></td>
+            <td>
+              <div class="table-actions order-actions">
+                <a class="action-icon" href="/orders/{{ o.id }}?{{ detail_return_qs }}" data-tooltip="Visualizar" title="Visualizar" aria-label="Visualizar pedido">{{ icon("eye") }}</a>
+                {% if user.role == 'admin' and not history %}
+                {% if o.can_reprocess and o.can_archive %}
+                {{ post_action(request, '/orders/' ~ o.id ~ '/retry', 'action-icon', 'Reprocessar pedido', icon_name='retry', tooltip='Reprocessar', confirm='Reprocessar este pedido? Um novo retrieve será iniciado e as imagens serão reenviadas para a nuvem.', confirm_label='Reprocessar pedido') }}
+                {{ post_action(request, '/orders/' ~ o.id ~ '/delete', 'action-icon', 'Arquivar pedido', icon_name='archive', tooltip='Arquivar', confirm='Arquivar este pedido? Ele sairá da fila, mas todos os dados e eventos serão preservados.', confirm_label='Arquivar pedido') }}
+                {% else %}
+                <span class="action-icon is-disabled" data-tooltip="Reprocessar indisponível durante o processamento" aria-label="Reprocessar indisponível">{{ icon("retry") }}</span>
+                <span class="action-icon is-disabled" data-tooltip="Arquivar indisponível durante o processamento" aria-label="Arquivar indisponível">{{ icon("archive") }}</span>
+                {% endif %}
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "pager.html" %}
+    {% endif %}
+  </section>

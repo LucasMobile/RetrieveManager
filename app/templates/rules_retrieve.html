@@ -8,7 +8,7 @@
     <div class="page-header__copy">
       <p class="eyebrow">Configurações</p>
       <h1>Tempo de retrieve</h1>
-      <p class="page-header__description">Defina quando cada modalidade será buscada no PACS e quais exames terão uma segunda tentativa automática.</p>
+      <p class="page-header__description">Defina quando cada modalidade será buscada no PACS e quais exames continuarão sendo consultados em busca de novas imagens.</p>
     </div>
   </header>
 
@@ -23,14 +23,13 @@
     </div>
     <div class="summary-strip__item">
       <span class="summary-strip__icon">{{ icon("retry") }}</span>
-      <div class="summary-strip__copy"><strong>{{ summary.second_enabled }}</strong><span>modalidade{% if summary.second_enabled != 1 %}s{% endif %} com 2º retrieve</span></div>
+      <div class="summary-strip__copy"><strong>{{ summary.monitor_enabled }}</strong><span>modalidade{% if summary.monitor_enabled != 1 %}s{% endif %} com monitoramento</span></div>
     </div>
   </section>
 
   <section class="surface retrieve-rules-card" aria-labelledby="retrieve-rules-title">
     <div class="retrieve-rules-card__header">
-      <div><h2 id="retrieve-rules-title">Regras por modalidade</h2><p>Os tempos são contados a partir da detecção do pedido.</p></div>
-      <span class="retrieve-rules-legend">Campo indisponível quando a segunda tentativa está desativada</span>
+      <div><h2 id="retrieve-rules-title">Regras por modalidade</h2><p>O 1º retrieve conta a partir da detecção do exame no PACS. O monitoramento começa quando o 1º retrieve termina e consulta o PACS (C-FIND) no intervalo definido, trazendo as séries que ganharem imagens.</p></div>
     </div>
 
     {% for r in rules %}
@@ -42,11 +41,11 @@
       <table class="data-table retrieve-rules-table">
         <caption class="visually-hidden">Regras de tempo de retrieve por modalidade</caption>
         <thead>
-          <tr><th scope="col">Modalidade</th><th scope="col">1º Retrieve</th><th scope="col">Segunda tentativa</th><th scope="col">2º Retrieve</th><th scope="col">Ações</th></tr>
+          <tr><th scope="col">Modalidade</th><th scope="col">1º Retrieve</th><th scope="col">Monitorar novas imagens</th><th scope="col">Intervalo</th><th scope="col">Tempo máximo</th><th scope="col">Ações</th></tr>
         </thead>
         <tbody>
           {% for r in rules %}
-          <tr data-second-rule>
+          <tr data-monitor-rule>
             <td>
               <div class="retrieve-modality">
                 <span class="retrieve-modality__mark">{{ r.modality }}</span>
@@ -60,16 +59,22 @@
               <div class="retrieve-time-input"><input name="wait_minutes" type="number" min="0" max="1440" value="{{ r.wait_minutes }}" form="retrieve-rule-{{ r.id }}" aria-label="Primeiro retrieve de {{ r.modality }}" required><span>min</span></div>
             </td>
             <td>
-              <input type="hidden" name="second_retrieve" value="{{ '1' if r.second_retrieve else '0' }}" form="retrieve-rule-{{ r.id }}" data-second-value>
-              <div class="retrieve-attempt{% if not r.second_retrieve %} is-off{% endif %}">
-                <button class="retrieve-switch" type="button" role="switch" aria-checked="{{ 'true' if r.second_retrieve else 'false' }}" aria-label="{{ 'Desativar' if r.second_retrieve else 'Ativar' }} segunda tentativa de {{ r.modality }}" data-second-toggle></button>
-                <span><strong data-second-label>{{ 'Ativada' if r.second_retrieve else 'Desativada' }}</strong><small data-second-description>{{ 'Nova busca automática' if r.second_retrieve else 'Uma única busca' }}</small></span>
+              <input type="hidden" name="monitor_enabled" value="{{ '1' if r.monitor_enabled else '0' }}" form="retrieve-rule-{{ r.id }}" data-monitor-value>
+              <div class="retrieve-attempt{% if not r.monitor_enabled %} is-off{% endif %}">
+                <button class="retrieve-switch" type="button" role="switch" aria-checked="{{ 'true' if r.monitor_enabled else 'false' }}" aria-label="{{ 'Desativar' if r.monitor_enabled else 'Ativar' }} monitoramento de {{ r.modality }}" data-monitor-toggle></button>
+                <span><strong data-monitor-label>{{ 'Ativado' if r.monitor_enabled else 'Desativado' }}</strong><small data-monitor-description>{{ 'Consulta periódica no PACS' if r.monitor_enabled else 'Somente o 1º retrieve' }}</small></span>
               </div>
             </td>
             <td>
-              <div class="retrieve-time-input retrieve-second-field{% if not r.second_retrieve %} is-disabled{% endif %}" data-second-field>
-                <input name="second_wait_minutes" type="number" min="0" max="2880" value="{{ r.second_wait_minutes }}" form="retrieve-rule-{{ r.id }}" aria-label="Segundo retrieve de {{ r.modality }}" data-second-input {% if not r.second_retrieve %}disabled{% endif %} required>
+              <div class="retrieve-time-input retrieve-monitor-field{% if not r.monitor_enabled %} is-disabled{% endif %}" data-monitor-field>
+                <input name="monitor_interval_minutes" type="number" min="1" max="240" value="{{ r.monitor_interval_minutes }}" form="retrieve-rule-{{ r.id }}" aria-label="Intervalo entre consultas de {{ r.modality }}" data-monitor-input {% if not r.monitor_enabled %}disabled{% endif %} required>
                 <span>min</span>
+              </div>
+            </td>
+            <td>
+              <div class="retrieve-time-input retrieve-monitor-field{% if not r.monitor_enabled %} is-disabled{% endif %}" data-monitor-field>
+                <input name="monitor_max_hours" type="number" min="1" max="72" value="{{ r.monitor_max_hours }}" form="retrieve-rule-{{ r.id }}" aria-label="Tempo máximo de monitoramento de {{ r.modality }}" data-monitor-input {% if not r.monitor_enabled %}disabled{% endif %} required>
+                <span>h</span>
               </div>
             </td>
             <td>
@@ -98,19 +103,20 @@
       <div><h2 id="new-retrieve-title">Adicionar modalidade</h2><p>Crie uma exceção à regra padrão para um novo tipo de exame.</p></div>
       <span class="status-badge status-badge--active">Nova regra</span>
     </div>
-    <form method="post" action="/rules/retrieve" class="retrieve-new-form" data-second-rule>
+    <form method="post" action="/rules/retrieve" class="retrieve-new-form" data-monitor-rule>
         {{ csrf_input(request) }}
       <div class="field"><label for="new-modality">Modalidade</label><input id="new-modality" name="modality" placeholder="Ex.: XA" maxlength="8" required><span class="field__hint">Código DICOM.</span></div>
       <div class="field"><label for="new-wait">1º Retrieve</label><div class="retrieve-time-input"><input id="new-wait" name="wait_minutes" type="number" min="0" max="1440" value="10" required><span>min</span></div></div>
       <div class="field">
-        <span class="field__label">Segunda tentativa</span>
-        <input type="hidden" name="second_retrieve" value="0" data-second-value>
+        <span class="field__label">Monitorar novas imagens</span>
+        <input type="hidden" name="monitor_enabled" value="0" data-monitor-value>
         <div class="retrieve-attempt retrieve-attempt--field is-off">
-          <button class="retrieve-switch" type="button" role="switch" aria-checked="false" aria-label="Ativar segunda tentativa da nova modalidade" data-second-toggle></button>
-          <span><strong data-second-label>Desativada</strong><small data-second-description>Uma única busca</small></span>
+          <button class="retrieve-switch" type="button" role="switch" aria-checked="false" aria-label="Ativar monitoramento da nova modalidade" data-monitor-toggle></button>
+          <span><strong data-monitor-label>Desativado</strong><small data-monitor-description>Somente o 1º retrieve</small></span>
         </div>
       </div>
-      <div class="field"><label for="new-second-wait">2º Retrieve</label><div class="retrieve-time-input retrieve-second-field is-disabled" data-second-field><input id="new-second-wait" name="second_wait_minutes" type="number" min="0" max="2880" value="90" data-second-input disabled required><span>min</span></div></div>
+      <div class="field"><label for="new-monitor-interval">Intervalo</label><div class="retrieve-time-input retrieve-monitor-field is-disabled" data-monitor-field><input id="new-monitor-interval" name="monitor_interval_minutes" type="number" min="1" max="240" value="5" data-monitor-input disabled required><span>min</span></div></div>
+      <div class="field"><label for="new-monitor-max">Tempo máximo</label><div class="retrieve-time-input retrieve-monitor-field is-disabled" data-monitor-field><input id="new-monitor-max" name="monitor_max_hours" type="number" min="1" max="72" value="6" data-monitor-input disabled required><span>h</span></div></div>
       <button class="btn btn--primary" type="submit">{{ icon("plus") }} Adicionar</button>
     </form>
   </section>

@@ -1,34 +1,24 @@
-"""C-MOVE: current study (1st, incremental 2nd), manual and prior studies."""
+"""C-MOVE: current study (1st and monitoring updates), manual and prior studies."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta
 from time import monotonic, perf_counter
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.config import (
-    FIND_TIMEOUT_SECONDS,
-)
 from app.dicom_net import (
     MoveResult,
     PacsNode,
     find_prior_series,
-    find_study_series,
     move_series,
     move_study,
 )
 from app.events import add_event
-from app.instances import (
-    ACTIVE_STATES,
-    DONE_STATES,
-)
 from app.models import (
-    DicomInstance,
-    DicomStudy,
     HistoricalSeries,
     HistoricalStudy,
     ManualMoveRequest,
@@ -52,20 +42,13 @@ from app.pipeline.common import (
     log,
 )
 from app.pipeline.find import prior_identity_matches
+from app.pipeline.monitor import continue_monitoring, start_monitoring
+from app.rules import monitor_plan_for
 
 PRIOR_RETRY_DELAYS = (60, 300)
 
 
 CURRENT_MOVE_RETRY_DELAYS = (60, 300)
-
-
-@dataclass(frozen=True)
-class SecondMovePlan:
-    """What the 2nd C-MOVE still needs: nothing, some series or the study."""
-
-    skip: bool
-    series: tuple[str, ...] = ()
-    detail: str = ""
 
 
 def _move_log_fields(moved: MoveResult) -> dict[str, object]:
@@ -154,18 +137,18 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             .with_for_update(skip_locked=True)
         )
     )
-    second = list(
+    update = list(
         db.scalars(
             select(Order)
             .where(
                 Order.unit_id == unit.id,
                 Order.archived_at.is_(None),
-                Order.status == "wait_second",
+                Order.status == "wait_update",
                 Order.id.notin_(active_manual_order_ids),
-                Order.second_retrieve_at.is_not(None),
-                Order.second_retrieve_at <= now,
+                Order.monitor_next_at.is_not(None),
+                Order.monitor_next_at <= now,
             )
-            .order_by(Order.second_retrieve_at)
+            .order_by(Order.monitor_next_at)
             .limit(slots)
             .with_for_update(skip_locked=True)
         )
@@ -188,10 +171,10 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
     candidates = (
         [(request.created_at, -1, request.id, "manual", request) for request in manual]
         + [(order.retrieve_at, 1, order.id, "first", order) for order in first]
-        + [(order.second_retrieve_at, 2, order.id, "second", order) for order in second]
+        + [(order.monitor_next_at, 2, order.id, "update", order) for order in update]
         + [(order.prior_due_at, 0, order.id, "prior", order) for order in prior]
     )
-    kind_priority = {"manual": 0, "first": 1, "second": 1, "prior": 2}
+    kind_priority = {"manual": 0, "first": 1, "update": 1, "prior": 2}
     candidates.sort(
         key=lambda item: (kind_priority[item[3]], item[0], item[1], item[2])
     )
@@ -204,8 +187,8 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
         if kind == "first":
             resource.status = "retrieving"
             resource.heartbeat_at = now
-        elif kind == "second":
-            resource.status = "retrieving_second"
+        elif kind == "update":
+            resource.status = "retrieving_update"
             resource.heartbeat_at = now
         else:
             resource.prior_status = "retrieving"
@@ -243,11 +226,14 @@ def run_claimed_move(db: Session, resource_id: int, kind: str) -> None:
         if order.prior_status != "retrieving" or order.archived_at is not None:
             return
         _run_prior_move(db, unit, order)
-    else:
-        expected = "retrieving_second" if kind == "second" else "retrieving"
-        if order.status != expected or order.archived_at is not None:
+    elif kind == "update":
+        if order.status != "retrieving_update" or order.archived_at is not None:
             return
-        _run_move(db, unit, order, kind == "second")
+        _run_update_move(db, unit, order)
+    else:
+        if order.status != "retrieving" or order.archived_at is not None:
+            return
+        _run_move(db, unit, order)
 
 
 def fail_claimed_move(
@@ -310,13 +296,24 @@ def fail_claimed_move(
         db.commit()
         return
 
-    expected = "retrieving_second" if kind == "second" else "retrieving"
-    if order.status != expected:
+    if kind == "update":
+        if order.status != "retrieving_update":
+            return
+        next_step = continue_monitoring(order, now)
+        add_event(
+            db,
+            order,
+            f"C-MOVE de novas imagens interrompido por falha interna. {next_step}",
+            detail,
+            "warn",
+        )
+        db.commit()
+        return
+    if order.status != "retrieving":
         return
     _schedule_current_move_retry(
         db,
         order,
-        second=kind == "second",
         now=now,
         error_message=f"Falha interna: {detail}",
         event_detail=detail,
@@ -328,13 +325,11 @@ def _schedule_current_move_retry(
     db: Session,
     order: Order,
     *,
-    second: bool,
     now: datetime,
     error_message: str,
     event_detail: str,
 ) -> bool:
-    """Schedule a bounded C-MOVE retry; return False when exhausted."""
-    label = "2º" if second else "1º"
+    """Schedule a bounded retry of the 1st C-MOVE; return False when exhausted."""
     order.heartbeat_at = now
     if order.attempts >= 3:
         order.status = "error"
@@ -342,24 +337,19 @@ def _schedule_current_move_retry(
         add_event(
             db,
             order,
-            f"{label} C-MOVE falhou após 3 tentativas",
+            "1º C-MOVE falhou após 3 tentativas",
             event_detail,
             "error",
         )
         return False
     delay = CURRENT_MOVE_RETRY_DELAYS[max(0, order.attempts - 1)]
-    due_at = now + timedelta(seconds=delay)
-    if second:
-        order.status = "wait_second"
-        order.second_retrieve_at = due_at
-    else:
-        order.status = "wait_retrieve"
-        order.retrieve_at = due_at
+    order.status = "wait_retrieve"
+    order.retrieve_at = now + timedelta(seconds=delay)
     order.last_error = error_message
     add_event(
         db,
         order,
-        f"{label} C-MOVE falhou; nova tentativa em {delay} segundos",
+        f"1º C-MOVE falhou; nova tentativa em {delay} segundos",
         event_detail,
         "warn",
     )
@@ -704,15 +694,13 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
         )
 
 
-def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
+def _run_move(db: Session, unit: Unit, order: Order) -> None:
     correlation_id = ensure_order_correlation(order)
     started_at = perf_counter()
-    order.status = "retrieving_second" if second else "retrieving"
+    order.status = "retrieving"
     order.heartbeat_at = datetime.now()
     order.attempts += 1
     db.commit()
-    timeout = unit.move_timeout_second if second else unit.move_timeout_first
-    label = "2º" if second else "1º"
     with log_context(correlation_id):
         log_event(
             log,
@@ -722,67 +710,38 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
             status="started",
             order_id=order.id,
             unit_id=unit.id,
-            retrieve_number=2 if second else 1,
+            retrieve_number=1,
             attempt=order.attempts,
         )
-        node = PacsNode.from_unit(unit)
-        plan = _plan_second_move(db, unit, order) if second else None
-        if plan is not None and plan.skip:
-            order.status = "done"
-            order.done_at = datetime.now()
-            order.last_error = ""
-            order.heartbeat_at = datetime.now()
-            add_event(db, order, "2º C-MOVE dispensado", plan.detail)
-            db.commit()
-            log_event(
-                log,
-                logging.INFO,
-                "dicom.move",
-                resource=f"order:{order.id}",
-                status="skipped",
-                started_at=started_at,
-                order_id=order.id,
-                unit_id=unit.id,
-                retrieve_number=2,
-            )
-            return
-        if plan is not None and plan.series:
-            moved = _move_series_list(node, order.study_uid, plan.series, timeout)
-        else:
-            moved = move_study(node, order.study_uid, timeout=timeout)
-        safe_output = moved.summary
-        if plan is not None and plan.detail:
-            safe_output = f"{plan.detail}\n{safe_output}"
+        moved = move_study(
+            PacsNode.from_unit(unit), order.study_uid, timeout=unit.move_timeout_first
+        )
         if moved.ok:
-            if second or order.second_retrieve_at is None:
-                order.status = "done"
-                order.done_at = datetime.now()
-                add_event(db, order, f"{label} C-MOVE concluído", safe_output)
-            else:
-                order.status = "wait_second"
-                # As tentativas são limitadas separadamente para cada retrieve.
-                order.attempts = 0
-                add_event(
-                    db,
-                    order,
-                    f"1º C-MOVE concluído. 2º às {order.second_retrieve_at:%H:%M}",
-                    safe_output,
-                )
+            now = datetime.now()
             order.last_error = ""
+            order.heartbeat_at = now
+            # As tentativas medem somente o 1º C-MOVE.
+            order.attempts = 0
+            plan = monitor_plan_for(db, order.modality)
+            if plan is None:
+                order.status = "done"
+                order.done_at = now
+                add_event(db, order, "1º C-MOVE concluído", moved.summary)
+            else:
+                window = start_monitoring(order, plan, now)
+                add_event(db, order, f"1º C-MOVE concluído. {window}", moved.summary)
             event_level = logging.INFO
             event_status = "success"
         else:
             retrying = _schedule_current_move_retry(
                 db,
                 order,
-                second=second,
                 now=datetime.now(),
                 error_message=f"C-MOVE: {moved.error}",
-                event_detail=safe_output,
+                event_detail=moved.summary,
             )
             event_level = logging.WARNING if retrying else logging.ERROR
             event_status = "retry" if retrying else "failure"
-        order.heartbeat_at = datetime.now()
         db.commit()
         log_event(
             log,
@@ -793,80 +752,80 @@ def _run_move(db: Session, unit: Unit, order: Order, second: bool) -> None:
             started_at=started_at,
             order_id=order.id,
             unit_id=unit.id,
-            retrieve_number=2 if second else 1,
+            retrieve_number=1,
             **_move_log_fields(moved),
         )
 
 
-def _received_series_counts(
-    db: Session, unit_id: int, study_uid: str
-) -> dict[str, int]:
-    """Distinct SOP instances already held per series of a study.
+def _run_update_move(db: Session, unit: Unit, order: Order) -> None:
+    """Fetch what the last monitoring check found new, then keep monitoring.
 
-    Lost (missing) or failed (error) objects do not count, so the 2nd C-MOVE
-    asks for them again.
+    A failure is not an order error: the next check compares the counts again
+    and asks for whatever is still missing.
     """
-    held = ACTIVE_STATES | DONE_STATES
-    rows = db.execute(
-        select(
-            DicomInstance.series_uid, func.count(func.distinct(DicomInstance.sop_uid))
-        )
-        .join(DicomStudy, DicomStudy.id == DicomInstance.study_id)
-        .where(
-            DicomInstance.unit_id == unit_id,
-            DicomStudy.study_uid == study_uid,
-            DicomInstance.state.in_(held),
-        )
-        .group_by(DicomInstance.series_uid)
-    ).all()
-    return {str(series_uid or ""): int(count) for series_uid, count in rows}
-
-
-def _plan_second_move(db: Session, unit: Unit, order: Order) -> SecondMovePlan:
-    """Compare the PACS series counts with what was received.
-
-    Anything the PACS does not report precisely (failed query, series without
-    NumberOfSeriesRelatedInstances) falls back to moving the whole study.
-    """
-    found = find_study_series(
-        PacsNode.from_unit(unit), order.study_uid, timeout=FIND_TIMEOUT_SECONDS
+    correlation_id = ensure_order_correlation(order)
+    started_at = perf_counter()
+    order.status = "retrieving_update"
+    order.heartbeat_at = datetime.now()
+    db.commit()
+    series = tuple(
+        uid for uid in (order.monitor_pending_series or "").splitlines() if uid
     )
-    if not found.ok or not found.responses:
-        return SecondMovePlan(
-            False, detail="Contagem do PACS indisponível: estudo completo solicitado."
+    with log_context(correlation_id):
+        log_event(
+            log,
+            logging.INFO,
+            "dicom.move",
+            resource=f"order:{order.id}",
+            status="started",
+            order_id=order.id,
+            unit_id=unit.id,
+            retrieve_number="update",
+            series_count=len(series),
         )
-    held = _received_series_counts(db, unit.id, order.study_uid)
-    pending: list[str] = []
-    expected_total = 0
-    for response in found.responses:
-        series_uid = str(response.get("SeriesInstanceUID", "") or "").strip()
-        raw_count = response.get("NumberOfSeriesRelatedInstances")
-        try:
-            expected = int(raw_count)
-        except TypeError, ValueError:
-            expected = -1
-        if not series_uid or expected < 0:
-            return SecondMovePlan(
-                False,
-                detail="O PACS não informou a quantidade de imagens por série: "
-                "estudo completo solicitado.",
+        node = PacsNode.from_unit(unit)
+        timeout = unit.move_timeout_update
+        if series:
+            moved = _move_series_list(node, order.study_uid, series, timeout)
+        else:
+            moved = move_study(node, order.study_uid, timeout=timeout)
+        order.monitor_new_images = (order.monitor_new_images or 0) + moved.completed
+        target = f"{len(series)} série(s)" if series else "estudo completo"
+        next_step = continue_monitoring(order, datetime.now())
+        if moved.ok:
+            add_event(
+                db,
+                order,
+                f"C-MOVE de novas imagens concluído ({target}): "
+                f"{moved.completed} imagem(ns) recebida(s). {next_step}",
+                moved.summary,
             )
-        expected_total += expected
-        if expected > held.get(series_uid, 0):
-            pending.append(series_uid)
-    received_total = sum(held.values())
-    if not pending:
-        return SecondMovePlan(
-            True,
-            detail=f"O PACS tem {expected_total} imagem(ns) em "
-            f"{len(found.responses)} série(s); todas já foram recebidas.",
+            event_level = logging.INFO
+            event_status = "success"
+        else:
+            add_event(
+                db,
+                order,
+                f"C-MOVE de novas imagens falhou ({target}; {moved.error}). "
+                f"{next_step}",
+                moved.summary,
+                "warn",
+            )
+            event_level = logging.WARNING
+            event_status = "retry"
+        db.commit()
+        log_event(
+            log,
+            event_level,
+            "dicom.move",
+            resource=f"order:{order.id}",
+            status=event_status,
+            started_at=started_at,
+            order_id=order.id,
+            unit_id=unit.id,
+            retrieve_number="update",
+            **_move_log_fields(moved),
         )
-    return SecondMovePlan(
-        False,
-        tuple(pending),
-        detail=f"PACS: {expected_total} imagem(ns); recebidas: {received_total}. "
-        f"Solicitadas {len(pending)} de {len(found.responses)} série(s).",
-    )
 
 
 def _move_series_list(

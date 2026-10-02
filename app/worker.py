@@ -12,6 +12,9 @@ from app.config import (
     COMPACT_UNIT_SCHEDULERS,
     FIND_ORDERS_PER_UNIT,
     FIND_UNIT_SCHEDULERS,
+    MONITOR_BATCH_SIZE,
+    MONITOR_CHECKS_PER_UNIT,
+    MONITOR_UNIT_SCHEDULERS,
     ORDERS_API_ACK_UNIT_WORKERS,
     ORDERS_API_INGEST_UNIT_WORKERS,
     SEND_UNIT_SCHEDULERS,
@@ -24,6 +27,7 @@ from app.observability import configure_logging, log_event, safe_error_detail
 from app.pipeline import (
     acknowledge_pending_orders,
     archive_completed_orders,
+    check_monitoring,
     claim_due_moves,
     cleanup_unmatched_orders,
     compact_unit,
@@ -175,11 +179,31 @@ def _find_job(unit_id: int) -> None:
     )
 
 
+def _monitor_job(unit_id: int) -> None:
+    """Run the due monitoring checks of a unit, one order per session."""
+    for _ in range(max(1, MONITOR_BATCH_SIZE)):
+        if stop_event.is_set():
+            return
+        claimed = _run_unit_stage(
+            unit_id,
+            "dicom.monitor.check",
+            lambda db, unit: check_monitoring(db, unit, max_orders=1),
+        )
+        if not claimed:
+            return
+
+
 def _schedule_find_jobs(
     pool: ThreadPoolExecutor,
     jobs: dict[tuple[int, int], Future],
+    *,
+    job=None,
+    slots: int | None = None,
+    stage: str = "dicom.find.order",
 ) -> None:
     """Keep a bounded number of C-FIND requests active per unit."""
+    job = job or _find_job
+    slots = FIND_ORDERS_PER_UNIT if slots is None else slots
     with SessionLocal() as db:
         unit_ids = list(
             db.scalars(
@@ -187,7 +211,7 @@ def _schedule_find_jobs(
             )
         )
     for unit_id in unit_ids:
-        for slot in range(max(1, FIND_ORDERS_PER_UNIT)):
+        for slot in range(max(1, slots)):
             key = (unit_id, slot)
             existing = jobs.get(key)
             if existing is not None and not existing.done():
@@ -204,22 +228,33 @@ def _schedule_find_jobs(
                         status="failure",
                         error=exc,
                         error_detail=safe_error_detail(exc),
-                        stage="dicom.find.order",
+                        stage=stage,
                         unit_id=unit_id,
                     )
-            jobs[key] = pool.submit(_find_job, unit_id)
+            jobs[key] = pool.submit(job, unit_id)
     active_units = set(unit_ids)
     for key in list(jobs):
         if key[0] not in active_units and jobs[key].done():
             jobs.pop(key)
 
 
-def _find_scheduler_loop(pool: ThreadPoolExecutor) -> None:
+def _find_scheduler_loop(
+    pool: ThreadPoolExecutor, monitor_pool: ThreadPoolExecutor | None = None
+) -> None:
     """Schedule finds independently of API ingestion, compression and sending."""
     jobs: dict[tuple[int, int], Future] = {}
+    monitor_jobs: dict[tuple[int, int], Future] = {}
     while not stop_event.is_set():
         try:
             _schedule_find_jobs(pool, jobs)
+            if monitor_pool is not None:
+                _schedule_find_jobs(
+                    monitor_pool,
+                    monitor_jobs,
+                    job=_monitor_job,
+                    slots=MONITOR_CHECKS_PER_UNIT,
+                    stage="dicom.monitor.check",
+                )
         except Exception as exc:
             log_event(
                 log,
@@ -305,9 +340,13 @@ def main() -> None:
         max_workers=max(1, FIND_UNIT_SCHEDULERS),
         thread_name_prefix="unit-find",
     )
+    monitor_pool = ThreadPoolExecutor(
+        max_workers=max(1, MONITOR_UNIT_SCHEDULERS),
+        thread_name_prefix="unit-monitor",
+    )
     find_scheduler = Thread(
         target=_find_scheduler_loop,
-        args=(find_pool,),
+        args=(find_pool, monitor_pool),
         name="find-scheduler",
         daemon=True,
     )
@@ -371,6 +410,7 @@ def main() -> None:
         ack_pool.shutdown(wait=True, cancel_futures=True)
         ingest_pool.shutdown(wait=True, cancel_futures=True)
         find_pool.shutdown(wait=True, cancel_futures=True)
+        monitor_pool.shutdown(wait=True, cancel_futures=True)
         compact_pool.shutdown(wait=True, cancel_futures=True)
         send_pool.shutdown(wait=True, cancel_futures=True)
         try:

@@ -1,20 +1,21 @@
 {% extends "base.html" %}
+{% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
 {% block title %}Logs · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack logs-page">
   <header class="page-header">
     <div class="page-header__copy">
-      <p class="eyebrow">Auditoria</p>
+      <p class="eyebrow">Configurações</p>
       <h1>Logs</h1>
       <p class="page-header__description">Acompanhe as alterações realizadas na configuração e nas operações do sistema.</p>
     </div>
   </header>
 
-  <section class="surface logs-summary" aria-label="Resumo dos logs">
-    <div><strong>{{ summary.total }}</strong><span>eventos registrados</span></div>
-    <div><strong>{{ summary.today }}</strong><span>eventos hoje</span></div>
-    <div><strong>{{ summary.actors }}</strong><span>autores identificados</span></div>
+  <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo dos logs">
+    {{ summary_item("scroll-text", summary.total, "evento registrado" if summary.total == 1 else "eventos registrados") }}
+    {{ summary_item("clock", summary.today, "evento hoje" if summary.today == 1 else "eventos hoje") }}
+    {{ summary_item("users", summary.actors, "autor identificado" if summary.actors == 1 else "autores identificados") }}
   </section>
 
   <form class="surface filter-bar logs-filter" method="get" action="/logs" aria-label="Filtros dos logs">

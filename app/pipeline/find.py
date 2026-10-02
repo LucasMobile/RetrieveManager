@@ -47,7 +47,8 @@ from app.pipeline.common import (
     ensure_order_correlation,
     log,
 )
-from app.rules import schedule_from_now
+from app.pipeline.monitor import reset_monitoring
+from app.rules import prior_skip_reason, schedule_from_now
 
 
 def prior_date_range(today: date | None = None) -> tuple[str, str]:
@@ -317,20 +318,21 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             )
             return
 
-        modality, retrieve_at, second_at = schedule_from_now(db, modality)
+        modality, retrieve_at = schedule_from_now(db, modality)
         order.study_uid = study_uid
         order.modality = modality[:32]
         order.patient_name = patient_name[:255]
         order.body_part = body_part[:64]
         order.retrieve_at = retrieve_at
-        order.second_retrieve_at = second_at
+        reset_monitoring(order)
         order.found_at = now
         order.status = "wait_retrieve"
         order.heartbeat_at = None
         # A partir daqui, attempts mede somente tentativas do C-MOVE atual.
         order.attempts = 0
         order.last_error = ""
-        if unit.retrieve_prior_enabled:
+        prior_skip = prior_skip_reason(db, unit, modality)
+        if prior_skip is None:
             prior_from, prior_to = prior_date_range(now.date())
             order.prior_status = "queued"
             order.prior_date_from = prior_from
@@ -350,13 +352,15 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
             f"1º retrieve em {retrieve_at:%H:%M}",
             safe_output,
         )
-        if unit.retrieve_prior_enabled:
+        if prior_skip is None:
             add_event(
                 db,
                 order,
                 "Retrieve histórico enfileirado para execução imediata: "
                 f"{order.prior_date_from}-{order.prior_date_to}",
             )
+        elif prior_skip:
+            add_event(db, order, prior_skip)
         db.commit()
         log_event(
             log,

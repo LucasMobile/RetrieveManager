@@ -137,6 +137,11 @@ FIND_BATCH_SIZE = _env_int("FIND_BATCH_SIZE", 10)
 FIND_UNIT_SCHEDULERS = _env_int("FIND_UNIT_SCHEDULERS", 8)
 FIND_ORDERS_PER_UNIT = _env_int("FIND_ORDERS_PER_UNIT", 4)
 FIND_TIMEOUT_SECONDS = _env_int("FIND_TIMEOUT_SECONDS", 20)
+# Monitoring checks (C-FIND of studies already retrieved) have their own
+# threads, so a long monitoring queue never delays the search for new exams.
+MONITOR_UNIT_SCHEDULERS = _env_int("MONITOR_UNIT_SCHEDULERS", 4)
+MONITOR_CHECKS_PER_UNIT = _env_int("MONITOR_CHECKS_PER_UNIT", 2)
+MONITOR_BATCH_SIZE = _env_int("MONITOR_BATCH_SIZE", 25)
 COMPACT_BATCH_SIZE = _env_int("COMPACT_BATCH_SIZE", 250)
 COMPACT_GLOBAL_WORKERS = _env_int("COMPACT_GLOBAL_WORKERS", 8)
 COMPACT_DB_BATCH_SIZE = _env_int("COMPACT_DB_BATCH_SIZE", 25)

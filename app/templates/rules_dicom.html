@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
 {% from "components/forms.html" import csrf_input %}
 {% block title %}Regras DICOM · Retrieve Manager{% endblock %}
@@ -7,16 +8,16 @@
   <header class="page-header">
     <div class="page-header__copy">
       <p class="eyebrow">Configurações</p>
-      <h1>Regras</h1>
+      <h1>Regras DICOM</h1>
       <p class="page-header__description">Crie condições específicas por tag DICOM e escolha em quais unidades serão aplicadas antes da compactação.</p>
     </div>
     <div class="page-header__actions"><a class="btn btn--primary" href="#rule-editor">{{ icon("plus") }} Nova regra</a></div>
   </header>
 
-  <section class="card card--flush dicom-rules-summary" aria-label="Resumo das regras">
-    <div><strong>{{ summary.total }}</strong><span>regras cadastradas</span></div>
-    <div><strong>{{ summary.active }}</strong><span>regras ativas</span></div>
-    <div><strong>{{ summary.units }}</strong><span>unidades cobertas</span></div>
+  <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das regras">
+    {{ summary_item("rules", summary.total, "regra cadastrada" if summary.total == 1 else "regras cadastradas") }}
+    {{ summary_item("check", summary.active, "regra ativa" if summary.active == 1 else "regras ativas", "success") }}
+    {{ summary_item("building", summary.units, "unidade coberta" if summary.units == 1 else "unidades cobertas") }}
   </section>
 
   <section class="surface dicom-rules-list" aria-labelledby="rules-list-title">

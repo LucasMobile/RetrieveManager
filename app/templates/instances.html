@@ -1,19 +1,22 @@
 {% extends "base.html" %}
+{% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
 {% block title %}Instâncias com pendência · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack logs-page">
   <header class="page-header">
     <div class="page-header__copy">
-      <p class="eyebrow">Recepção DICOM</p>
+      <p class="eyebrow">Operação</p>
       <h1>Instâncias com pendência</h1>
       <p class="page-header__description">Objetos recebidos que não seguiram o fluxo normal: conteúdo em conflito, arquivo ausente ou erro de processamento.</p>
     </div>
   </header>
 
-  <section class="surface logs-summary" aria-label="Resumo das pendências">
+  {% set issue_icons = {"conflict": ("alert", "danger"), "missing": ("file", "warning"), "error": ("x-circle", "danger")} %}
+  <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das pendências">
     {% for key, issue in issues.items() %}
-    <div><strong>{{ counts[key] }}</strong><span>{{ issue[0] | lower }}</span></div>
+    {% set look = issue_icons.get(key, ("alert", "")) %}
+    {{ summary_item(look[0], counts[key], issue[0] | lower, look[1]) }}
     {% endfor %}
   </section>
 

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from starlette.concurrency import run_in_threadpool
 
 from app.compression import (
@@ -46,6 +46,11 @@ from app.order_state import (
 from app.pager import paginate
 from app.pipeline import resend_failed_transfers
 from app.retention import archive_unit
+from app.rules import (
+    DEFAULT_PRIOR_MODALITIES,
+    prior_modalities_for,
+    save_prior_modalities,
+)
 from app.validation import (
     validate_pacs_connection,
     validate_unit_form,
@@ -80,6 +85,7 @@ def units_list(
     units = list(
         db.scalars(
             select(Unit)
+            .options(selectinload(Unit.prior_modalities))
             .where(Unit.deleted_at.is_(None))
             .order_by(Unit.name)
             .offset(pager["offset"])
@@ -114,6 +120,7 @@ def units_new(
             db,
             "units",
             unit=None,
+            prior_modalities=DEFAULT_PRIOR_MODALITIES,
             default_cloud_url=DEFAULT_CLOUD_URL,
             compression_settings=compression_settings,
             compression_modalities=compression_modalities_for_form(
@@ -156,7 +163,7 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
         obj.token = ""
     obj.cloud_url = str(form["cloud_url"])
     obj.move_timeout_first = int(form["move_timeout_first"])
-    obj.move_timeout_second = int(form["move_timeout_second"])
+    obj.move_timeout_update = int(form["move_timeout_update"])
     obj.max_parallel_moves = int(form["max_parallel_moves"])
     obj.find_interval_seconds = int(form["find_interval_seconds"])
     obj.compact_workers = int(form["compact_workers"])
@@ -193,6 +200,7 @@ async def units_create(
     try:
         db.flush()
         save_unit_compression_settings(db, unit, compression_settings)
+        save_prior_modalities(db, unit, form["prior_modalities"])
         link_default_rules(db, unit)
         audit(
             db,
@@ -287,6 +295,7 @@ def units_edit(
             db,
             "units",
             unit=unit,
+            prior_modalities=prior_modalities_for(db, unit.id),
             default_cloud_url=DEFAULT_CLOUD_URL,
             compression_settings=compression_settings,
             compression_modalities=compression_modalities_for_form(
@@ -320,6 +329,7 @@ async def units_update(
     _unit_from_form(form, unit)
     try:
         save_unit_compression_settings(db, unit, compression_settings)
+        save_prior_modalities(db, unit, form["prior_modalities"])
         audit(
             db,
             request,

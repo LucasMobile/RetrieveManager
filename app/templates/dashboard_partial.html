@@ -33,7 +33,7 @@
 
 <div class="dashboard-section-heading">
   <div><span class="dashboard-section-heading__eyebrow">Infraestrutura</span><h2>Unidades monitoradas</h2></div>
-  <span class="dashboard-live"><i aria-hidden="true"></i>Atualização automática a cada 5 segundos</span>
+  <span class="live-indicator"><i aria-hidden="true"></i>Atualização automática a cada 5 segundos</span>
 </div>
 
 {% if not units %}
@@ -63,7 +63,7 @@
           <p class="unit-card__meta"><span>{{ u.calling_aet }}</span><i aria-hidden="true">→</i><span>{{ u.pacs_aet }}</span><span class="unit-card__endpoint">{{ u.pacs_ip }}:{{ u.pacs_port }}</span></p>
         </div>
       </div>
-      <span class="unit-card__updated">{{ icon("refresh") }} Verificado agora</span>
+      <span class="unit-card__updated">{{ icon("refresh") }} <span data-age="Verificado">Verificado agora</span></span>
     </header>
 
     <div class="unit-card__body">
@@ -74,7 +74,7 @@
         <div class="metric metric--error{% if u.counts.error %} has-alert{% endif %}"><span class="metric__icon">{{ icon("alert") }}</span><div><strong class="metric__value">{{ u.counts.error }}</strong><span class="metric__label">Erros em 24h</span><small>{% if u.counts.error %}Requer atenção{% else %}Sem ocorrências{% endif %}</small></div></div>
       </div>
       <aside class="unit-card__pipeline" aria-label="Arquivos DICOM por pasta">
-        <div class="unit-card__pipeline-title"><div><span class="unit-card__pipeline-icon">{{ icon("folder") }}</span><strong>Fluxo de arquivos DICOM</strong></div><span>Agora</span></div>
+        <div class="unit-card__pipeline-title"><div><span class="unit-card__pipeline-icon">{{ icon("folder") }}</span><strong>Fluxo de arquivos DICOM</strong></div><span data-age>Agora</span></div>
         <div class="unit-card__folders">
           <span class="folder-count folder-count--receive"><i aria-hidden="true"></i><span>Recebimento</span><strong>{{ u.folders.receive }}</strong></span>
           <span class="folder-count folder-count--send"><i aria-hidden="true"></i><span>Prontos para envio</span><strong>{{ u.folders.send }}</strong></span>
@@ -84,9 +84,8 @@
     </div>
 
     <footer class="unit-card__footer">
-      <span class="unit-card__technical">{{ icon("tcp-port") }} Listener TCP <strong>{% if u.store_up %}operacional{% else %}indisponível{% endif %}</strong><span>Calling AET {{ u.calling_aet }}</span></span>
       <div class="button-group">
-        <a class="btn btn--primary btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
+        <a class="btn btn--secondary btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
         {% if user.role == 'admin' %}
         <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Configurar</a>
         <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
