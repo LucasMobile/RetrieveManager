@@ -29,6 +29,7 @@ from app.models import DicomInstance, DicomStudy, Order, Unit
 from app.observability import log_context, log_event, safe_error_detail
 from app.pipeline.common import ensure_order_correlation, log
 from app.rules import MonitorPlan
+from app.wording import counted
 
 
 @dataclass(frozen=True)
@@ -170,8 +171,12 @@ def _close(order: Order, now: datetime) -> None:
 
 def _totals(order: Order) -> str:
     return (
-        f"{order.monitor_checks} verificação(ões), "
-        f"{order.monitor_new_images} imagem(ns) nova(s) recebida(s)"
+        f"{counted(order.monitor_checks, 'verificação', 'verificações')}, "
+        + counted(
+            order.monitor_new_images,
+            "imagem nova recebida",
+            "imagens novas recebidas",
+        )
     )
 
 
@@ -228,7 +233,6 @@ def check_monitoring(db: Session, unit: Unit, max_orders: int = 1) -> int:
                 resource=f"order:{order_id}",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 order_id=order_id,
                 unit_id=unit.id,
             )
@@ -265,8 +269,9 @@ def _check_one(db: Session, unit: Unit, order: Order) -> None:
         else:
             plan = plan_update(found, received)
             counts = (
-                f"PACS: {plan.pacs_total} imagem(ns) em {plan.series_count} "
-                f"série(s); recebidas: {plan.received_total}."
+                f"PACS: {counted(plan.pacs_total, 'imagem', 'imagens')} em "
+                f"{counted(plan.series_count, 'série', 'séries')}; "
+                f"recebidas: {plan.received_total}."
             )
             if plan.has_news:
                 order.status = "wait_update"
@@ -277,7 +282,8 @@ def _check_one(db: Session, unit: Unit, order: Order) -> None:
                     request = "PACS sem contagem por série: estudo completo solicitado."
                 else:
                     request = (
-                        f"Imagens novas em {len(plan.series)} série(s); "
+                        "Imagens novas em "
+                        f"{counted(len(plan.series), 'série', 'séries')}; "
                         "C-MOVE solicitado."
                     )
                 add_event(

@@ -1,7 +1,7 @@
 {% from "components/summary.html" import summary_item %}
   <section class="summary-strip summary-strip--four summary-strip--surface" aria-label="Resumo da seleção" data-poll-slot="summary">
-    {{ summary_item("orders", order_summary.total, ("pedido arquivado" if order_summary.total == 1 else "pedidos arquivados") if history else ("pedido na seleção" if order_summary.total == 1 else "pedidos na seleção")) }}
+    {{ summary_item("orders", order_summary.total, order_summary.total | plural("pedido arquivado", "pedidos arquivados") if history else order_summary.total | plural("pedido na seleção", "pedidos na seleção")) }}
     {{ summary_item("clock", order_summary.waiting, "aguardando", "warning") }}
     {{ summary_item("activity", order_summary.running, "em processamento") }}
-    {{ summary_item("check", order_summary.done, "concluído" if order_summary.done == 1 else "concluídos", "success") }}
+    {{ summary_item("check", order_summary.done, order_summary.done | plural("concluído", "concluídos"), "success") }}
   </section>

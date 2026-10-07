@@ -11,6 +11,7 @@ from app.config import (
     DEFAULT_CLOUD_URL,
     IS_PRODUCTION,
 )
+from app.store_routing import parse_senders
 
 _AET = re.compile(r"^[A-Za-z0-9 _-]{1,16}$")
 _HOSTNAME = re.compile(
@@ -112,9 +113,8 @@ def peer_ip_allowed(peer_ip: str, networks: tuple[StoreNetwork, ...]) -> bool:
 
 def store_allowed_senders(value: str | None) -> frozenset[str]:
     """Return the stored allowlist in its case-insensitive comparison form."""
-    return frozenset(
-        item.strip().upper() for item in (value or "").split(",") if item.strip()
-    )
+    # Same normalization as the receiver's routing table.
+    return parse_senders(value)
 
 
 def validate_host(value: str) -> str:
@@ -124,6 +124,12 @@ def validate_host(value: str) -> str:
     except ValueError as exc:
         if not _HOSTNAME.fullmatch(host):
             raise ValueError("IP/host do PACS inválido") from exc
+        # A name ending in a numeric label is a mistyped IP (192.1683.103),
+        # never a DNS name: no top-level domain is all digits.
+        if host.rsplit(".", 1)[-1].isdigit():
+            raise ValueError(
+                f"IP/host do PACS inválido: {host} não é um endereço IP válido"
+            ) from exc
     return host
 
 

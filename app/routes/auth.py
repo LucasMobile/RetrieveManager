@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -28,10 +28,11 @@ from app.security import (
     verify_password,
 )
 from app.web import (
-    audit,
+    commit_action,
     ctx,
     flash,
     log,
+    redirect,
     require_admin,
     require_user,
     templates,
@@ -131,7 +132,7 @@ def login(
         user_id=user.id,
     )
     return apply_rate_limit_headers(
-        RedirectResponse("/", status_code=303),
+        redirect("/"),
         login_failure_rate_limiter.check(client_id),
         scope="failed-login",
     )
@@ -140,12 +141,12 @@ def login(
 @router.post("/logout")
 def logout(request: Request):
     request.session.clear()
-    return RedirectResponse("/login", status_code=303)
+    return redirect("/login")
 
 
 @router.get("/settings")
 def settings_redirect(user: User = Depends(require_admin)):
-    return RedirectResponse("/users", status_code=303)
+    return redirect("/users")
 
 
 @router.get("/account/password", response_class=HTMLResponse)
@@ -172,17 +173,17 @@ def account_password_update(
 ):
     if not verify_password(current, user.password_hash):
         flash(request, "Senha atual incorreta.", "err")
-        return RedirectResponse("/account/password", status_code=303)
+        return redirect("/account/password")
     try:
         validate_password(new_password, password_confirmation)
     except ValueError as exc:
         flash(request, str(exc), "err")
-        return RedirectResponse("/account/password", status_code=303)
+        return redirect("/account/password")
     user.password_hash = hash_password(new_password)
     # Other browsers/devices lose access; this one keeps a fresh session.
     revoke_sessions(user)
     start_session(request, user)
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -191,15 +192,7 @@ def account_password_update(
         resource_id=user.id,
         resource_name=user.username,
         summary="Usuário alterou a própria senha.",
+        notice="Senha atualizada.",
+        redirect_to="/account/password",
+        event="user.password_change",
     )
-    db.commit()
-    log_event(
-        log,
-        logging.INFO,
-        "user.password_change",
-        resource=f"user:{user.id}",
-        status="success",
-        user_id=user.id,
-    )
-    flash(request, "Senha atualizada.")
-    return RedirectResponse("/account/password", status_code=303)

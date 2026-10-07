@@ -1,20 +1,14 @@
 {% extends "base.html" %}
+{% from "components/page.html" import page_header %}
 {% from "icons.html" import icon %}
 {% block title %}Visão geral · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Operação</p>
-      <h1>Visão geral</h1>
-      <p class="page-header__description">Disponibilidade das unidades e volume em cada etapa do processamento.</p>
-    </div>
-    {% if user.role == 'admin' and (units or (pager and pager.total)) %}<div class="page-header__actions">
-      <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
-    </div>{% endif %}
-  </header>
+  {% call page_header("Operação", "Visão geral", "Disponibilidade das unidades e volume em cada etapa do processamento.") %}
+    {% if user.role == 'admin' and (units or (pager and pager.total)) %}<a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>{% endif %}
+  {% endcall %}
 
-  <section class="poll-region" data-poll="/dashboard/partial?page={{ pager.page if pager else 1 }}" data-interval="5000" aria-live="polite" aria-label="Estado das unidades">
+  <section class="poll-region" data-poll="/?page={{ pager.page if pager else 1 }}" data-interval="5000" aria-live="polite" aria-label="Estado das unidades">
     {% include "dashboard_partial.html" %}
   </section>
 </div>

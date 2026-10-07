@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from collections import Counter
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import BoundedSemaphore, Lock
+from threading import Condition, Lock
 from time import monotonic, perf_counter
 
 import pydicom
@@ -63,7 +65,50 @@ from app.pipeline.records import (
 )
 from app.validation import store_allowed_senders
 
-_compact_slots = BoundedSemaphore(max(1, COMPACT_GLOBAL_WORKERS))
+
+class FairSlots:
+    """The server's codec slots, shared fairly by the units using them.
+
+    A unit compacting alone may take every slot. When several units have files
+    waiting, each is held to its share (total divided by the units that hold
+    or wait for a slot, rounded up): a unit returning a slot above its share
+    lets the waiting one in, so a large CT backlog of one unit cannot keep the
+    other unit's images waiting until it ends. The unit's own worker count
+    still caps what it may use.
+    """
+
+    def __init__(self, total: int) -> None:
+        self.total = max(1, total)
+        self._changed = Condition()
+        self._held: Counter[int] = Counter()
+        self._waiting: Counter[int] = Counter()
+
+    def _share(self) -> int:
+        units = len(+self._held | +self._waiting)
+        return max(1, -(-self.total // max(1, units)))
+
+    @contextmanager
+    def slot(self, unit_id: int) -> Iterator[None]:
+        with self._changed:
+            self._waiting[unit_id] += 1
+            try:
+                while not (
+                    self._held.total() < self.total
+                    and self._held[unit_id] < self._share()
+                ):
+                    self._changed.wait()
+            finally:
+                self._waiting[unit_id] -= 1
+            self._held[unit_id] += 1
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._held[unit_id] -= 1
+                self._changed.notify_all()
+
+
+_compact_slots = FairSlots(COMPACT_GLOBAL_WORKERS)
 
 
 def _quarantine_failed_source(source: Path, error_dir: Path) -> Path | None:
@@ -80,8 +125,8 @@ def _quarantine_failed_source(source: Path, error_dir: Path) -> Path | None:
     return target
 
 
-def _compact_one_limited(*args) -> CompactResult:
-    with _compact_slots:
+def _compact_one_limited(unit_id: int, *args) -> CompactResult:
+    with _compact_slots.slot(unit_id):
         return _compact_one(*args)
 
 
@@ -144,7 +189,6 @@ def _publish_outputs(
                     resource=f"transfer:{transfer_id}",
                     status="retry",
                     error=exc,
-                    error_detail=safe_error_detail(exc),
                     transfer_id=transfer_id,
                     unit_id=unit.id,
                 )
@@ -180,7 +224,6 @@ def _publish_outputs(
             resource=f"unit:{unit.id}",
             status="retry",
             error=exc,
-            error_detail=safe_error_detail(exc),
             unit_id=unit.id,
             file_count=len(published),
         )
@@ -202,7 +245,6 @@ def _remove_compacted_source(
             resource=f"transfer:{transfer_id}",
             status="failure",
             error=exc,
-            error_detail=safe_error_detail(exc),
             transfer_id=transfer_id,
             unit_id=unit.id,
         )
@@ -509,7 +551,6 @@ def _adopt_receive_files(db: Session, unit: Unit, origin: Path, error_dir: Path)
                 resource=f"unit:{unit.id}",
                 status="quarantined",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit.id,
                 quarantined=target is not None,
             )
@@ -531,7 +572,6 @@ def _adopt_receive_files(db: Session, unit: Unit, origin: Path, error_dir: Path)
                 resource=f"instance:{decision.instance_id}",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit.id,
             )
             continue
@@ -565,7 +605,6 @@ def compact_unit(db: Session, unit: Unit) -> bool:
             resource=f"unit:{unit.id}",
             status="failure",
             error=exc,
-            error_detail=safe_error_detail(exc),
             unit_id=unit.id,
             path_name=path.name,
         )
@@ -582,7 +621,8 @@ def compact_unit(db: Session, unit: Unit) -> bool:
     instance_by_path = {path: instance_id for instance_id, path in claims}
     batch_correlation = new_correlation_id()
     started_at = perf_counter()
-    workers = max(1, unit.compact_workers or 8)
+    # The unit's own cap; the server-wide slots are shared between units.
+    workers = max(1, unit.compact_workers or COMPACT_GLOBAL_WORKERS)
     with log_context(batch_correlation):
         log_event(
             log,
@@ -606,6 +646,7 @@ def compact_unit(db: Session, unit: Unit) -> bool:
         futs = {
             pool.submit(
                 _compact_one_limited,
+                unit.id,
                 str(p),
                 str(dest_dir / (p.name + ".dcm")),
                 str(error_dir / p.name),
@@ -637,7 +678,6 @@ def compact_unit(db: Session, unit: Unit) -> bool:
                     resource=f"unit:{unit.id}",
                     status="failure",
                     error=exc,
-                    error_detail=safe_error_detail(exc),
                     unit_id=unit.id,
                     filename=source.name,
                     quarantine_error=quarantine_error,

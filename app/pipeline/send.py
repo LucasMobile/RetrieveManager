@@ -35,7 +35,6 @@ from app.models import (
 from app.observability import (
     log_context,
     log_event,
-    safe_error_detail,
 )
 from app.pipeline.common import bounded_db_text, log
 
@@ -148,7 +147,6 @@ def _next_send_jobs(
                 resource=f"transfer:{transfer.id}",
                 status="retry",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 transfer_id=transfer.id,
                 unit_id=unit.id,
             )
@@ -191,7 +189,6 @@ def send_unit(db: Session, unit: Unit, cloud_url: str) -> bool:
             resource=f"unit:{unit.id}",
             status="failure",
             error=exc,
-            error_detail=safe_error_detail(exc),
             unit_id=unit.id,
             directory=str(origin),
         )
@@ -527,7 +524,6 @@ def _record_send_results(
                 resource=f"unit:{unit.id}",
                 status="fallback",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit.id,
                 file_count=len(chunk),
             )
@@ -551,7 +547,6 @@ def _record_send_results(
                 resource=f"transfer:{transfer_id}",
                 status="retry",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 transfer_id=transfer_id,
                 unit_id=unit.id,
             )
@@ -711,7 +706,6 @@ def _persist_send_result_with_retry(
                 resource=f"transfer:{result.transfer_id}",
                 status="failure" if exhausted else "retry",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 transfer_id=result.transfer_id,
                 unit_id=unit.id,
                 attempt=persist_attempt,

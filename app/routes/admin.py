@@ -7,13 +7,15 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Form, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.db import get_db
+from app.audit import audit
+from app.db import count_rows, get_db
+from app.instances import clear_issue_instances
 from app.models import (
     AuditLog,
     DicomInstance,
@@ -22,7 +24,7 @@ from app.models import (
     User,
 )
 from app.observability import log_event
-from app.pager import cursor_page_links, paginate, query_keep
+from app.pager import keyset_page, paginate, query_keep
 from app.security import (
     hash_password,
     revoke_sessions,
@@ -35,24 +37,96 @@ from app.web import (
     INSTANCE_ISSUES,
     PAGE_SIZE_OPTIONS,
     USER_ROLES,
-    audit,
+    FlashRedirect,
+    commit_action,
     ctx,
-    cursor_page_cursors,
     flash,
     log,
     normalize_username,
+    redirect,
     require_admin,
     templates,
     validate_password,
 )
+from app.wording import counted
 
 router = APIRouter()
 
 
+def _managed_user(
+    managed_user_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> User:
+    managed_user = db.get(User, managed_user_id)
+    if managed_user is None:
+        raise FlashRedirect("/users")
+    return managed_user
+
+
 def _admin_count(db: Session) -> int:
-    return (
-        db.scalar(select(func.count()).select_from(User).where(User.role == "admin"))
-        or 0
+    return count_rows(db, User, User.role == "admin")
+
+
+@router.post("/instances/clear")
+def instances_clear(
+    request: Request,
+    unit_id: int | None = Form(None, ge=1),
+    state: str = Form("", max_length=16),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Delete the pending instances shown by the current filter, with their files."""
+    if state and state not in INSTANCE_ISSUES:
+        raise StarletteHTTPException(422, "Estado de instância inválido")
+    unit = db.get(Unit, unit_id) if unit_id else None
+    if unit_id and unit is None:
+        raise StarletteHTTPException(422, "Unidade inválida")
+    result = clear_issue_instances(
+        db, [state] if state else list(INSTANCE_ISSUES), unit_id
+    )
+    scope = INSTANCE_ISSUES[state][0].lower() if state else "todas as pendências"
+    kept = (
+        " "
+        + counted(
+            result.files_kept,
+            "arquivo não pôde ser excluído.",
+            "arquivos não puderam ser excluídos.",
+        )
+        if result.files_kept
+        else ""
+    )
+    return commit_action(
+        db,
+        request,
+        user,
+        action="delete",
+        resource_type="instance",
+        resource_id=unit_id or "all",
+        resource_name=unit.name if unit else "Todas as unidades",
+        summary=(
+            f"Fila de instâncias limpa ({scope}): "
+            + counted(result.instances, "registro excluído", "registros excluídos")
+            + " e "
+            + counted(result.files_removed, "arquivo excluído", "arquivos excluídos")
+            + f".{kept}"
+        ),
+        notice=(
+            counted(result.instances, "pendência removida", "pendências removidas")
+            + " e "
+            + counted(result.files_removed, "arquivo excluído", "arquivos excluídos")
+            + f".{kept} "
+            "Os objetos podem ser reenviados pelo PACS."
+        ),
+        redirect_to=f"/instances?{query_keep(unit_id=unit_id, state=state)}".rstrip(
+            "?"
+        ),
+        event="dicom.instances.clear",
+        unit_id=unit_id,
+        state=state or None,
+        instance_count=result.instances,
+        files_removed=result.files_removed,
+        files_kept=result.files_kept,
     )
 
 
@@ -74,7 +148,7 @@ def instances_page(
     scope = [DicomInstance.state.in_(states)]
     if unit_id:
         scope.append(DicomInstance.unit_id == unit_id)
-    total = int(db.scalar(select(func.count()).where(*scope)) or 0)
+    total = count_rows(db, DicomInstance, *scope)
     pager = paginate(total, page, page_size)
     pager["size_options"] = PAGE_SIZE_OPTIONS
     pager["keep"] = {"unit_id": unit_id, "state": state}
@@ -149,12 +223,6 @@ def audit_logs(
         raise StarletteHTTPException(422, "Ação de auditoria inválida")
     if resource and resource not in AUDIT_RESOURCE_LABELS:
         raise StarletteHTTPException(422, "Tipo de recurso inválido")
-    if page_size not in PAGE_SIZE_OPTIONS:
-        raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
-    if sum((before is not None, after is not None, last)) > 1:
-        raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
-    if page > 1 and before is None and after is None and not last:
-        raise StarletteHTTPException(422, "Cursor de paginação ausente")
 
     filtered = select(AuditLog)
     if action:
@@ -173,72 +241,22 @@ def audit_logs(
             )
         )
 
-    count_query = select(func.count()).select_from(filtered.subquery())
-    total = int(db.scalar(count_query) or 0)
-    pages = max(1, (total + page_size - 1) // page_size)
-    if last:
-        page = pages
-    elif before is None and after is None:
-        page = 1
-    pager = paginate(total, page, page_size)
-    pager["size_options"] = PAGE_SIZE_OPTIONS
-    pager["keep"] = {"action": action, "resource": resource, "q": search}
-    stmt = filtered
-    if last:
-        stmt = stmt.order_by(AuditLog.id.asc())
-    elif before is not None:
-        stmt = stmt.where(AuditLog.id < before).order_by(AuditLog.id.desc())
-    elif after is not None:
-        stmt = stmt.where(AuditLog.id > after).order_by(AuditLog.id.asc())
-    else:
-        stmt = stmt.order_by(AuditLog.id.desc())
-    result_limit = (total - pager["offset"]) if last else pager["size"]
-    entries = list(db.scalars(stmt.limit(result_limit)))
-    if after is not None or last:
-        entries.reverse()
-
-    has_prev = False
-    has_next = False
-    if entries:
-        has_prev = (
-            db.scalar(
-                filtered.where(AuditLog.id > entries[0].id)
-                .with_only_columns(AuditLog.id)
-                .limit(1)
-            )
-            is not None
-        )
-        has_next = (
-            db.scalar(
-                filtered.where(AuditLog.id < entries[-1].id)
-                .with_only_columns(AuditLog.id)
-                .limit(1)
-            )
-            is not None
-        )
-    pager.update(
-        cursor=True,
-        has_prev=has_prev,
-        has_next=has_next,
-        prev_cursor=entries[0].id if entries else None,
-        next_cursor=entries[-1].id if entries else None,
-    )
-
-    pager["page_links"] = cursor_page_links(
-        pager,
-        page_cursors=cursor_page_cursors(db, filtered, AuditLog.id, pager),
+    entries, pager = keyset_page(
+        db,
+        filtered,
+        AuditLog.id,
+        page=page,
+        page_size=page_size,
+        size_options=PAGE_SIZE_OPTIONS,
+        before=before,
+        after=after,
+        last=last,
+        keep={"action": action, "resource": resource, "q": search},
     )
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     summary = {
-        "total": int(db.scalar(select(func.count()).select_from(AuditLog)) or 0),
-        "today": int(
-            db.scalar(
-                select(func.count())
-                .select_from(AuditLog)
-                .where(AuditLog.created_at >= today)
-            )
-            or 0
-        ),
+        "total": count_rows(db, AuditLog),
+        "today": count_rows(db, AuditLog, AuditLog.created_at >= today),
         "actors": int(
             db.scalar(select(func.count(func.distinct(AuditLog.actor_username)))) or 0
         ),
@@ -324,10 +342,10 @@ def users_create(
             raise ValueError("Perfil de acesso inválido.")
     except ValueError as exc:
         flash(request, str(exc), "err")
-        return RedirectResponse("/users/new", status_code=303)
+        return redirect("/users/new")
     if db.scalar(select(User).where(User.username == clean_username)) is not None:
         flash(request, "Já existe um usuário com esse nome.", "err")
-        return RedirectResponse("/users/new", status_code=303)
+        return redirect("/users/new")
     managed_user = User(
         username=clean_username,
         password_hash=hash_password(password),
@@ -350,7 +368,7 @@ def users_create(
     except IntegrityError:
         db.rollback()
         flash(request, "Já existe um usuário com esse nome.", "err")
-        return RedirectResponse("/users/new", status_code=303)
+        return redirect("/users/new")
     log_event(
         log,
         logging.INFO,
@@ -362,19 +380,17 @@ def users_create(
         managed_user_role=managed_user.role,
     )
     flash(request, "Usuário criado.")
-    return RedirectResponse("/users", status_code=303)
+    return redirect("/users")
 
 
 @router.get("/users/{managed_user_id}", response_class=HTMLResponse)
 def users_edit(
     managed_user_id: int,
     request: Request,
+    managed_user: User = Depends(_managed_user),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    managed_user = db.get(User, managed_user_id)
-    if managed_user is None:
-        return RedirectResponse("/users", status_code=303)
     return templates.TemplateResponse(
         request=request,
         name="user_form.html",
@@ -386,44 +402,42 @@ def users_edit(
 def users_update(
     managed_user_id: int,
     request: Request,
+    managed_user: User = Depends(_managed_user),
     role: str = Form(...),
     new_password: str = Form(""),
     password_confirmation: str = Form(""),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    managed_user = db.get(User, managed_user_id)
-    if managed_user is None:
-        return RedirectResponse("/users", status_code=303)
     if role not in USER_ROLES:
         flash(request, "Perfil de acesso inválido.", "err")
-        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+        return redirect(f"/users/{managed_user_id}")
     if managed_user.id == user.id and role != managed_user.role:
         flash(request, "Você não pode alterar o perfil da própria conta.", "err")
-        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+        return redirect(f"/users/{managed_user_id}")
     if managed_user.id == user.id and (new_password or password_confirmation):
         flash(
             request,
             "Use a opção Alterar minha senha para modificar a própria senha.",
             "err",
         )
-        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+        return redirect(f"/users/{managed_user_id}")
     if managed_user.role == "admin" and role != "admin" and _admin_count(db) <= 1:
         flash(request, "O sistema precisa manter pelo menos um administrador.", "err")
-        return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+        return redirect(f"/users/{managed_user_id}")
     if new_password or password_confirmation:
         try:
             validate_password(new_password, password_confirmation)
         except ValueError as exc:
             flash(request, str(exc), "err")
-            return RedirectResponse(f"/users/{managed_user_id}", status_code=303)
+            return redirect(f"/users/{managed_user_id}")
         managed_user.password_hash = hash_password(new_password)
         revoke_sessions(managed_user)
     managed_user.role = role
     update_summary = f"Perfil definido como {role}."
     if new_password:
         update_summary += " Senha redefinida pelo administrador."
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -432,43 +446,33 @@ def users_update(
         resource_id=managed_user.id,
         resource_name=managed_user.username,
         summary=update_summary,
-    )
-    db.commit()
-    log_event(
-        log,
-        logging.INFO,
-        "user.update",
-        resource=f"user:{managed_user.id}",
-        status="success",
-        user_id=user.id,
+        notice="Usuário atualizado.",
+        redirect_to="/users",
+        event="user.update",
         managed_user_id=managed_user.id,
         managed_user_role=managed_user.role,
         password_reset=bool(new_password),
     )
-    flash(request, "Usuário atualizado.")
-    return RedirectResponse("/users", status_code=303)
 
 
 @router.post("/users/{managed_user_id}/delete")
 def users_delete(
     managed_user_id: int,
     request: Request,
+    managed_user: User = Depends(_managed_user),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    managed_user = db.get(User, managed_user_id)
-    if managed_user is None:
-        return RedirectResponse("/users", status_code=303)
     if managed_user.id == user.id:
         flash(request, "Você não pode excluir a própria conta.", "err")
-        return RedirectResponse("/users", status_code=303)
+        return redirect("/users")
     if managed_user.role == "admin" and _admin_count(db) <= 1:
         flash(request, "O sistema precisa manter pelo menos um administrador.", "err")
-        return RedirectResponse("/users", status_code=303)
+        return redirect("/users")
     deleted_user_id = managed_user.id
     deleted_username = managed_user.username
     db.delete(managed_user)
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -477,16 +481,8 @@ def users_delete(
         resource_id=deleted_user_id,
         resource_name=deleted_username,
         summary="Conta de usuário removida.",
-    )
-    db.commit()
-    log_event(
-        log,
-        logging.INFO,
-        "user.delete",
-        resource=f"user:{deleted_user_id}",
-        status="success",
-        user_id=user.id,
+        notice="Usuário excluído.",
+        redirect_to="/users",
+        event="user.delete",
         managed_user_id=deleted_user_id,
     )
-    flash(request, "Usuário excluído.")
-    return RedirectResponse("/users", status_code=303)

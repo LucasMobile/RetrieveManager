@@ -10,12 +10,13 @@ from time import perf_counter
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from sqlalchemy import func, or_, select, update
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from starlette.concurrency import run_in_threadpool
 
+from app.audit import audit
 from app.compression import (
     compression_form_for_unit,
     compression_modalities_for_form,
@@ -27,7 +28,7 @@ from app.config import (
     DEFAULT_CLOUD_URL,
     SEND_MAX_ATTEMPTS,
 )
-from app.db import get_db
+from app.db import count_rows, get_db
 from app.dicom_net import PacsNode, echo
 from app.dicom_rules import (
     link_default_rules,
@@ -48,16 +49,48 @@ from app.pipeline import resend_failed_transfers
 from app.retention import archive_unit
 from app.rules import (
     DEFAULT_PRIOR_MODALITIES,
+    cancel_unwanted_priors,
     prior_modalities_for,
     save_prior_modalities,
+)
+from app.store_routing import (
+    STORE_ROUTING_LOCK_KEY,
+    StoreEndpoint,
+    build_routing_plan,
+    endpoint_conflicts,
+    units_sharing_listener,
 )
 from app.validation import (
     validate_pacs_connection,
     validate_unit_form,
 )
-from app.web import UNITS_PAGE, audit, ctx, flash, log, require_admin, templates
+from app.web import (
+    UNITS_PAGE,
+    FlashRedirect,
+    commit_action,
+    ctx,
+    flash,
+    form_strings,
+    log,
+    redirect,
+    require_admin,
+    templates,
+)
+from app.wording import counted
 
 router = APIRouter()
+
+
+def _active_unit(
+    unit_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> Unit:
+    """Load a unit that was not archived; authorization is checked first."""
+    unit = db.get(Unit, unit_id)
+    if unit is None or unit.deleted_at is not None:
+        raise FlashRedirect("/units")
+    return unit
 
 
 @router.get("/units", response_class=HTMLResponse)
@@ -67,20 +100,8 @@ def units_list(
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    total = (
-        db.scalar(
-            select(func.count()).select_from(Unit).where(Unit.deleted_at.is_(None))
-        )
-        or 0
-    )
-    enabled = (
-        db.scalar(
-            select(func.count())
-            .select_from(Unit)
-            .where(Unit.enabled.is_(True), Unit.deleted_at.is_(None))
-        )
-        or 0
-    )
+    total = count_rows(db, Unit, Unit.deleted_at.is_(None))
+    enabled = count_rows(db, Unit, Unit.enabled.is_(True), Unit.deleted_at.is_(None))
     pager = paginate(total, page, UNITS_PAGE)
     units = list(
         db.scalars(
@@ -111,7 +132,27 @@ def units_list(
 def units_new(
     request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
-    compression_settings = default_unit_compression_form()
+    return _unit_form_page(request, db, None)
+
+
+def _unit_form_page(request: Request, db: Session, unit: Unit | None):
+    """Render the create (``unit=None``) or edit form for a unit."""
+    store_shared_with: list[str] = []
+    store_route_problem = None
+    if unit is None:
+        compression_settings = default_unit_compression_form()
+        prior_modalities = DEFAULT_PRIOR_MODALITIES
+    else:
+        compression_settings = compression_form_for_unit(db, unit.id)
+        prior_modalities = prior_modalities_for(db, unit.id)
+        endpoint = StoreEndpoint.from_unit(unit)
+        others = _other_endpoints(db, unit.id)
+        store_shared_with = [
+            other.name for other in units_sharing_listener(endpoint, others)
+        ]
+        store_route_problem = build_routing_plan([endpoint, *others]).unit_problems.get(
+            unit.id
+        )
     return templates.TemplateResponse(
         request=request,
         name="units_form.html",
@@ -119,14 +160,16 @@ def units_new(
             request,
             db,
             "units",
-            unit=None,
-            prior_modalities=DEFAULT_PRIOR_MODALITIES,
+            unit=unit,
+            prior_modalities=prior_modalities,
             default_cloud_url=DEFAULT_CLOUD_URL,
             compression_settings=compression_settings,
             compression_modalities=compression_modalities_for_form(
                 compression_settings
             ),
             send_max_attempts=SEND_MAX_ATTEMPTS,
+            store_shared_with=store_shared_with,
+            store_route_problem=store_route_problem,
         ),
     )
 
@@ -171,30 +214,56 @@ def _unit_from_form(form: dict[str, Any], unit: Unit | None) -> Unit:
     return obj
 
 
-def _port_taken(db: Session, port: int, unit_id: int | None) -> bool:
-    q = select(Unit).where(
-        Unit.store_port == port,
-        Unit.deleted_at.is_(None),
-    )
+def _other_endpoints(db: Session, unit_id: int | None) -> list[StoreEndpoint]:
+    q = select(Unit).where(Unit.deleted_at.is_(None))
     if unit_id:
         q = q.where(Unit.id != unit_id)
-    return db.scalar(q) is not None
+    # The unit being edited may hold unsaved form values: never flush them.
+    with db.no_autoflush:
+        return [StoreEndpoint.from_unit(unit) for unit in db.scalars(q)]
+
+
+def _store_route_problems(
+    db: Session, form: dict[str, Any], unit_id: int | None
+) -> list[str]:
+    """Routing and folder conflicts of the submitted unit with the others.
+
+    The advisory lock lasts until this request's transaction ends, so two
+    saves cannot both pass the check and then commit conflicting units.
+    """
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"), {"key": STORE_ROUTING_LOCK_KEY}
+    )
+    candidate = StoreEndpoint.from_values(
+        unit_id=unit_id,
+        name=str(form["name"]),
+        enabled=bool(form["enabled"]),
+        store_port=int(form["store_port"]),
+        calling_aet=str(form["calling_aet"]),
+        store_allowed_aets=str(form["store_allowed_aets"]),
+        receive_dir=str(form["receive_dir"]),
+        send_dir=str(form["send_dir"]),
+        error_dir=str(form["error_dir"]),
+    )
+    return endpoint_conflicts(candidate, _other_endpoints(db, unit_id))
 
 
 @router.post("/units/new")
 async def units_create(
     request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)
 ):
-    raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
+    raw_form = await form_strings(request)
     try:
         form = validate_unit_form(raw_form, creating=True)
         compression_settings = validate_unit_compression_form(raw_form)
     except ValueError as exc:
         flash(request, str(exc), "err")
-        return RedirectResponse("/units/new", status_code=303)
-    if _port_taken(db, int(form["store_port"]), None):
-        flash(request, "Essa porta de store já está em uso.", "err")
-        return RedirectResponse("/units/new", status_code=303)
+        return redirect("/units/new")
+    problems = _store_route_problems(db, form, None)
+    if problems:
+        db.rollback()
+        flash(request, " ".join(problems[:3]), "err")
+        return redirect("/units/new")
     unit = _unit_from_form(form, None)
     db.add(unit)
     try:
@@ -216,9 +285,9 @@ async def units_create(
     except IntegrityError:
         db.rollback()
         flash(request, "Não foi possível salvar (nome duplicado?).", "err")
-        return RedirectResponse("/units/new", status_code=303)
+        return redirect("/units/new")
     flash(request, "Unidade criada. Cadastre o AET no PACS se ainda não existir.")
-    return RedirectResponse("/units", status_code=303)
+    return redirect("/units")
 
 
 @router.post("/units/test-echo")
@@ -226,7 +295,7 @@ async def units_test_echo(
     request: Request,
     user: User = Depends(require_admin),
 ):
-    raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
+    raw_form = await form_strings(request)
     try:
         connection = validate_pacs_connection(raw_form)
     except ValueError as exc:
@@ -278,58 +347,40 @@ async def units_test_echo(
 
 @router.get("/units/{unit_id}", response_class=HTMLResponse)
 def units_edit(
-    unit_id: int,
     request: Request,
+    unit: Unit = Depends(_active_unit),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    unit = db.get(Unit, unit_id)
-    if unit is None or unit.deleted_at is not None:
-        return RedirectResponse("/units", status_code=303)
-    compression_settings = compression_form_for_unit(db, unit.id)
-    return templates.TemplateResponse(
-        request=request,
-        name="units_form.html",
-        context=ctx(
-            request,
-            db,
-            "units",
-            unit=unit,
-            prior_modalities=prior_modalities_for(db, unit.id),
-            default_cloud_url=DEFAULT_CLOUD_URL,
-            compression_settings=compression_settings,
-            compression_modalities=compression_modalities_for_form(
-                compression_settings
-            ),
-            send_max_attempts=SEND_MAX_ATTEMPTS,
-        ),
-    )
+    return _unit_form_page(request, db, unit)
 
 
 @router.post("/units/{unit_id}")
 async def units_update(
     unit_id: int,
     request: Request,
+    unit: Unit = Depends(_active_unit),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    unit = db.get(Unit, unit_id)
-    if unit is None or unit.deleted_at is not None:
-        return RedirectResponse("/units", status_code=303)
-    raw_form = {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
+    raw_form = await form_strings(request)
     try:
         form = validate_unit_form(raw_form)
         compression_settings = validate_unit_compression_form(raw_form)
     except ValueError as exc:
         flash(request, str(exc), "err")
-        return RedirectResponse(f"/units/{unit_id}", status_code=303)
-    if _port_taken(db, int(form["store_port"]), unit_id):
-        flash(request, "Essa porta de store já está em uso.", "err")
-        return RedirectResponse(f"/units/{unit_id}", status_code=303)
+        return redirect(f"/units/{unit_id}")
+    problems = _store_route_problems(db, form, unit_id)
+    if problems:
+        db.rollback()
+        flash(request, " ".join(problems[:3]), "err")
+        return redirect(f"/units/{unit_id}")
     _unit_from_form(form, unit)
     try:
         save_unit_compression_settings(db, unit, compression_settings)
         save_prior_modalities(db, unit, form["prior_modalities"])
+        db.flush()
+        priors_cancelled = cancel_unwanted_priors(db, unit)
         audit(
             db,
             request,
@@ -338,114 +389,131 @@ async def units_update(
             resource_type="unit",
             resource_id=unit.id,
             resource_name=unit.name,
-            summary="Configuração da unidade atualizada.",
+            summary="Configuração da unidade atualizada."
+            + (
+                " "
+                + counted(
+                    priors_cancelled,
+                    "retrieve histórico da fila cancelado.",
+                    "retrieves históricos da fila cancelados.",
+                )
+                if priors_cancelled
+                else ""
+            ),
         )
         db.commit()
     except IntegrityError:
         db.rollback()
         flash(request, "Não foi possível salvar (nome duplicado?).", "err")
-        return RedirectResponse(f"/units/{unit_id}", status_code=303)
-    flash(request, "Unidade atualizada.")
-    return RedirectResponse(f"/units/{unit_id}", status_code=303)
+        return redirect(f"/units/{unit_id}")
+    if priors_cancelled:
+        flash(
+            request,
+            "Unidade atualizada. "
+            + counted(
+                priors_cancelled,
+                "retrieve histórico que estava na fila foi cancelado.",
+                "retrieves históricos que estavam na fila foram cancelados.",
+            ),
+        )
+    else:
+        flash(request, "Unidade atualizada.")
+    return redirect(f"/units/{unit_id}")
 
 
 @router.post("/units/{unit_id}/toggle")
 def units_toggle(
-    unit_id: int,
     request: Request,
+    unit: Unit = Depends(_active_unit),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    unit = db.get(Unit, unit_id)
-    if unit and unit.deleted_at is None:
-        unit.enabled = not unit.enabled
-        audit(
-            db,
-            request,
-            user,
-            action="enable" if unit.enabled else "disable",
-            resource_type="unit",
-            resource_id=unit.id,
-            resource_name=unit.name,
-            summary="Unidade ativada." if unit.enabled else "Unidade pausada.",
-        )
-        db.commit()
-        flash(request, "Unidade " + ("ativada" if unit.enabled else "pausada") + ".")
-    return RedirectResponse(request.headers.get("referer") or "/units", status_code=303)
+    unit.enabled = not unit.enabled
+    return commit_action(
+        db,
+        request,
+        user,
+        action="enable" if unit.enabled else "disable",
+        resource_type="unit",
+        resource_id=unit.id,
+        resource_name=unit.name,
+        summary="Unidade ativada." if unit.enabled else "Unidade pausada.",
+        notice="Unidade " + ("ativada" if unit.enabled else "pausada") + ".",
+        redirect_to=request.headers.get("referer") or "/units",
+    )
 
 
 @router.post("/units/{unit_id}/delete")
 def units_delete(
-    unit_id: int,
     request: Request,
+    unit: Unit = Depends(_active_unit),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    unit = db.get(Unit, unit_id)
-    if unit and unit.deleted_at is None:
-        processing = db.scalar(
-            select(func.count()).where(
-                Order.unit_id == unit.id,
-                Order.archived_at.is_(None),
-                or_(
-                    Order.status.in_(ACTIVE_ORDER_STATUSES),
-                    Order.prior_status.in_(ACTIVE_PRIOR_STATUSES),
-                ),
-            )
-        )
-        if processing:
-            flash(
-                request,
-                "Aguarde os pedidos em processamento terminarem antes de arquivar.",
-                "err",
-            )
-            return RedirectResponse("/units", status_code=303)
-        unit_name = unit.name
-        archived_at = datetime.now()
-        archive_unit(
-            unit,
-            actor_id=user.id,
-            actor_username=user.username,
-            archived_at=archived_at,
-        )
-        archived_orders = db.execute(
-            update(Order)
-            .where(Order.unit_id == unit.id, Order.archived_at.is_(None))
-            .values(
-                archived_at=archived_at,
-                archive_reason="Unidade arquivada pelo administrador.",
-                archived_by_user_id=user.id,
-                archived_by_username=user.username,
-            )
-        ).rowcount
-        audit(
-            db,
+    processing = count_rows(
+        db,
+        Order,
+        Order.unit_id == unit.id,
+        Order.archived_at.is_(None),
+        or_(
+            Order.status.in_(ACTIVE_ORDER_STATUSES),
+            Order.prior_status.in_(ACTIVE_PRIOR_STATUSES),
+        ),
+    )
+    if processing:
+        flash(
             request,
-            user,
-            action="archive",
-            resource_type="unit",
-            resource_id=unit_id,
-            resource_name=unit_name,
-            summary=(
-                f"Unidade arquivada; {archived_orders or 0} pedido(s) "
-                "foram movidos para o histórico."
-            ),
+            "Aguarde os pedidos em processamento terminarem antes de arquivar.",
+            "err",
         )
-        db.commit()
-        flash(request, "Unidade arquivada com seus pedidos preservados.")
-    return RedirectResponse("/units", status_code=303)
+        return redirect("/units")
+    unit_name = unit.name
+    archived_at = datetime.now()
+    archive_unit(
+        unit,
+        actor_id=user.id,
+        actor_username=user.username,
+        archived_at=archived_at,
+    )
+    archived_orders = db.execute(
+        update(Order)
+        .where(Order.unit_id == unit.id, Order.archived_at.is_(None))
+        .values(
+            archived_at=archived_at,
+            archive_reason="Unidade arquivada pelo administrador.",
+            archived_by_user_id=user.id,
+            archived_by_username=user.username,
+        )
+    ).rowcount
+    return commit_action(
+        db,
+        request,
+        user,
+        action="archive",
+        resource_type="unit",
+        resource_id=unit.id,
+        resource_name=unit_name,
+        summary=(
+            "Unidade arquivada; "
+            + counted(
+                archived_orders or 0,
+                "pedido foi movido para o histórico.",
+                "pedidos foram movidos para o histórico.",
+            )
+        ),
+        notice="Unidade arquivada com seus pedidos preservados.",
+        redirect_to="/units",
+    )
 
 
 @router.post("/units/{unit_id}/retry-errors")
 def units_retry_errors(
     unit_id: int,
     request: Request,
+    unit: Unit = Depends(_active_unit),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    unit = db.get(Unit, unit_id)
-    if unit is None or unit.deleted_at is not None:
-        return RedirectResponse("/units", status_code=303)
     src = Path(unit.error_dir)
     dest = Path(unit.receive_dir)
     dest.mkdir(parents=True, exist_ok=True)
@@ -455,7 +523,7 @@ def units_retry_errors(
             if f.is_file():
                 shutil.move(str(f), str(dest / f.name))
                 moved += 1
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -463,25 +531,30 @@ def units_retry_errors(
         resource_type="unit",
         resource_id=unit.id,
         resource_name=unit.name,
-        summary=f"{moved} arquivo(s) devolvidos à fila de recebimento.",
+        summary=counted(
+            moved,
+            "arquivo devolvido à fila de recebimento.",
+            "arquivos devolvidos à fila de recebimento.",
+        ),
+        notice=counted(
+            moved,
+            "arquivo devolvido ao recebimento.",
+            "arquivos devolvidos ao recebimento.",
+        ),
+        redirect_to=f"/units/{unit_id}",
     )
-    db.commit()
-    flash(request, f"{moved} arquivo(s) devolvidos ao recebimento.")
-    return RedirectResponse(f"/units/{unit_id}", status_code=303)
 
 
 @router.post("/units/{unit_id}/resend-failed")
 def units_resend_failed(
     unit_id: int,
     request: Request,
+    unit: Unit = Depends(_active_unit),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    unit = db.get(Unit, unit_id)
-    if unit is None or unit.deleted_at is not None:
-        return RedirectResponse("/units", status_code=303)
     count = resend_failed_transfers(db, ImageTransfer.unit_id == unit.id)
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -489,8 +562,15 @@ def units_resend_failed(
         resource_type="unit",
         resource_id=unit.id,
         resource_name=unit.name,
-        summary=f"{count} imagem(ns) com falha de envio devolvidas à fila.",
+        summary=counted(
+            count,
+            "imagem com falha de envio devolvida à fila.",
+            "imagens com falha de envio devolvidas à fila.",
+        ),
+        notice=counted(
+            count,
+            "imagem devolvida à fila de envio.",
+            "imagens devolvidas à fila de envio.",
+        ),
+        redirect_to=f"/units/{unit_id}",
     )
-    db.commit()
-    flash(request, f"{count} imagem(ns) devolvidas à fila de envio.")
-    return RedirectResponse(f"/units/{unit_id}", status_code=303)

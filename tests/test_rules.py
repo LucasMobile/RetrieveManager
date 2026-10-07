@@ -76,11 +76,13 @@ class RulesTest(DatabaseTestCase):
             assert ct is not None
             assert default is not None
 
-            response = rules_retrieve_delete(ct.id, request, db, user)
+            response = rules_retrieve_delete(ct.id, request, rule=ct, db=db, user=user)
             self.assertEqual(response.status_code, 303)
             self.assertIsNone(db.get(ModalityRule, ct.id))
 
-            response = rules_retrieve_delete(default.id, request, db, user)
+            response = rules_retrieve_delete(
+                default.id, request, rule=default, db=db, user=user
+            )
             self.assertEqual(response.status_code, 303)
             self.assertIsNotNone(db.get(ModalityRule, default.id))
             self.assertEqual(request.session["flash"]["kind"], "err")

@@ -1,5 +1,6 @@
+{% from "components/page.html" import empty_state %}
 {% from "icons.html" import icon %}
-{% from "components/forms.html" import csrf_input %}
+{% from "components/forms.html" import post_action %}
 <section class="dashboard-overview" aria-label="Resumo da operação">
   <article class="dashboard-health dashboard-health--{% if summary.error %}danger{% elif summary.enabled %}success{% else %}warning{% endif %}">
     <span class="dashboard-health__icon">{{ icon("activity") }}</span>
@@ -37,14 +38,16 @@
 </div>
 
 {% if not units %}
-<div class="surface empty-state">
-  <div class="empty-state__content">
-    <div class="empty-state__icon">{{ icon("building") }}</div>
-    <h2>Nenhuma unidade configurada</h2>
-    <p>Cadastre a primeira unidade para iniciar o recebimento e o envio de imagens.</p>
-    {% if user.role == 'admin' %}<a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Cadastrar unidade</a>{% endif %}
-  </div>
-</div>
+{{ empty_state(
+  "building",
+  "Nenhuma unidade configurada",
+  "Cadastre a primeira unidade para iniciar o recebimento e o envio de imagens.",
+  modifier="surface",
+  action_href="/units/new" if user.role == "admin" else "",
+  action_label="Cadastrar unidade",
+  action_icon="plus",
+  action_primary=true,
+) }}
 {% else %}
 <div class="unit-grid">
   {% for u in units %}
@@ -57,7 +60,7 @@
             <h3 class="unit-card__title">{{ u.name }}</h3>
             <div class="unit-card__statuses" aria-label="Status da unidade">
               {% if u.enabled %}<span class="status-badge status-badge--success">Ativa</span>{% else %}<span class="status-badge status-badge--warning">Pausada</span>{% endif %}
-              {% if u.store_up %}<span class="status-badge status-badge--info">Store {{ u.store_port }} online</span>{% else %}<span class="status-badge status-badge--danger">Store indisponível</span>{% endif %}
+              {% if u.store_problem %}<span class="status-badge status-badge--danger" title="{{ u.store_problem }}">Store bloqueado</span>{% elif u.store_up %}<span class="status-badge status-badge--info">Store {{ u.store_port }} online</span>{% else %}<span class="status-badge status-badge--danger">Store indisponível</span>{% endif %}
             </div>
           </div>
           <p class="unit-card__meta"><span>{{ u.calling_aet }}</span><i aria-hidden="true">→</i><span>{{ u.pacs_aet }}</span><span class="unit-card__endpoint">{{ u.pacs_ip }}:{{ u.pacs_port }}</span></p>
@@ -88,10 +91,7 @@
         <a class="btn btn--secondary btn--sm" href="/orders?unit_id={{ u.id }}">{{ icon("orders") }} Ver fila</a>
         {% if user.role == 'admin' %}
         <a class="btn btn--secondary btn--sm" href="/units/{{ u.id }}">{{ icon("edit") }} Configurar</a>
-        <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
-          {{ csrf_input(request) }}
-          <button class="btn {% if u.enabled %}btn--warning{% else %}btn--success{% endif %} btn--sm" type="submit">{{ icon("pause" if u.enabled else "play") }} {% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}</button>
-        </form>
+        {{ post_action(request, "/units/" ~ u.id ~ "/toggle", "btn " ~ ("btn--warning" if u.enabled else "btn--success") ~ " btn--sm", "", icon_name="pause" if u.enabled else "play", text="Pausar unidade" if u.enabled else "Ativar unidade") }}
         {% endif %}
       </div>
     </footer>

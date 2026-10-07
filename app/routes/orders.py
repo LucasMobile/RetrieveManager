@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.db import get_db
+from app.db import count_rows, get_db
 from app.events import add_event
 from app.models import (
     STATUSES,
@@ -26,15 +25,16 @@ from app.models import (
     Unit,
     User,
 )
-from app.observability import log_event, new_correlation_id
+from app.observability import new_correlation_id
 from app.order_state import (
     ACTIVE_ORDER_STATUSES,
     ACTIVE_PRIOR_STATUSES,
     can_archive,
     can_cancel,
     can_reprocess,
+    queue_prior_retrieve,
 )
-from app.pager import cursor_page_links, paginate, query_keep
+from app.pager import keyset_page, paginate, query_keep
 from app.pipeline import resend_failed_transfers
 from app.pipeline.monitor import finish_monitoring, reset_monitoring
 from app.retention import archive_order
@@ -44,38 +44,79 @@ from app.web import (
     EVENTS_PAGE,
     PAGE_SIZE_OPTIONS,
     PRIOR_STATUS_LABELS,
-    audit,
+    FlashRedirect,
     badge_for,
+    commit_action,
     ctx,
-    cursor_page_cursors,
     flash,
-    log,
+    redirect,
     require_admin,
     require_user,
     templates,
 )
+from app.wording import counted
 
 router = APIRouter()
 
 MONITOR_STOPPABLE = frozenset({"monitoring", "wait_update"})
 
 
+def _found(order: Order | None) -> Order:
+    if order is None:
+        raise FlashRedirect("/orders", "Pedido não encontrado.")
+    return order
+
+
+def _viewable_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_user),
+) -> Order:
+    return _found(
+        db.scalar(
+            select(Order).options(selectinload(Order.unit)).where(Order.id == order_id)
+        )
+    )
+
+
+def _admin_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> Order:
+    """Load an order for an admin action; authorization is checked first."""
+    return _found(db.get(Order, order_id))
+
+
+def _locked_admin_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> Order:
+    return _found(
+        db.scalar(select(Order).where(Order.id == order_id).with_for_update())
+    )
+
+
+def _active_order(order: Order = Depends(_admin_order)) -> Order:
+    """Admin order that still accepts actions (not archived)."""
+    if order.archived_at is not None:
+        raise FlashRedirect(
+            f"/orders/{order.id}", "Pedidos arquivados são somente para consulta."
+        )
+    return order
+
+
 @router.post("/orders/{order_id}/resend-failed")
 def order_resend_failed(
     order_id: int,
     request: Request,
+    order: Order = Depends(_active_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
-    if order.archived_at is not None:
-        flash(request, "Pedidos arquivados são somente para consulta.", "err")
-        return RedirectResponse(f"/orders/{order_id}", status_code=303)
     count = resend_failed_transfers(db, ImageTransfer.order_id == order.id)
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -83,22 +124,26 @@ def order_resend_failed(
         resource_type="order",
         resource_id=order.id,
         resource_name=order.acc,
-        summary=f"{count} imagem(ns) com falha de envio devolvidas à fila.",
+        summary=counted(
+            count,
+            "imagem com falha de envio devolvida à fila.",
+            "imagens com falha de envio devolvidas à fila.",
+        ),
+        notice=counted(
+            count,
+            "imagem devolvida à fila de envio.",
+            "imagens devolvidas à fila de envio.",
+        ),
+        redirect_to=f"/orders/{order_id}",
     )
-    db.commit()
-    flash(request, f"{count} imagem(ns) devolvidas à fila de envio.")
-    return RedirectResponse(f"/orders/{order_id}", status_code=303)
 
 
 def _order_send_failures(db: Session, order_id: int) -> int:
-    return int(
-        db.scalar(
-            select(func.count()).where(
-                ImageTransfer.order_id == order_id,
-                ImageTransfer.status == "send_error",
-            )
-        )
-        or 0
+    return count_rows(
+        db,
+        ImageTransfer,
+        ImageTransfer.order_id == order_id,
+        ImageTransfer.status == "send_error",
     )
 
 
@@ -194,12 +239,6 @@ def _orders_response(
 ):
     if status and status not in STATUSES:
         raise StarletteHTTPException(422, "Status inválido")
-    if page_size not in PAGE_SIZE_OPTIONS:
-        raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
-    if sum((before is not None, after is not None, last)) > 1:
-        raise StarletteHTTPException(422, "Use apenas um cursor de paginação")
-    if page > 1 and before is None and after is None and not last:
-        raise StarletteHTTPException(422, "Cursor de paginação ausente")
     archived_filter = (
         Order.archived_at.is_not(None) if history else Order.archived_at.is_(None)
     )
@@ -217,7 +256,27 @@ def _orders_response(
                 Order.source_id.ilike(like),
             )
         )
-    total = db.scalar(select(func.count()).select_from(filt.subquery())) or 0
+    rows, pager = keyset_page(
+        db,
+        filt,
+        Order.id,
+        page=page,
+        page_size=page_size,
+        size_options=PAGE_SIZE_OPTIONS,
+        before=before,
+        after=after,
+        last=last,
+        keep={"unit_id": unit_id, "status": status, "q": q},
+        options=(selectinload(Order.unit),),
+    )
+    for o in rows:
+        o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
+        o.badge = badge_for(o.status)  # type: ignore[attr-defined]
+        o.can_reprocess = can_reprocess(o)  # type: ignore[attr-defined]
+        o.can_archive = can_archive(o)  # type: ignore[attr-defined]
+        o.prior_status_label = PRIOR_STATUS_LABELS.get(  # type: ignore[attr-defined]
+            o.prior_status, o.prior_status
+        )
     filtered_orders = filt.subquery()
     order_status_counts = db.execute(
         select(
@@ -256,68 +315,11 @@ def _orders_response(
         ).select_from(filtered_orders)
     ).one()
     order_summary = {
-        "total": total,
+        "total": pager["total"],
         "waiting": int(order_status_counts[0] or 0),
         "running": int(order_status_counts[1] or 0),
         "done": int(order_status_counts[2] or 0),
     }
-    pages = max(1, (total + page_size - 1) // page_size)
-    if last:
-        page = pages
-    elif before is None and after is None:
-        page = 1
-    pager = paginate(total, page, page_size)
-    pager["size_options"] = PAGE_SIZE_OPTIONS
-    pager["keep"] = {"unit_id": unit_id, "status": status, "q": q}
-    stmt = filt.options(selectinload(Order.unit))
-    if last:
-        stmt = stmt.order_by(Order.id.asc())
-    elif before is not None:
-        stmt = stmt.where(Order.id < before).order_by(Order.id.desc())
-    elif after is not None:
-        stmt = stmt.where(Order.id > after).order_by(Order.id.asc())
-    else:
-        stmt = stmt.order_by(Order.id.desc())
-    result_limit = (total - pager["offset"]) if last else pager["size"]
-    stmt = stmt.limit(result_limit)
-    rows = list(db.scalars(stmt))
-    if after is not None or last:
-        rows.reverse()
-    for o in rows:
-        o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
-        o.badge = badge_for(o.status)  # type: ignore[attr-defined]
-        o.can_reprocess = can_reprocess(o)  # type: ignore[attr-defined]
-        o.can_archive = can_archive(o)  # type: ignore[attr-defined]
-        o.prior_status_label = PRIOR_STATUS_LABELS.get(  # type: ignore[attr-defined]
-            o.prior_status, o.prior_status
-        )
-    has_prev = False
-    has_next = False
-    if rows:
-        has_prev = (
-            db.scalar(
-                filt.where(Order.id > rows[0].id).with_only_columns(Order.id).limit(1)
-            )
-            is not None
-        )
-        has_next = (
-            db.scalar(
-                filt.where(Order.id < rows[-1].id).with_only_columns(Order.id).limit(1)
-            )
-            is not None
-        )
-    pager.update(
-        cursor=True,
-        has_prev=has_prev,
-        has_next=has_next,
-        prev_cursor=rows[0].id if rows else None,
-        next_cursor=rows[-1].id if rows else None,
-    )
-
-    pager["page_links"] = cursor_page_links(
-        pager,
-        page_cursors=cursor_page_cursors(db, filt, Order.id, pager),
-    )
     units = list(db.scalars(select(Unit).order_by(Unit.name)))
     qs = query_keep(unit_id=unit_id, status=status, q=q, page_size=page_size)
     return_to = request.url.path
@@ -382,15 +384,10 @@ def order_detail(
     request: Request,
     page: int = 1,
     return_to: str = Query("", max_length=2048),
+    order: Order = Depends(_viewable_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
-    order = db.scalar(
-        select(Order).options(selectinload(Order.unit)).where(Order.id == order_id)
-    )
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
     default_return_path = "/orders/history" if order.archived_at else "/orders"
     parsed_return = urlsplit(return_to)
     if (
@@ -404,11 +401,11 @@ def order_detail(
     order.can_archive = can_archive(order)  # type: ignore[attr-defined]
     order.can_cancel = can_cancel(order)  # type: ignore[attr-defined]
     manual_move_active = bool(
-        db.scalar(
-            select(func.count()).where(
-                ManualMoveRequest.order_id == order_id,
-                ManualMoveRequest.status.in_(("queued", "running")),
-            )
+        count_rows(
+            db,
+            ManualMoveRequest,
+            ManualMoveRequest.order_id == order_id,
+            ManualMoveRequest.status.in_(("queued", "running")),
         )
     )
     can_manual_move = bool(
@@ -418,7 +415,7 @@ def order_detail(
         and order.status != "cancelled"
         and not manual_move_active
     )
-    total = db.scalar(select(func.count()).where(OrderEvent.order_id == order_id)) or 0
+    total = count_rows(db, OrderEvent, OrderEvent.order_id == order_id)
     pager = paginate(total, page, EVENTS_PAGE)
     events = list(
         db.scalars(
@@ -460,7 +457,7 @@ def order_detail(
         study.id: {} for study in historical_studies
     }
     if historical_counts:
-        count_rows = db.execute(
+        status_rows = db.execute(
             select(
                 HistoricalImageLink.historical_study_id,
                 ImageTransfer.status,
@@ -476,7 +473,7 @@ def order_detail(
                 ImageTransfer.status,
             )
         )
-        for study_id, transfer_status, count in count_rows:
+        for study_id, transfer_status, count in status_rows:
             historical_counts[int(study_id)][str(transfer_status)] = int(count)
     historical_total_images = 0
     for study in historical_studies:
@@ -517,16 +514,11 @@ def order_detail(
 def order_retrieve_now(
     order_id: int,
     request: Request,
+    order: Order = Depends(_active_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
-    if order.archived_at is not None:
-        flash(request, "Pedidos arquivados são somente para consulta.", "err")
-    elif not order.study_uid:
+    if not order.study_uid:
         flash(request, "Aguarde o C-FIND localizar o exame atual.", "err")
     elif order.status in ACTIVE_ORDER_STATUSES:
         flash(request, "Já existe um C-MOVE do exame atual em andamento.", "err")
@@ -558,7 +550,7 @@ def order_retrieve_now(
                 message="C-MOVE manual do exame atual solicitado",
             )
         )
-        audit(
+        return commit_action(
             db,
             request,
             user,
@@ -567,61 +559,43 @@ def order_retrieve_now(
             resource_id=order.id,
             resource_name=order.acc,
             summary="C-MOVE manual do exame atual colocado na fila.",
-        )
-        db.commit()
-        log_event(
-            log,
-            logging.INFO,
-            "order.current_move.request",
-            resource=f"order:{order.id}",
-            status="success",
+            notice="C-MOVE do exame atual colocado na fila imediata.",
+            redirect_to=f"/orders/{order_id}",
+            event="order.current_move.request",
             order_id=order.id,
             unit_id=order.unit_id,
-            user_id=user.id,
             correlation_id=correlation_id,
         )
-        flash(request, "C-MOVE do exame atual colocado na fila imediata.")
-    return RedirectResponse(f"/orders/{order_id}", status_code=303)
+    return redirect(f"/orders/{order_id}")
 
 
 @router.post("/orders/{order_id}/retry")
 def order_retry(
-    order_id: int,
     request: Request,
+    order: Order = Depends(_admin_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
-    if order and can_reprocess(order):
-        _reset_order_for_reprocess(db, order)
-        audit(
-            db,
-            request,
-            user,
-            action="retry",
-            resource_type="order",
-            resource_id=order.id,
-            resource_name=order.acc,
-            summary="Pedido reiniciado para novo retrieve e envio.",
-        )
-        db.commit()
-        log_event(
-            log,
-            logging.INFO,
-            "order.reprocess",
-            resource=f"order:{order.id}",
-            status="success",
-            order_id=order.id,
-            unit_id=order.unit_id,
-            user_id=user.id,
-        )
-        flash(request, "Pedido reiniciado para novo retrieve e envio.")
-    elif order:
+    if not can_reprocess(order):
         flash(
             request, "Aguarde o processamento atual terminar para reprocessar.", "err"
         )
-    return RedirectResponse(
-        request.headers.get("referer") or "/orders", status_code=303
+        return redirect(request.headers.get("referer") or "/orders")
+    _reset_order_for_reprocess(db, order)
+    return commit_action(
+        db,
+        request,
+        user,
+        action="retry",
+        resource_type="order",
+        resource_id=order.id,
+        resource_name=order.acc,
+        summary="Pedido reiniciado para novo retrieve e envio.",
+        notice="Pedido reiniciado para novo retrieve e envio.",
+        redirect_to=request.headers.get("referer") or "/orders",
+        event="order.reprocess",
+        order_id=order.id,
+        unit_id=order.unit_id,
     )
 
 
@@ -629,16 +603,10 @@ def order_retry(
 def order_retry_prior(
     order_id: int,
     request: Request,
+    order: Order = Depends(_active_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
-    if order.archived_at is not None:
-        flash(request, "Pedidos arquivados são somente para consulta.", "err")
-        return RedirectResponse(f"/orders/{order_id}", status_code=303)
     if order.prior_status == "disabled":
         flash(request, "O retrieve histórico não está habilitado neste pedido.", "err")
     elif order.prior_status in ACTIVE_PRIOR_STATUSES:
@@ -651,13 +619,7 @@ def order_retry_prior(
         db.execute(
             delete(HistoricalSeries).where(HistoricalSeries.order_id == order.id)
         )
-        order.prior_status = "queued"
-        order.prior_due_at = datetime.now()
-        order.prior_started_at = None
-        order.prior_completed_at = None
-        order.prior_heartbeat_at = None
-        order.prior_attempts = 0
-        order.prior_last_error = ""
+        queue_prior_retrieve(order, datetime.now())
         db.add(
             OrderEvent(
                 order_id=order.id,
@@ -665,7 +627,7 @@ def order_retry_prior(
                 message="Reprocessamento manual do histórico solicitado",
             )
         )
-        audit(
+        return commit_action(
             db,
             request,
             user,
@@ -674,95 +636,73 @@ def order_retry_prior(
             resource_id=order.id,
             resource_name=order.acc,
             summary="Retrieve histórico colocado novamente na fila.",
-        )
-        db.commit()
-        log_event(
-            log,
-            logging.INFO,
-            "order.prior.reprocess",
-            resource=f"order:{order.id}",
-            status="success",
+            notice="Retrieve histórico colocado novamente na fila.",
+            redirect_to=f"/orders/{order_id}",
+            event="order.prior.reprocess",
             order_id=order.id,
             unit_id=order.unit_id,
-            user_id=user.id,
         )
-        flash(request, "Retrieve histórico colocado novamente na fila.")
-    return RedirectResponse(f"/orders/{order_id}", status_code=303)
+    return redirect(f"/orders/{order_id}")
 
 
 @router.post("/orders/{order_id}/monitor-now")
 def order_monitor_now(
     order_id: int,
     request: Request,
+    order: Order = Depends(_admin_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
     if order.archived_at is not None or order.status != "monitoring":
         flash(request, "O pedido não está monitorando novas imagens.", "err")
-    else:
-        order.monitor_next_at = datetime.now()
-        add_event(db, order, f"Verificação imediata solicitada por {user.username}")
-        audit(
-            db,
-            request,
-            user,
-            action="retry",
-            resource_type="order",
-            resource_id=order.id,
-            resource_name=order.acc,
-            summary="Verificação imediata de novas imagens solicitada.",
-        )
-        db.commit()
-        flash(request, "Verificação de novas imagens colocada na fila imediata.")
-    return RedirectResponse(f"/orders/{order_id}", status_code=303)
+        return redirect(f"/orders/{order_id}")
+    order.monitor_next_at = datetime.now()
+    add_event(db, order, f"Verificação imediata solicitada por {user.username}")
+    return commit_action(
+        db,
+        request,
+        user,
+        action="retry",
+        resource_type="order",
+        resource_id=order.id,
+        resource_name=order.acc,
+        summary="Verificação imediata de novas imagens solicitada.",
+        notice="Verificação de novas imagens colocada na fila imediata.",
+        redirect_to=f"/orders/{order_id}",
+    )
 
 
 @router.post("/orders/{order_id}/monitor-stop")
 def order_monitor_stop(
     order_id: int,
     request: Request,
+    order: Order = Depends(_locked_admin_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.scalar(select(Order).where(Order.id == order_id).with_for_update())
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
     if order.archived_at is not None or order.status not in MONITOR_STOPPABLE:
         flash(
             request,
             "Só é possível encerrar um monitoramento sem C-MOVE em andamento.",
             "err",
         )
-    else:
-        finish_monitoring(db, order, datetime.now(), user.username)
-        audit(
-            db,
-            request,
-            user,
-            action="update",
-            resource_type="order",
-            resource_id=order.id,
-            resource_name=order.acc,
-            summary="Monitoramento de novas imagens encerrado manualmente.",
-        )
-        db.commit()
-        log_event(
-            log,
-            logging.INFO,
-            "order.monitor.stop",
-            resource=f"order:{order.id}",
-            status="success",
-            order_id=order.id,
-            unit_id=order.unit_id,
-            user_id=user.id,
-        )
-        flash(request, "Monitoramento de novas imagens encerrado.")
-    return RedirectResponse(f"/orders/{order_id}", status_code=303)
+        return redirect(f"/orders/{order_id}")
+    finish_monitoring(db, order, datetime.now(), user.username)
+    return commit_action(
+        db,
+        request,
+        user,
+        action="update",
+        resource_type="order",
+        resource_id=order.id,
+        resource_name=order.acc,
+        summary="Monitoramento de novas imagens encerrado manualmente.",
+        notice="Monitoramento de novas imagens encerrado.",
+        redirect_to=f"/orders/{order_id}",
+        event="order.monitor.stop",
+        order_id=order.id,
+        unit_id=order.unit_id,
+    )
 
 
 def _reset_order_for_reprocess(db: Session, order: Order) -> None:
@@ -774,13 +714,7 @@ def _reset_order_for_reprocess(db: Session, order: Order) -> None:
     if order.prior_status == "cancelled":
         prior_skip = prior_skip_reason(db, order.unit, order.modality)
         if prior_skip is None:
-            order.prior_status = "queued"
-            order.prior_due_at = datetime.now()
-            order.prior_started_at = None
-            order.prior_completed_at = None
-            order.prior_heartbeat_at = None
-            order.prior_attempts = 0
-            order.prior_last_error = ""
+            queue_prior_retrieve(order, datetime.now())
         else:
             order.prior_status = "disabled"
             if prior_skip:
@@ -805,59 +739,54 @@ def _reset_order_for_reprocess(db: Session, order: Order) -> None:
 
 @router.post("/orders/{order_id}/cancel")
 def order_cancel(
-    order_id: int,
     request: Request,
+    order: Order = Depends(_admin_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
     running_manual = bool(
-        order
-        and db.scalar(
+        db.scalar(
             select(ManualMoveRequest.id).where(
                 ManualMoveRequest.order_id == order.id,
                 ManualMoveRequest.status == "running",
             )
         )
     )
-    if order and can_cancel(order) and not running_manual:
-        queued_manual = list(
-            db.scalars(
-                select(ManualMoveRequest).where(
-                    ManualMoveRequest.order_id == order.id,
-                    ManualMoveRequest.status == "queued",
-                )
-            )
-        )
-        for move_request in queued_manual:
-            move_request.status = "cancelled"
-            move_request.completed_at = datetime.now()
-            move_request.last_error = "Cancelado junto com o pedido"
-        if order.prior_status in {"queued", "retry_wait"}:
-            order.prior_status = "cancelled"
-            order.prior_completed_at = datetime.now()
-            order.prior_last_error = "Cancelado junto com o pedido"
-        order.status = "cancelled"
-        audit(
-            db,
-            request,
-            user,
-            action="cancel",
-            resource_type="order",
-            resource_id=order.id,
-            resource_name=order.acc,
-            summary="Processamento do pedido cancelado.",
-        )
-        db.commit()
-        flash(request, "Pedido cancelado.")
-    elif order:
+    if not can_cancel(order) or running_manual:
         flash(
             request,
             "Aguarde o retrieve atual terminar antes de cancelar.",
             "err",
         )
-    return RedirectResponse(
-        request.headers.get("referer") or "/orders", status_code=303
+        return redirect(request.headers.get("referer") or "/orders")
+    queued_manual = list(
+        db.scalars(
+            select(ManualMoveRequest).where(
+                ManualMoveRequest.order_id == order.id,
+                ManualMoveRequest.status == "queued",
+            )
+        )
+    )
+    for move_request in queued_manual:
+        move_request.status = "cancelled"
+        move_request.completed_at = datetime.now()
+        move_request.last_error = "Cancelado junto com o pedido"
+    if order.prior_status in {"queued", "retry_wait"}:
+        order.prior_status = "cancelled"
+        order.prior_completed_at = datetime.now()
+        order.prior_last_error = "Cancelado junto com o pedido"
+    order.status = "cancelled"
+    return commit_action(
+        db,
+        request,
+        user,
+        action="cancel",
+        resource_type="order",
+        resource_id=order.id,
+        resource_name=order.acc,
+        summary="Processamento do pedido cancelado.",
+        notice="Pedido cancelado.",
+        redirect_to=request.headers.get("referer") or "/orders",
     )
 
 
@@ -882,19 +811,16 @@ def _delete_order_record(
 def order_delete(
     order_id: int,
     request: Request,
+    order: Order = Depends(_admin_order),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
 ):
-    order = db.get(Order, order_id)
-    if order is None:
-        flash(request, "Pedido não encontrado.", "err")
-        return RedirectResponse("/orders", status_code=303)
     if order.archived_at is not None:
         flash(request, "O pedido já está arquivado.", "err")
-        return RedirectResponse("/orders/history", status_code=303)
+        return redirect("/orders/history")
     if not can_archive(order):
         flash(request, "Aguarde o processamento atual terminar para excluir.", "err")
-        return RedirectResponse("/orders", status_code=303)
+        return redirect("/orders")
     unit_id = order.unit_id
     accession = order.acc
     _delete_order_record(
@@ -903,7 +829,7 @@ def order_delete(
         actor_id=user.id,
         actor_username=user.username,
     )
-    audit(
+    return commit_action(
         db,
         request,
         user,
@@ -912,17 +838,9 @@ def order_delete(
         resource_id=order_id,
         resource_name=accession,
         summary="Pedido arquivado com eventos e arquivos clínicos preservados.",
-    )
-    db.commit()
-    log_event(
-        log,
-        logging.INFO,
-        "order.archive",
-        resource=f"order:{order_id}",
-        status="success",
+        notice="Pedido arquivado. Todo o histórico foi preservado.",
+        redirect_to="/orders",
+        event="order.archive",
         order_id=order_id,
         unit_id=unit_id,
-        user_id=user.id,
     )
-    flash(request, "Pedido arquivado. Todo o histórico foi preservado.")
-    return RedirectResponse("/orders", status_code=303)

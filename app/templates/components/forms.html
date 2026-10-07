@@ -4,10 +4,13 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
 {%- endmacro %}
 
-{% macro post_action(request, url, button_class, aria_label, icon_name='', text='', tooltip='', confirm='', confirm_label='') -%}
+{# Formulário POST de um botão só (com CSRF e confirmação opcional).
+   title: none repete o tooltip; "" omite o atributo. aria_label "" omite o atributo (botão com texto). #}
+{% macro post_action(request, url, button_class, aria_label, icon_name='', text='', tooltip='', confirm='', confirm_label='', title=none, disabled=false) -%}
+{% set title = tooltip if title is none else title %}
 <form class="inline-form" method="post" action="{{ url }}"{% if confirm %} data-confirm="{{ confirm }}"{% endif %}{% if confirm_label %} data-confirm-label="{{ confirm_label }}"{% endif %}>
   {{ csrf_input(request) }}
-  <button class="{{ button_class }}" type="submit" aria-label="{{ aria_label }}"{% if tooltip %} data-tooltip="{{ tooltip }}" title="{{ tooltip }}"{% endif %}>{% if icon_name %}{{ icon(icon_name) }}{% endif %}{% if text %} {{ text }}{% endif %}</button>
+  <button class="{{ button_class }}" type="submit"{% if aria_label %} aria-label="{{ aria_label }}"{% endif %}{% if tooltip %} data-tooltip="{{ tooltip }}"{% endif %}{% if title %} title="{{ title }}"{% endif %}{% if disabled %} disabled{% endif %}>{% if icon_name %}{{ icon(icon_name) }}{% endif %}{% if text %} {{ text }}{% endif %}</button>
 </form>
 {%- endmacro %}
 

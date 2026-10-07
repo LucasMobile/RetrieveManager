@@ -1,30 +1,17 @@
 {% extends "base.html" %}
+{% from "components/summary.html" import summary_item %}
+{% from "components/page.html" import page_header %}
 {% from "icons.html" import icon %}
-{% from "components/forms.html" import csrf_input %}
+{% from "components/forms.html" import csrf_input, post_action %}
 {% block title %}Tempo de retrieve · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack retrieve-rules-page">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Configurações</p>
-      <h1>Tempo de retrieve</h1>
-      <p class="page-header__description">Defina quando cada modalidade será buscada no PACS e quais exames continuarão sendo consultados em busca de novas imagens.</p>
-    </div>
-  </header>
+  {{ page_header("Configurações", "Tempo de retrieve", "Defina quando cada modalidade será buscada no PACS e quais exames continuarão sendo consultados em busca de novas imagens.") }}
 
   <section class="retrieve-summary summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das regras">
-    <div class="summary-strip__item">
-      <span class="summary-strip__icon">{{ icon("clock") }}</span>
-      <div class="summary-strip__copy"><strong>{% if summary.default_wait is not none %}{{ summary.default_wait }} min{% else %}—{% endif %}</strong><span>regra padrão do 1º retrieve</span></div>
-    </div>
-    <div class="summary-strip__item">
-      <span class="summary-strip__icon">{{ icon("rules") }}</span>
-      <div class="summary-strip__copy"><strong>{{ summary.total }}</strong><span>regra{% if summary.total != 1 %}s{% endif %} configurada{% if summary.total != 1 %}s{% endif %}</span></div>
-    </div>
-    <div class="summary-strip__item">
-      <span class="summary-strip__icon">{{ icon("retry") }}</span>
-      <div class="summary-strip__copy"><strong>{{ summary.monitor_enabled }}</strong><span>modalidade{% if summary.monitor_enabled != 1 %}s{% endif %} com monitoramento</span></div>
-    </div>
+    {{ summary_item("clock", "—" if summary.default_wait is none else summary.default_wait ~ " min", "regra padrão do 1º retrieve") }}
+    {{ summary_item("rules", summary.total, summary.total | plural("regra configurada", "regras configuradas")) }}
+    {{ summary_item("retry", summary.monitor_enabled, summary.monitor_enabled | plural("modalidade com monitoramento", "modalidades com monitoramento")) }}
   </section>
 
   <section class="surface retrieve-rules-card" aria-labelledby="retrieve-rules-title">
@@ -81,10 +68,7 @@
               <div class="table-actions retrieve-rule-actions">
                 <button class="action-icon" type="submit" form="retrieve-rule-{{ r.id }}" data-tooltip="Salvar regra" aria-label="Salvar regra de {{ r.modality }}">{{ icon("save") }}</button>
                 {% if r.modality != '*' %}
-                <form class="inline-form" method="post" action="/rules/retrieve/{{ r.id }}/delete" data-confirm="Excluir a regra de {{ r.modality }}? A modalidade passará a utilizar a regra padrão." data-confirm-label="Excluir regra">
-        {{ csrf_input(request) }}
-                  <button class="action-icon action-icon--danger" type="submit" data-tooltip="Excluir regra" aria-label="Excluir regra de {{ r.modality }}">{{ icon("trash") }}</button>
-                </form>
+                {{ post_action(request, "/rules/retrieve/" ~ r.id ~ "/delete", "action-icon action-icon--danger", "Excluir regra de " ~ r.modality, icon_name="trash", tooltip="Excluir regra", title="", confirm="Excluir a regra de " ~ r.modality ~ "? A modalidade passará a utilizar a regra padrão.", confirm_label="Excluir regra") }}
                 {% else %}
                 <button class="action-icon is-disabled" type="button" data-tooltip="Regra padrão protegida" aria-label="A regra padrão não pode ser excluída" aria-disabled="true">{{ icon("trash") }}</button>
                 {% endif %}

@@ -1,15 +1,15 @@
 {% extends "base.html" %}
+{% from "components/page.html" import page_header %}
 {% from "icons.html" import icon %}
 {% block title %}{{ 'Histórico de pedidos' if history else 'Fila de pedidos' }} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Operação</p>
-      <h1>{{ 'Histórico de pedidos' if history else 'Fila de pedidos' }}</h1>
-      <p class="page-header__description">{% if history %}Consulte pedidos arquivados sem perder eventos, vínculos ou evidências.{% else %}Consulte cada pedido e acompanhe a etapa atual do processamento.{% endif %}</p>
-    </div>
-  </header>
+  {{ page_header(
+    "Operação",
+    "Histórico de pedidos" if history else "Fila de pedidos",
+    "Consulte pedidos arquivados sem perder eventos, vínculos ou evidências." if history
+    else "Consulte cada pedido e acompanhe a etapa atual do processamento.",
+  ) }}
 
   {# Na fila, resumo e tabela se atualizam sozinhos (data-poll-slot); o formulário de filtros nunca é substituído. #}
   <div class="page-stack{% if not history %} poll-region{% endif %}"{% if not history %} data-poll="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}" data-interval="{{ poll_seconds * 1000 }}"{% endif %}>

@@ -1,24 +1,18 @@
 {% extends "base.html" %}
+{% from "components/page.html" import page_header %}
 {% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
-{% from "components/forms.html" import csrf_input %}
+{% from "components/forms.html" import post_action %}
 {% block title %}Usuários · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack users-page">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Configurações</p>
-      <h1>Usuários</h1>
-      <p class="page-header__description">Gerencie quem pode acompanhar a operação e quem possui acesso administrativo.</p>
-    </div>
-    <div class="page-header__actions">
-      <a class="btn btn--primary" href="/users/new">{{ icon("plus") }} Novo usuário</a>
-    </div>
-  </header>
+  {% call page_header("Configurações", "Usuários", "Gerencie quem pode acompanhar a operação e quem possui acesso administrativo.") %}
+    <a class="btn btn--primary" href="/users/new">{{ icon("plus") }} Novo usuário</a>
+  {% endcall %}
 
   <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo dos usuários">
-    {{ summary_item("users", summary.total, "usuário cadastrado" if summary.total == 1 else "usuários cadastrados") }}
-    {{ summary_item("key", summary.admins, "administrador" if summary.admins == 1 else "administradores") }}
+    {{ summary_item("users", summary.total, summary.total | plural("usuário cadastrado", "usuários cadastrados")) }}
+    {{ summary_item("key", summary.admins, summary.admins | plural("administrador", "administradores")) }}
     {{ summary_item("eye", summary.regular, "somente acompanhamento") }}
   </section>
 
@@ -28,7 +22,7 @@
         <h2 id="users-title">Contas cadastradas</h2>
         <p>Administradores configuram o sistema; usuários comuns possuem acesso somente de leitura à operação.</p>
       </div>
-      <span>{{ summary.total }} conta{% if summary.total != 1 %}s{% endif %}</span>
+      <span>{{ summary.total }} {{ summary.total | plural("conta", "contas") }}</span>
     </div>
     <div class="table-wrap">
       <table class="data-table users-table">
@@ -47,10 +41,8 @@
             <td>
               <div class="table-actions">
                 <a class="action-icon" href="/users/{{ managed_user.id }}" data-tooltip="Editar usuário" title="Editar usuário" aria-label="Editar usuário">{{ icon("edit") }}</a>
-                <form class="inline-form" method="post" action="/users/{{ managed_user.id }}/delete" data-confirm="Excluir o usuário {{ managed_user.username }}? Essa pessoa perderá o acesso ao sistema." data-confirm-label="Excluir usuário">
-                  {{ csrf_input(request) }}
-                  <button class="action-icon action-icon--danger{% if managed_user.id == user.id %} is-disabled{% endif %}" type="submit" data-tooltip="{{ 'Não é possível excluir a própria conta' if managed_user.id == user.id else 'Excluir usuário' }}" title="Excluir usuário" aria-label="Excluir usuário" {% if managed_user.id == user.id %}disabled{% endif %}>{{ icon("trash") }}</button>
-                </form>
+                {% set is_self = managed_user.id == user.id %}
+                {{ post_action(request, "/users/" ~ managed_user.id ~ "/delete", "action-icon action-icon--danger" ~ (" is-disabled" if is_self else ""), "Excluir usuário", icon_name="trash", tooltip="Não é possível excluir a própria conta" if is_self else "Excluir usuário", title="Excluir usuário", disabled=is_self, confirm="Excluir o usuário " ~ managed_user.username ~ "? Essa pessoa perderá o acesso ao sistema.", confirm_label="Excluir usuário") }}
               </div>
             </td>
           </tr>

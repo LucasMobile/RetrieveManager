@@ -1,0 +1,26 @@
+{% from "icons.html" import icon %}
+
+{# Cabeçalho padrão de página. As ações vêm de um bloco {% call %}; se ele renderizar vazio, a área de ações é omitida. #}
+{% macro page_header(eyebrow, title, description) -%}
+{% set actions = caller() if caller is defined else "" %}
+<header class="page-header">
+  <div class="page-header__copy">
+    <p class="eyebrow">{{ eyebrow }}</p>
+    <h1>{{ title }}</h1>
+    <p class="page-header__description">{{ description }}</p>
+  </div>
+  {% if actions | trim %}<div class="page-header__actions">{{ actions }}</div>{% endif %}
+</header>
+{%- endmacro %}
+
+{# Estado vazio de listas. modifier acrescenta classes (ex.: "surface"); a ação é opcional. #}
+{% macro empty_state(icon_name, title, text, modifier="", action_href="", action_label="", action_icon="", action_primary=false) -%}
+<div class="{% if modifier %}{{ modifier }} {% endif %}empty-state">
+  <div class="empty-state__content">
+    <div class="empty-state__icon">{{ icon(icon_name) }}</div>
+    <h2>{{ title }}</h2>
+    <p>{{ text }}</p>
+    {% if action_href %}<a class="btn btn--{{ 'primary' if action_primary else 'secondary' }}" href="{{ action_href }}">{% if action_icon %}{{ icon(action_icon) }} {% endif %}{{ action_label }}</a>{% endif %}
+  </div>
+</div>
+{%- endmacro %}

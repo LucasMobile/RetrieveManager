@@ -27,16 +27,36 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
      (`dicom.find status=conflict`) sem agendar C-MOVE;
    - quando encontrado, agenda o primeiro retrieve a partir do C-FIND.
 3. **Claim de C-MOVE (`dicom.move.claim`)**
-   - respeita `max_parallel_moves` da unidade;
+   - respeita `max_parallel_moves` da unidade como total. Dentro dele, o 1º
+     retrieve e o move manual usam qualquer vaga livre; o trabalho de fundo
+     (C-MOVE de novas imagens e histórico) nunca ocupa a última vaga, e cada um
+     dos dois fica com no máximo metade (4 vagas: fundo até 3, novas imagens até
+     2, histórico até 2). Entre os dois, vai primeiro o que espera há mais tempo.
+     Uma rajada de pedidos não trava o 1º retrieve dos exames novos atrás do
+     monitoramento e do histórico. Com 1 vaga, a ordem é manual, 1º retrieve e
+     depois o trabalho de fundo;
    - usa bloqueio de linha com `SKIP LOCKED`, evitando claim duplicado quando há
      mais de um worker;
-   - move manual tem prioridade, seguido do exame atual e do histórico.
+   - move manual tem prioridade, seguido do exame atual;
+   - com o histórico desativado na unidade nada histórico é iniciado; salvar a
+     unidade (histórico desligado ou modalidade removida da lista) cancela os
+     históricos na fila (`disabled`, com evento no pedido), e um histórico em
+     andamento para antes da próxima série.
 4. **Retrieve atual (`dicom.move`)**
    - C-MOVE em pynetdicom com o Calling AET da unidade como destino; sucesso
      exige status final Success **e** nenhuma sub-operação com falha. Falha
      parcial (0xB000), destino desconhecido (0xA801) ou tempo esgotado (a
      associação é abortada) contam como tentativa com erro; o evento e o log
      trazem as contagens enviadas/falhas/avisos;
+   - depois da primeira resposta pendente, o PACS que passa
+     `MOVE_IDLE_TIMEOUT_SECONDS` (120 s) sem enviar imagem tem a associação
+     abortada: uma transferência travada libera a vaga em vez de segurá-la pelo
+     timeout inteiro da unidade;
+   - o sucesso informado pelo PACS é conferido no receptor: se em
+     `MOVE_RECEIVE_CONFIRM_SECONDS` (15 s) nenhuma imagem do estudo foi
+     registrada desde o início do C-MOVE (cópias repetidas contam), o C-MOVE
+     conta como falha com "nenhuma chegou ao receptor". Isso revela o AE de
+     destino apontando para outro Store SCP (outra porta/serviço/IP);
    - o primeiro retrieve possui até três tentativas;
    - retries usam espera de 60 e 300 segundos;
    - uma exceção inesperada é persistida imediatamente, sem aguardar o recovery
@@ -66,14 +86,23 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
      todos), com Called AET diferente ou Calling AET fora da lista é recusada
      com A-ASSOCIATE-RJ (`dicom.receive.association status=rejected`);
    - o objeto é gravado byte a byte como recebido (temporário oculto + rename),
-     com o SHA-256 do dataset, e registrado em `dicom_instances` antes do
-     sucesso; os registros pendentes compartilham um commit por vez;
-   - banco indisponível, commit acima de `RECEIVER_COMMIT_TIMEOUT_SECONDS` ou
-     disco abaixo de `RECEIVER_MIN_FREE_MB` respondem `0xA700` (o PACS reenvia);
-     o arquivo gravado fica para a adoção do worker;
+     com o SHA-256 do dataset, e registrado em `dicom_instances`; os registros
+     pendentes compartilham um commit por vez;
+   - SOP nunca registrado pela unidade recebe sucesso logo após o rename e é
+     commitado em seguida (`RECEIVER_EARLY_ACK=true`); reenvio, instância com
+     erro recebida de novo e conflito esperam o commit, assim como todo objeto
+     enquanto o último commit falhou ou a fila passa de
+     `RECEIVER_EARLY_ACK_MAX_PENDING`. Commit falho de objeto já confirmado
+     registra `dicom.receive.persist status=failure acknowledged=true`, e o
+     arquivo fica para a adoção do worker;
+   - banco ilegível (consultado antes de gravar), commit acima de
+     `RECEIVER_COMMIT_TIMEOUT_SECONDS` no caminho que espera o commit ou disco
+     abaixo de `RECEIVER_MIN_FREE_MB` respondem `0xA700` (o PACS reenvia); o
+     arquivo já gravado fica para a adoção do worker;
    - o mesmo SOP e conteúdo é duplicata (confirmada sem nova compactação); o
      mesmo SOP com conteúdo diferente vira `conflict` na pasta de erro;
-   - uma linha por associação resume gravados, duplicatas, conflitos e falhas
+   - uma linha por associação resume gravados, duplicatas, conflitos, falhas e
+     confirmados sem registro (`unrecorded_count`, adotados depois pelo worker)
      (`dicom.receive.association status=released`);
    - a compactação reconfere o AE de origem gravado no meta header
      (`dicom.inbound.reject error_type=UnauthorizedSender`);
@@ -95,7 +124,10 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - a fila é lida com `scandir` e a varredura para assim que o lote é preenchido,
      evitando ordenar e manter dezenas de milhares de caminhos em memória;
    - unidades são compactadas em jobs independentes e a concorrência total dos
-     codecs é limitada por `COMPACT_GLOBAL_WORKERS`;
+     codecs é limitada por `COMPACT_GLOBAL_WORKERS` (padrão: CPUs disponíveis
+     − 2, mínimo 1), dividida de forma justa entre as unidades com fila
+     (`FairSlots`): cada uma fica com o total dividido pelo número de unidades
+     compactando, e uma unidade sozinha usa tudo;
    - cada arquivo é executado isoladamente; uma exceção não cancela os demais;
    - arquivos que provocam exceção inesperada são movidos para quarentena, para
      não reaparecerem indefinidamente no início de cada lote;
@@ -188,7 +220,7 @@ Variáveis novas e seus padrões:
 
 - `FIND_BATCH_SIZE=10`
 - `COMPACT_BATCH_SIZE=250`
-- `COMPACT_GLOBAL_WORKERS=8`
+- `COMPACT_GLOBAL_WORKERS=` (vazio = CPUs disponíveis − 2, mínimo 1)
 - `COMPACT_DB_BATCH_SIZE=25`
 - `COMPACT_TEMP_MAX_AGE_SECONDS=3600`
 - `COMPACT_FILE_TIMEOUT_SECONDS=300`

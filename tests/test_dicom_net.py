@@ -1,10 +1,13 @@
+import itertools
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from unittest import mock
 
 from pydicom.dataset import Dataset
+from pynetdicom import AE, StoragePresentationContexts, evt
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
@@ -19,6 +22,7 @@ from app.dicom_net import (
     move_series,
     move_study,
     prior_series_query,
+    study_move_identifier,
 )
 from app.models import DicomInstance, ModalityRule, Order, OrderEvent, Unit
 from app.parse import study_response
@@ -86,7 +90,12 @@ class PacsReceiverFixture:
         self.engine.dispose()
         self.tmp.cleanup()
 
+    def wait_writer(self):
+        # New objects are acknowledged before their commit ends.
+        self.assertTrue(self.receiver.writer.wait_idle(10))
+
     def stored(self) -> int:
+        self.wait_writer()
         with self.Session() as db:
             return db.scalar(select(func.count()).select_from(DicomInstance))
 
@@ -111,7 +120,7 @@ class DicomNetworkTest(PacsReceiverFixture, unittest.TestCase):
         self.assertEqual(response.birth_date, "19691027")
         self.assertEqual(response.modalities, "CT")
         self.assertEqual(response.instance_count, "3")
-        self.assertIn("1 resposta(s)", result.summary)
+        self.assertIn("1 resposta", result.summary)
 
     def test_find_without_match_is_ok_and_empty(self):
         result = find_study(self.node, "NAO-EXISTE", "19691027", timeout=10)
@@ -214,6 +223,70 @@ class DicomNetworkTest(PacsReceiverFixture, unittest.TestCase):
         self.assertTrue(result.error)
         self.assertEqual(self.stored(), 0)
 
+    def test_move_delivered_to_another_store_scp_is_not_a_retrieve(self):
+        # Another service answers on the address the PACS has for our AE: the
+        # PACS reports every image as sent and the receiver gets none.
+        other_port = free_port()
+        other = AE(ae_title="OTHER")
+        other.supported_contexts = StoragePresentationContexts
+        server = other.start_server(
+            ("127.0.0.1", other_port),
+            block=False,
+            evt_handlers=[(evt.EVT_C_STORE, lambda _event: 0x0000)],
+        )
+        self.addCleanup(server.shutdown)
+        self.pacs.destinations["RETRIEVE"] = ("127.0.0.1", other_port)
+        with self.Session() as db:
+            unit = db.get(Unit, self.unit.id)
+            unit.pacs_port = self.pacs.port
+            order = Order(
+                unit_id=unit.id,
+                acc="ACC-1",
+                birth_date="19691027",
+                study_uid=STUDY,
+                modality="CT",
+                status="retrieving",
+                prior_status="disabled",
+            )
+            db.add(order)
+            db.commit()
+            with mock.patch("app.pipeline.move.MOVE_RECEIVE_CONFIRM_SECONDS", 1):
+                _run_move(db, unit, order)
+            self.assertEqual(order.status, "wait_retrieve")
+            self.assertIn("3 imagens enviadas", order.last_error)
+            self.assertIn("nenhuma chegou ao receptor", order.last_error)
+            self.assertIn(f"porta {unit.store_port}", order.last_error)
+        self.assertEqual(self.stored(), 0)
+
+    def test_stalled_transfer_is_aborted_at_the_idle_limit(self):
+        self.pacs.stall_after = 1
+        self.pacs.stall_seconds = 6
+        started = monotonic()
+        result = move(
+            self.node,
+            study_move_identifier(STUDY),
+            destination_aet="RETRIEVE",
+            timeout=60,
+            idle_timeout=2,
+        )
+        self.assertLess(monotonic() - started, 5)
+        self.assertFalse(result.ok)
+        self.assertIn("PACS sem enviar imagens por 2 s", result.error)
+        self.assertEqual(self.stored(), 1)
+
+    def test_slow_first_response_is_not_taken_for_a_stall(self):
+        # Some PACS take a while to prepare the study before the first answer.
+        self.pacs.move_delay = 3
+        result = move(
+            self.node,
+            study_move_identifier(STUDY),
+            destination_aet="RETRIEVE",
+            timeout=60,
+            idle_timeout=2,
+        )
+        self.assertTrue(result.ok, result.summary)
+        self.assertEqual(self.stored(), 3)
+
 
 def move_status(code, **counts):
     status = Dataset()
@@ -248,10 +321,13 @@ class MonitoringTest(PacsReceiverFixture, unittest.TestCase):
             db.commit()
             self.order_id = order.id
         self.assertTrue(move_study(self.node, STUDY, timeout=30).ok)
+        self.wait_writer()
         self.moves_before = len(self.pacs.moves)
 
     def run_check(self):
         """One monitoring check plus the update move it may have queued."""
+        # In production the check comes minutes after the move's last commit.
+        self.wait_writer()
         with self.Session() as db:
             unit = db.get(Unit, self.unit.id)
             self.assertEqual(check_monitoring(db, unit), 1)
@@ -277,7 +353,7 @@ class MonitoringTest(PacsReceiverFixture, unittest.TestCase):
             (order.monitor_next_at - datetime.now()).total_seconds() / 60, 5, delta=0.2
         )
         self.assertTrue(events[0].startswith("Verificação 1: nenhuma imagem nova"))
-        self.assertIn("PACS: 3 imagem(ns) em 1 série(s); recebidas: 3.", events[0])
+        self.assertIn("PACS: 3 imagens em 1 série; recebidas: 3.", events[0])
 
     def test_only_series_with_new_images_are_moved(self):
         self.pacs.images.extend(study_images(count=2, series_uid=f"{STUDY}.2"))
@@ -286,7 +362,7 @@ class MonitoringTest(PacsReceiverFixture, unittest.TestCase):
         self.assertEqual(len(self.pacs.moves), self.moves_before + 1)
         self.assertEqual(self.stored(), 5)
         self.assertEqual(order.monitor_new_images, 2)
-        self.assertIn("Imagens novas em 1 série(s)", events[0])
+        self.assertIn("Imagens novas em 1 série;", events[0])
         self.assertTrue(events[1].startswith("C-MOVE de novas imagens concluído"))
 
         # The next check sees everything received.
@@ -342,7 +418,7 @@ class MonitoringTest(PacsReceiverFixture, unittest.TestCase):
         self.assertIsNone(order.monitor_next_at)
         self.assertTrue(events[-1].startswith("Verificação 1: nenhuma imagem nova"))
         self.assertIn(
-            "Monitoramento de novas imagens encerrado: 1 verificação(ões)", events[-1]
+            "Monitoramento de novas imagens encerrado: 1 verificação,", events[-1]
         )
 
     def test_stopped_order_is_left_alone_by_an_inflight_check(self):
@@ -400,6 +476,33 @@ class MoveCountsTest(unittest.TestCase):
         self.assertEqual((result.completed, result.failed), (388, 4))
         self.assertEqual(result.remaining, 0)
         self.assertNotIn("pendentes", result.summary)
+
+    def test_pending_responses_without_progress_are_a_stall(self):
+        assoc = mock.Mock(is_established=True)
+        assoc.send_c_move.return_value = iter(
+            [
+                (move_status(0xFF00, Remaining=9, Completed=1), None),
+                (move_status(0xFF00, Remaining=9, Completed=1), None),
+                (move_status(0x0000, Completed=10), None),
+            ]
+        )
+        node = PacsNode("127.0.0.1", 104, "PACS", "RETRIEVE")
+        clock = itertools.count(0, 100)
+        with (
+            mock.patch("app.dicom_net._associate", return_value=(assoc, "")),
+            mock.patch("app.dicom_net.monotonic", side_effect=lambda: next(clock)),
+        ):
+            result = move(
+                node,
+                Dataset(),
+                destination_aet="RETRIEVE",
+                timeout=10_000,
+                idle_timeout=50,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("sem enviar imagens", result.error)
+        assoc.abort.assert_called_once()
 
 
 if __name__ == "__main__":

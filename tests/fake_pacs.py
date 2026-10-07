@@ -57,11 +57,16 @@ class FakePacs:
         ae_title: str = "PACS",
         destinations: dict[str, tuple[str, int]] | None = None,
         move_delay: float = 0.0,
+        stall_after: int | None = None,
+        stall_seconds: float = 0.0,
     ) -> None:
         self.images = list(images)
         self.ae_title = ae_title
         self.destinations = destinations or {}
         self.move_delay = move_delay
+        # Pause after sending this many images, as a PACS whose transfer hangs.
+        self.stall_after = stall_after
+        self.stall_seconds = stall_seconds
         self.port = free_port()
         self.moves: list[str] = []
         self._server = None
@@ -142,5 +147,7 @@ class FakePacs:
             time.sleep(self.move_delay)
         matches = self._select(event.identifier)
         yield len(matches)
-        for image in matches:
+        for sent, image in enumerate(matches):
+            if sent == self.stall_after:
+                time.sleep(self.stall_seconds)
             yield 0xFF00, image

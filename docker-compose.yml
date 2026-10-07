@@ -21,14 +21,14 @@ x-service-defaults: &service-defaults
       max-file: "3"
   volumes:
     - retrieve-data:/data
-    - /mobilemed:/mobilemed
+    - c:/mobile:/mobile
     - /opt/idr:/opt/idr
   environment: &service-environment
     APP_ENV: production
     TZ: America/Sao_Paulo
     DATA_DIR: /data
     POSTGRES_HOST: postgres
-    ALLOWED_DATA_ROOTS: /mobilemed,/opt/idr
+    ALLOWED_DATA_ROOTS: /mobile,/opt/idr
     STORE_PORT_MAP: "444:10444"
 
 services:
@@ -41,6 +41,44 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-retrieve}
       POSTGRES_USER: ${POSTGRES_USER:-retrieve}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no .env}
+    # Consultas paralelas usam /dev/shm; os 64 MB padrão do Docker fazem
+    # consultas grandes falharem com "could not resize shared memory segment".
+    shm_size: ${PG_SHM_SIZE:-256mb}
+    # Ajustes para um banco que cresce por anos. Memória: dimensione pelo
+    # servidor no .env (PG_SHARED_BUFFERS ~25% da RAM livre para o banco).
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-2GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}
+      # Disco SSD/NVMe; em disco mecânico use 4.
+      - -c
+      - random_page_cost=${PG_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - max_wal_size=${PG_MAX_WAL_SIZE:-2GB}
+      - -c
+      - checkpoint_timeout=15min
+      # Transação esquecida aberta impede o vacuum e incha as tabelas; nenhum
+      # fluxo do app mantém transação parada por mais que alguns segundos.
+      - -c
+      - idle_in_transaction_session_timeout=${PG_IDLE_IN_TRANSACTION_TIMEOUT:-30min}
+      # Diagnóstico: consultas lentas, esperas por lock, vacuum demorado e
+      # ordenações que transbordam para disco.
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION:-1000}
+      - -c
+      - log_lock_waits=on
+      - -c
+      - log_autovacuum_min_duration=10s
+      - -c
+      - log_temp_files=10MB
+      - -c
+      - track_io_timing=on
     volumes:
       - postgres-data:/var/lib/postgresql
     healthcheck:

@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.audit import audit
 from app.config import (
     ORDERS_API_ACK_BATCH_SIZE,
     ORDERS_API_ACK_CONCURRENCY,
@@ -18,7 +19,6 @@ from app.config import (
 )
 from app.events import add_event
 from app.models import (
-    AuditLog,
     ManualMoveRequest,
     Order,
     Unit,
@@ -27,7 +27,6 @@ from app.observability import (
     log_context,
     log_event,
     new_correlation_id,
-    safe_error_detail,
 )
 from app.order_state import ACTIVE_ORDER_STATUSES
 from app.orders_api import (
@@ -138,6 +137,19 @@ def recover_stale_locks(db: Session) -> None:
         )
     ]
     for order in prior_rows:
+        if not order.unit.retrieve_prior_enabled:
+            # Turned off meanwhile: do not queue it again.
+            order.prior_status = "disabled"
+            order.prior_due_at = None
+            order.prior_last_error = ""
+            add_event(
+                db,
+                order,
+                "Retrieve histórico interrompido pela queda do worker e não "
+                "retomado: desativado na unidade",
+                level="warn",
+            )
+            continue
         order.prior_status = "queued"
         order.prior_due_at = now
         order.prior_last_error = "lock órfão do histórico recuperado"
@@ -306,20 +318,17 @@ def ingest_unit(db: Session, unit: Unit) -> int:
                 )
                 db.add(order)
                 db.flush()
-                db.add(
-                    AuditLog(
-                        actor_id=None,
-                        actor_username="Sistema",
-                        actor_role="system",
-                        action="create",
-                        resource_type="order",
-                        resource_id=str(order.id),
-                        resource_name=order.acc,
-                        summary=(
-                            f"Pedido recebido automaticamente da unidade {unit.name}."
-                        ),
-                        ip_address="",
-                    )
+                audit(
+                    db,
+                    None,
+                    None,
+                    action="create",
+                    resource_type="order",
+                    resource_id=order.id,
+                    resource_name=order.acc,
+                    summary=(
+                        f"Pedido recebido automaticamente da unidade {unit.name}."
+                    ),
                 )
                 add_event(
                     db,
@@ -335,7 +344,6 @@ def ingest_unit(db: Session, unit: Unit) -> int:
                 resource=f"unit:{unit.id}",
                 status="rejected",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit.id,
             )
             continue
@@ -528,18 +536,15 @@ def _archive_order_batch(
 ) -> int:
     for order in orders:
         archive_order(db, order, reason=reason, archived_at=archived_at)
-        db.add(
-            AuditLog(
-                actor_id=None,
-                actor_username="Sistema",
-                actor_role="system",
-                action="archive",
-                resource_type="order",
-                resource_id=str(order.id),
-                resource_name=order.acc,
-                summary=audit_summary,
-                ip_address="",
-            )
+        audit(
+            db,
+            None,
+            None,
+            action="archive",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary=audit_summary,
         )
     if not orders:
         return 0
