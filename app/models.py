@@ -270,46 +270,10 @@ class DicomRuleUnit(Base):
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
+        # Queues and lists use the partial and trigram indexes created by
+        # app.db.ensure_postgresql_schema.
         UniqueConstraint("unit_id", "acc", name="uq_order_unit_accession"),
-        Index("ix_orders_unit_status_retrieve", "unit_id", "status", "retrieve_at"),
-        Index("ix_orders_unit_status_find", "unit_id", "status", "last_find_at"),
-        Index(
-            "ix_orders_unit_status_monitor_next",
-            "unit_id",
-            "status",
-            "monitor_next_at",
-        ),
-        Index(
-            "ix_orders_unit_prior_status_due",
-            "unit_id",
-            "prior_status",
-            "prior_due_at",
-        ),
-        Index("ix_orders_active_id", "archived_at", "id"),
-        Index(
-            "ix_orders_active_unit_status_id",
-            "archived_at",
-            "unit_id",
-            "status",
-            "id",
-        ),
-        Index(
-            "ix_orders_active_prior_status_unit",
-            "archived_at",
-            "prior_status",
-            "unit_id",
-        ),
-        Index(
-            "ix_orders_completed_retention",
-            "archived_at",
-            "status",
-            "done_at",
-            "id",
-        ),
-        Index("ix_orders_archive_date_id", "archived_at", "id"),
-        Index("ix_orders_acc", "acc"),
         Index("ix_orders_pat_id", "pat_id"),
-        Index("ix_orders_source_id", "source_id"),
         Index("ix_orders_unit_study_uid", "unit_id", "study_uid"),
     )
 
@@ -320,7 +284,7 @@ class Order(Base):
     acc: Mapped[str] = mapped_column(String(64), nullable=False)
     birth_date: Mapped[str] = mapped_column(String(16), nullable=False)
     exam_date: Mapped[str] = mapped_column(String(16), default="")
-    correlation_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    correlation_id: Mapped[str] = mapped_column(String(64), default="")
     api_read_status: Mapped[str] = mapped_column(String(16), default="pending")
     api_read_attempts: Mapped[int] = mapped_column(Integer, default=0)
     api_read_last_error: Mapped[str] = mapped_column(String(500), default="")
@@ -409,7 +373,7 @@ class ManualMoveRequest(Base):
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
     requested_by_user_id: Mapped[int] = mapped_column(Integer, nullable=True)
     requested_by_username: Mapped[str] = mapped_column(String(80), default="")
-    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     last_error: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
@@ -477,12 +441,12 @@ class HistoricalImageLink(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     historical_study_id: Mapped[int] = mapped_column(
         ForeignKey("historical_studies.id"), nullable=False
     )
     transfer_id: Mapped[int] = mapped_column(
-        ForeignKey("image_transfers.id"), nullable=False
+        BigInteger, ForeignKey("image_transfers.id"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
@@ -500,11 +464,13 @@ class ImageTransfer(Base):
         Index("ix_transfer_order_status", "order_id", "status"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # bigint, like every id that grows with each image (instances, links, rule
+    # applications): integer ids run out after ~2.1 billion rows.
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=True)
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
-    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    correlation_id: Mapped[str] = mapped_column(String(64), nullable=False)
     study_uid: Mapped[str] = mapped_column(String(128), default="")
     status: Mapped[str] = mapped_column(String(32), default="received")
     # SHA-256 of the published artifact, recorded before it enters send_dir.
@@ -556,13 +522,13 @@ class DicomInstance(Base):
         UniqueConstraint(
             "unit_id", "sop_uid", "source_sha256", name="uq_dicom_instance_content"
         ),
+        # The unique key also serves lookups by (unit_id, sop_uid); the partial
+        # indexes are created by app.db.ensure_postgresql_schema.
         Index("ix_dicom_instance_unit_state_id", "unit_id", "state", "id"),
-        Index("ix_dicom_instance_unit_sop", "unit_id", "sop_uid"),
-        Index("ix_dicom_instance_unit_path", "unit_id", "source_path"),
         Index("ix_dicom_instance_study", "study_id"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
     study_id: Mapped[int] = mapped_column(
         ForeignKey("dicom_studies.id"), nullable=False
@@ -580,7 +546,7 @@ class DicomInstance(Base):
     state: Mapped[str] = mapped_column(String(16), default="received")
     claimed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     transfer_id: Mapped[int] = mapped_column(
-        ForeignKey("image_transfers.id"), nullable=True
+        BigInteger, ForeignKey("image_transfers.id"), nullable=True
     )
     last_error: Mapped[str] = mapped_column(String(500), default="")
     received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
@@ -595,13 +561,13 @@ class DicomRuleApplication(Base):
         Index("ix_dicom_rule_application_transfer", "transfer_id", "created_at"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     rule_id: Mapped[int] = mapped_column(
         ForeignKey("dicom_rules.id", ondelete="SET NULL"), nullable=True
     )
     unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False)
     transfer_id: Mapped[int] = mapped_column(
-        ForeignKey("image_transfers.id", ondelete="CASCADE"), nullable=False
+        BigInteger, ForeignKey("image_transfers.id", ondelete="CASCADE"), nullable=False
     )
     rule_name: Mapped[str] = mapped_column(String(120), nullable=False)
     action: Mapped[str] = mapped_column(String(16), nullable=False)

@@ -1,21 +1,16 @@
 {% extends "base.html" %}
+{% from "components/page.html" import empty_state, page_header %}
 {% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
 {% block title %}Logs · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack logs-page">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Configurações</p>
-      <h1>Logs</h1>
-      <p class="page-header__description">Acompanhe as alterações realizadas na configuração e nas operações do sistema.</p>
-    </div>
-  </header>
+  {{ page_header("Configurações", "Logs", "Acompanhe as alterações realizadas na configuração e nas operações do sistema.") }}
 
   <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo dos logs">
-    {{ summary_item("scroll-text", summary.total, "evento registrado" if summary.total == 1 else "eventos registrados") }}
-    {{ summary_item("clock", summary.today, "evento hoje" if summary.today == 1 else "eventos hoje") }}
-    {{ summary_item("users", summary.actors, "autor identificado" if summary.actors == 1 else "autores identificados") }}
+    {{ summary_item("scroll-text", summary.total, summary.total | plural("evento registrado", "eventos registrados")) }}
+    {{ summary_item("clock", summary.today, summary.today | plural("evento hoje", "eventos hoje")) }}
+    {{ summary_item("users", summary.actors, summary.actors | plural("autor identificado", "autores identificados")) }}
   </section>
 
   <form class="surface filter-bar logs-filter" method="get" action="/logs" aria-label="Filtros dos logs">
@@ -49,7 +44,7 @@
   <section class="surface logs-table-card" aria-labelledby="logs-table-title">
     <div class="logs-table-card__header">
       <div><h2 id="logs-table-title">Histórico de alterações</h2><p>Eventos mais recentes aparecem primeiro.</p></div>
-      <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+      <span>{{ pager.total }} {{ pager.total | plural("resultado", "resultados") }}</span>
     </div>
     {% if entries %}
     <div class="table-wrap">
@@ -71,7 +66,14 @@
     </div>
     {% include "pager.html" %}
     {% else %}
-    <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("timeline") }}</div><h2>Nenhum log encontrado</h2><p>{% if action or resource or q %}Revise os filtros ou limpe a busca para visualizar todo o histórico.{% else %}As próximas alterações realizadas no sistema aparecerão aqui.{% endif %}</p>{% if action or resource or q %}<a class="btn btn--secondary" href="/logs">Limpar filtros</a>{% endif %}</div></div>
+    {% set filtered = action or resource or q %}
+    {{ empty_state(
+      "timeline",
+      "Nenhum log encontrado",
+      "Revise os filtros ou limpe a busca para visualizar todo o histórico." if filtered else "As próximas alterações realizadas no sistema aparecerão aqui.",
+      action_href="/logs" if filtered else "",
+      action_label="Limpar filtros",
+    ) }}
     {% endif %}
   </section>
 </div>

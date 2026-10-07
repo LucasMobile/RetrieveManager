@@ -16,15 +16,20 @@ from app.models import (
     Unit,
     UnitPriorModality,
 )
-from app.pipeline.find import _find_one, find_pending, prior_date_range
+from app.order_state import prior_date_range, queue_prior_retrieve
+from app.pipeline.find import _find_one, find_pending
 from app.pipeline.move import (
+    Arrival,
+    MoveSlots,
     _run_move,
     _run_prior_move,
     claim_due_moves,
     fail_claimed_move,
+    move_slots,
     run_claimed_move,
 )
 from app.pipeline.orders import recover_stale_locks
+from app.rules import cancel_unwanted_priors
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -62,6 +67,10 @@ def move_failed(error: str = "falha de rede") -> MoveResult:
     return MoveResult(False, error=error)
 
 
+def delivered(_db, _unit, _study_uid, moved, _started) -> Arrival:
+    return Arrival(moved, moved.completed)
+
+
 class PriorRetrieveTest(DatabaseTestCase):
     def setUp(self):
         super().setUp()
@@ -74,6 +83,11 @@ class PriorRetrieveTest(DatabaseTestCase):
             )
             series.start()
             self.addCleanup(series.stop)
+        # The C-MOVEs here are faked, so no image reaches a receiver: take the
+        # PACS counts as delivered (tests/test_dicom_net.py covers the check).
+        arrival = patch("app.pipeline.move._confirm_arrival", side_effect=delivered)
+        arrival.start()
+        self.addCleanup(arrival.stop)
 
     @staticmethod
     def _unit(max_parallel_moves=1):
@@ -120,6 +134,36 @@ class PriorRetrieveTest(DatabaseTestCase):
         self.assertEqual(
             prior_date_range(date(2024, 2, 29)),
             ("20210228", "20240228"),
+        )
+
+    def test_queue_prior_retrieve_resets_counters_and_optionally_the_window(self):
+        now = datetime(2026, 9, 11, 8, 30)
+        order = Order(
+            prior_status="error",
+            prior_date_from="20200101",
+            prior_date_to="20221231",
+            prior_started_at=now,
+            prior_completed_at=now,
+            prior_heartbeat_at=now,
+            prior_attempts=3,
+            prior_last_error="timeout",
+        )
+
+        queue_prior_retrieve(order, now)
+        self.assertEqual(order.prior_status, "queued")
+        self.assertEqual(order.prior_due_at, now)
+        self.assertIsNone(order.prior_started_at)
+        self.assertIsNone(order.prior_completed_at)
+        self.assertIsNone(order.prior_heartbeat_at)
+        self.assertEqual(order.prior_attempts, 0)
+        self.assertEqual(order.prior_last_error, "")
+        self.assertEqual(
+            (order.prior_date_from, order.prior_date_to), ("20200101", "20221231")
+        )
+
+        queue_prior_retrieve(order, now, refresh_window=True)
+        self.assertEqual(
+            (order.prior_date_from, order.prior_date_to), ("20230911", "20260910")
         )
 
     def test_find_saves_body_part_and_queues_prior_move(self):
@@ -551,7 +595,8 @@ class PriorRetrieveTest(DatabaseTestCase):
             )
             self.assertEqual(order.prior_status, "done")
             self.assertIn(
-                "3 série(s) com identificação divergente", order.events[-1].message
+                "3 séries com identificação divergente ignoradas",
+                order.events[-1].message,
             )
 
     def test_prior_wildcard_option_is_forwarded_and_accepts_suffixed_id(self):
@@ -718,6 +763,75 @@ class PriorRetrieveTest(DatabaseTestCase):
             self.assertEqual(order.status, "retrieving")
 
             self.assertEqual(claim_due_moves(db, unit), [])
+
+    def test_move_slots_keep_one_for_new_exams_and_split_the_rest(self):
+        self.assertEqual(move_slots(0), MoveSlots(1, 1, 1, 1))
+        self.assertEqual(move_slots(1), MoveSlots(1, 1, 1, 1))
+        self.assertEqual(move_slots(2), MoveSlots(2, 1, 1, 1))
+        self.assertEqual(move_slots(4), MoveSlots(4, 3, 2, 2))
+        self.assertEqual(move_slots(5), MoveSlots(5, 4, 3, 3))
+
+    def test_burst_of_background_work_leaves_a_slot_for_new_exams(self):
+        now = datetime.now()
+        with self.Session() as db:
+            unit = self._unit(max_parallel_moves=4)
+            db.add(unit)
+            db.flush()
+            # Ten monitored CTs due for an update and five queued priors, the
+            # priors waiting longer: the situation of a burst of CT orders.
+            updates = [
+                self._order(
+                    unit.id,
+                    acc=f"update-{number}",
+                    status="wait_update",
+                    retrieve_at=None,
+                    monitor_next_at=now - timedelta(minutes=1, seconds=number),
+                    prior_status="done",
+                )
+                for number in range(10)
+            ]
+            priors = [
+                self._order(
+                    unit.id,
+                    acc=f"prior-{number}",
+                    status="monitoring",
+                    retrieve_at=None,
+                    prior_due_at=now - timedelta(minutes=10, seconds=number),
+                )
+                for number in range(5)
+            ]
+            db.add_all(updates + priors)
+            db.commit()
+
+            kinds = [kind for _id, kind in claim_due_moves(db, unit)]
+            self.assertEqual(sorted(kinds), ["prior", "prior", "update"])
+            # Background work is capped: one slot stays free.
+            self.assertEqual(claim_due_moves(db, unit), [])
+
+            new_exam = self._order(unit.id, acc="new", prior_status="disabled")
+            db.add(new_exam)
+            db.commit()
+            self.assertEqual(claim_due_moves(db, unit), [(new_exam.id, "first")])
+
+    def test_new_exams_go_before_monitoring_updates_on_a_single_slot(self):
+        now = datetime.now()
+        with self.Session() as db:
+            unit = self._unit(max_parallel_moves=1)
+            db.add(unit)
+            db.flush()
+            update = self._order(
+                unit.id,
+                acc="update",
+                status="wait_update",
+                retrieve_at=None,
+                monitor_next_at=now - timedelta(hours=1),
+                prior_status="done",
+            )
+            new_exam = self._order(unit.id, acc="new", prior_status="disabled")
+            db.add_all([update, new_exam])
+            db.commit()
+
+            self.assertEqual(claim_due_moves(db, unit), [(new_exam.id, "first")])
 
     def test_prior_failure_retries_without_changing_current_status(self):
         with self.Session() as db:
@@ -959,6 +1073,153 @@ class PriorRetrieveTest(DatabaseTestCase):
                 order.prior_last_error,
                 "lock órfão do histórico recuperado",
             )
+
+    def test_prior_queue_does_not_start_while_disabled_on_the_unit(self):
+        with self.Session() as db:
+            unit = self._unit(max_parallel_moves=2)
+            unit.retrieve_prior_enabled = False
+            db.add(unit)
+            db.flush()
+            order = self._order(unit.id, status="monitoring", retrieve_at=None)
+            db.add(order)
+            db.commit()
+
+            self.assertEqual(claim_due_moves(db, unit), [])
+            self.assertEqual(order.prior_status, "queued")
+
+    def test_unit_settings_withdraw_queued_priors_it_no_longer_requests(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            db.add_all(
+                UnitPriorModality(unit_id=unit.id, code=code) for code in ("CT", "MR")
+            )
+            orders = {
+                key: self._order(
+                    unit.id, acc=key, modality=modality, prior_status=state
+                )
+                for key, modality, state in (
+                    ("mr-queued", "MR", "queued"),
+                    ("ct-retry", "CT", "retry_wait"),
+                    ("ct-running", "CT", "retrieving"),
+                    ("ct-done", "CT", "done"),
+                )
+            }
+            db.add_all(orders.values())
+            db.commit()
+
+            # MR leaves the list: only its queued retrieve goes.
+            db.execute(
+                UnitPriorModality.__table__.delete().where(
+                    UnitPriorModality.code == "MR"
+                )
+            )
+            self.assertEqual(cancel_unwanted_priors(db, unit), 1)
+            self.assertEqual(orders["mr-queued"].prior_status, "disabled")
+            self.assertEqual(orders["ct-retry"].prior_status, "retry_wait")
+
+            # Turned off: whatever is still waiting goes; running and done stay.
+            unit.retrieve_prior_enabled = False
+            self.assertEqual(cancel_unwanted_priors(db, unit), 1)
+            db.commit()
+            states = {key: order.prior_status for key, order in orders.items()}
+            self.assertEqual(
+                states,
+                {
+                    "mr-queued": "disabled",
+                    "ct-retry": "disabled",
+                    "ct-running": "retrieving",
+                    "ct-done": "done",
+                },
+            )
+            messages = dict(
+                db.execute(
+                    select(Order.acc, OrderEvent.message).join(
+                        OrderEvent, OrderEvent.order_id == Order.id
+                    )
+                ).all()
+            )
+            self.assertEqual(
+                messages["mr-queued"],
+                "Retrieve histórico da fila cancelado: MR não está nas modalidades "
+                "de exames anteriores da unidade (CT)",
+            )
+            self.assertEqual(
+                messages["ct-retry"],
+                "Retrieve histórico da fila cancelado: retrieve de exames anteriores "
+                "desativado na unidade",
+            )
+
+    def test_running_prior_stops_before_the_next_series_when_disabled(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(unit.id, prior_status="retrieving")
+            db.add(order)
+            db.commit()
+            unit_id = unit.id
+            output = find_result(
+                *(
+                    {
+                        "PatientID": "30211738",
+                        "PatientBirthDate": "19691027",
+                        "StudyDate": "20250110",
+                        "Modality": "MR",
+                        "StudyInstanceUID": "1.2.old",
+                        "SeriesInstanceUID": f"1.2.old.series.{number}",
+                    }
+                    for number in (1, 2)
+                )
+            )
+
+            def move_then_disable(*_args, **_kwargs):
+                with self.Session() as other:
+                    other.get(Unit, unit_id).retrieve_prior_enabled = False
+                    other.commit()
+                return MOVE_OK
+
+            with (
+                patch("app.pipeline.move.find_prior_series", return_value=output),
+                patch(
+                    "app.pipeline.move.move_series", side_effect=move_then_disable
+                ) as move,
+            ):
+                _run_prior_move(db, unit, order)
+
+            move.assert_called_once()
+            self.assertEqual(order.prior_status, "disabled")
+            event = db.scalar(
+                select(OrderEvent.message)
+                .where(OrderEvent.order_id == order.id)
+                .order_by(OrderEvent.id.desc())
+            )
+            self.assertEqual(
+                event,
+                "Retrieve histórico interrompido: desativado na unidade "
+                "(1 série concluída de 2)",
+            )
+
+    def test_orphan_prior_is_not_queued_again_once_disabled(self):
+        with self.Session() as db:
+            unit = self._unit()
+            unit.retrieve_prior_enabled = False
+            db.add(unit)
+            db.flush()
+            order = self._order(
+                unit.id,
+                status="monitoring",
+                prior_status="retrieving",
+                prior_heartbeat_at=datetime.now() - timedelta(hours=2),
+            )
+            db.add(order)
+            db.commit()
+
+            recover_stale_locks(db)
+
+            self.assertEqual(order.prior_status, "disabled")
+            self.assertIsNone(order.prior_due_at)
 
 
 if __name__ == "__main__":

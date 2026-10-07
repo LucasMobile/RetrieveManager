@@ -1,16 +1,12 @@
 {% extends "base.html" %}
+{% from "components/forms.html" import csrf_input %}
+{% from "components/page.html" import empty_state, page_header %}
 {% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
 {% block title %}Instâncias com pendência · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack logs-page">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Operação</p>
-      <h1>Instâncias com pendência</h1>
-      <p class="page-header__description">Objetos recebidos que não seguiram o fluxo normal: conteúdo em conflito, arquivo ausente ou erro de processamento.</p>
-    </div>
-  </header>
+  {{ page_header("Operação", "Instâncias com pendência", "Objetos recebidos que não seguiram o fluxo normal: conteúdo em conflito, arquivo ausente ou erro de processamento.") }}
 
   {% set issue_icons = {"conflict": ("alert", "danger"), "missing": ("file", "warning"), "error": ("x-circle", "danger")} %}
   <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das pendências">
@@ -47,7 +43,19 @@
   <section class="surface logs-table-card" aria-labelledby="instances-table-title">
     <div class="logs-table-card__header">
       <div><h2 id="instances-table-title">Pendências</h2><p>As mais recentes aparecem primeiro.</p></div>
-      <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
+      <div class="logs-table-card__actions">
+        <span>{{ pager.total }} {{ pager.total | plural("resultado", "resultados") }}</span>
+        {% if pager.total %}
+        {% set scope_unit = (units | selectattr(0, "equalto", unit_id) | map(attribute=1) | first) if unit_id else "todas as unidades" %}
+        {% set scope_state = issues[state][0] | lower if state else "todas as pendências" %}
+        <form method="post" action="/instances/clear" data-confirm="Excluir {{ pager.total }} {{ pager.total | plural('pendência', 'pendências') }} ({{ scope_state }}, {{ scope_unit }}) e os arquivos delas? Os registros saem da fila e o PACS pode reenviar os mesmos objetos. Não é possível desfazer." data-confirm-label="Limpar pendências">
+          {{ csrf_input(request) }}
+          {% if unit_id %}<input type="hidden" name="unit_id" value="{{ unit_id }}">{% endif %}
+          {% if state %}<input type="hidden" name="state" value="{{ state }}">{% endif %}
+          <button class="btn btn--danger btn--sm" type="submit">{{ icon("trash") }} Limpar pendências</button>
+        </form>
+        {% endif %}
+      </div>
     </div>
     {% if rows %}
     <div class="table-wrap">
@@ -71,7 +79,14 @@
     </div>
     {% include "pager.html" %}
     {% else %}
-    <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("check") }}</div><h2>Nenhuma pendência</h2><p>{% if unit_id or state %}Nada encontrado com esses filtros.{% else %}Todos os objetos recebidos seguiram o fluxo normal.{% endif %}</p>{% if unit_id or state %}<a class="btn btn--secondary" href="/instances">Limpar filtros</a>{% endif %}</div></div>
+    {% set filtered = unit_id or state %}
+    {{ empty_state(
+      "check",
+      "Nenhuma pendência",
+      "Nada encontrado com esses filtros." if filtered else "Todos os objetos recebidos seguiram o fluxo normal.",
+      action_href="/instances" if filtered else "",
+      action_label="Limpar filtros",
+    ) }}
     {% endif %}
   </section>
 </div>

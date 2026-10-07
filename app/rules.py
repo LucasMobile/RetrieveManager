@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.models import ModalityRule, Unit, UnitPriorModality
+from app.events import add_event
+from app.models import ModalityRule, Order, Unit, UnitPriorModality
 from app.parse import normalize_modality
 
 
@@ -84,7 +85,10 @@ def prior_skip_reason(db: Session, unit: Unit, modality: str) -> str | None:
     """
     if not unit.retrieve_prior_enabled:
         return ""
-    codes = prior_modalities_for(db, unit.id)
+    return _modality_skip_reason(modality, prior_modalities_for(db, unit.id))
+
+
+def _modality_skip_reason(modality: str, codes: tuple[str, ...]) -> str | None:
     if ALL_MODALITIES in codes or normalize_modality(modality) in codes:
         return None
     return (
@@ -92,3 +96,41 @@ def prior_skip_reason(db: Session, unit: Unit, modality: str) -> str | None:
         "não está nas modalidades de exames anteriores da unidade "
         f"({', '.join(codes)})"
     )
+
+
+def cancel_unwanted_priors(db: Session, unit: Unit) -> int:
+    """Withdraw the queued historical retrieves the unit no longer requests.
+
+    Turning the prior retrieve off, or removing a modality from its list,
+    used to decide only new orders: the ones already queued still ran, and a
+    burst of orders kept the C-MOVE slots busy with them. A retrieve already
+    running stops before its next series (see ``_run_prior_move``). Call it
+    with the unit's prior modalities flushed; returns how many were withdrawn.
+    """
+    orders = list(
+        db.scalars(
+            select(Order).where(
+                Order.unit_id == unit.id,
+                Order.archived_at.is_(None),
+                Order.prior_status.in_(("queued", "retry_wait")),
+            )
+        )
+    )
+    if not orders:
+        return 0
+    codes = prior_modalities_for(db, unit.id) if unit.retrieve_prior_enabled else ()
+    cancelled = 0
+    for order in orders:
+        if unit.retrieve_prior_enabled:
+            reason = _modality_skip_reason(order.modality, codes)
+            if reason is None:
+                continue
+            reason = reason.removeprefix("Histórico não solicitado: ")
+        else:
+            reason = "retrieve de exames anteriores desativado na unidade"
+        order.prior_status = "disabled"
+        order.prior_due_at = None
+        order.prior_last_error = ""
+        add_event(db, order, f"Retrieve histórico da fila cancelado: {reason}")
+        cancelled += 1
+    return cancelled

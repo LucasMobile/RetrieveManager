@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from time import perf_counter
 
 from sqlalchemy import or_, select
@@ -31,6 +31,7 @@ from app.observability import (
     log_event,
     safe_error_detail,
 )
+from app.order_state import queue_prior_retrieve
 from app.parse import (
     PriorSeriesResult,
     StudyFindResponse,
@@ -43,22 +44,12 @@ from app.parse import (
 )
 from app.pipeline.common import (
     bounded_db_text,
-    database_error_detail,
     ensure_order_correlation,
     log,
 )
 from app.pipeline.monitor import reset_monitoring
 from app.rules import prior_skip_reason, schedule_from_now
-
-
-def prior_date_range(today: date | None = None) -> tuple[str, str]:
-    current = today or date.today()
-    try:
-        start = current.replace(year=current.year - 3)
-    except ValueError:
-        start = current.replace(year=current.year - 3, day=28)
-    end = current - timedelta(days=1)
-    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+from app.wording import counted
 
 
 def find_pending(db: Session, unit: Unit, max_orders: int | None = None) -> int:
@@ -124,7 +115,6 @@ def find_pending(db: Session, unit: Unit, max_orders: int | None = None) -> int:
                 resource=f"order:{order_id}",
                 status="failure",
                 error=exc,
-                error_detail=database_error_detail(exc),
                 order_id=order_id,
                 unit_id=unit.id,
             )
@@ -155,7 +145,6 @@ def find_pending(db: Session, unit: Unit, max_orders: int | None = None) -> int:
                 resource=f"order:{order_id}",
                 status="retry",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 order_id=order_id,
                 unit_id=unit.id,
             )
@@ -333,16 +322,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
         order.last_error = ""
         prior_skip = prior_skip_reason(db, unit, modality)
         if prior_skip is None:
-            prior_from, prior_to = prior_date_range(now.date())
-            order.prior_status = "queued"
-            order.prior_date_from = prior_from
-            order.prior_date_to = prior_to
-            order.prior_due_at = now
-            order.prior_started_at = None
-            order.prior_completed_at = None
-            order.prior_heartbeat_at = None
-            order.prior_attempts = 0
-            order.prior_last_error = ""
+            queue_prior_retrieve(order, now, refresh_window=True)
         else:
             order.prior_status = "disabled"
         add_event(
@@ -383,8 +363,8 @@ def _find_diagnostic(
     for response in responses:
         if response.study_uid:
             count = (
-                f", {response.instance_count} imagem(ns)"
-                if (response.instance_count)
+                ", " + counted(response.instance_count, "imagem", "imagens")
+                if response.instance_count
                 else ""
             )
             lines.append(

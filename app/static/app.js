@@ -7,6 +7,78 @@
   const menuButton = document.querySelector("[data-sidebar-open]");
   const themeToggle = document.querySelector("[data-theme-toggle]");
 
+  const parseCsv = (value) =>
+    (value || "").split(",").map((item) => item.trim()).filter(Boolean);
+  const sortedValues = (values) =>
+    Array.from(values).sort((left, right) => left.localeCompare(right));
+  const DICOM_MODALITY = /^[A-Z0-9]{1,8}$/;
+
+  // Busca e lê a resposta sob um único prazo: `read` também é abortado, então
+  // uma resposta travada não deixa quem chamou esperando para sempre.
+  const fetchWithTimeout = async (url, options, timeoutMs, read) => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await read(await fetch(url, { ...options, signal: controller.signal }));
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  };
+
+  const modalityChip = (text, { onRemove = null, removeLabel = "", disabled = false } = {}) => {
+    const chip = document.createElement("span");
+    chip.className = "modality-selection-chip";
+    chip.textContent = text;
+    if (onRemove) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.disabled = disabled;
+      remove.setAttribute("aria-label", removeLabel);
+      remove.textContent = "×";
+      remove.addEventListener("click", onRemove);
+      chip.append(remove);
+    }
+    return chip;
+  };
+
+  // Campo de texto que transforma modalidades DICOM digitadas em chips.
+  // `values` é o conjunto exibido; `render` redesenha após cada mudança.
+  const bindModalityInput = (
+    input,
+    { values, render, onAdd = (modality) => values.add(modality), canPop = () => values.size > 0 },
+  ) => {
+    const add = () => {
+      if (!input || input.disabled) return true;
+      const modality = input.value.trim().toUpperCase();
+      if (!modality) return true;
+      if (!DICOM_MODALITY.test(modality)) {
+        input.setCustomValidity("Use um código DICOM com até 8 letras ou números.");
+        input.reportValidity();
+        return false;
+      }
+      input.setCustomValidity("");
+      onAdd(modality);
+      input.value = "";
+      render();
+      return true;
+    };
+    input?.addEventListener("input", () => input.setCustomValidity(""));
+    input?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === ",") {
+        event.preventDefault();
+        add();
+      } else if (event.key === "Backspace" && !input.value && canPop()) {
+        values.delete(sortedValues(values).at(-1));
+        render();
+      }
+    });
+    input?.addEventListener("blur", add);
+    // O texto ainda não confirmado vira chip antes do envio; inválido bloqueia.
+    input?.form?.addEventListener("submit", (event) => {
+      if (!add()) event.preventDefault();
+    });
+  };
+
   const syncThemeToggle = () => {
     const isDark = root.dataset.theme === "dark";
     const label = themeToggle?.querySelector("[data-theme-label]");
@@ -238,64 +310,53 @@
     true,
   );
 
+  // Botão que abre um painel: fecha com clique fora ou Esc (devolvendo o foco).
+  const disclosures = [];
+  const bindDisclosure = (root, toggle, panel, { focusFirst = false } = {}) => {
+    if (!root || !toggle || !panel) return null;
+    const isOpen = () => toggle.getAttribute("aria-expanded") === "true";
+    const set = (open, restoreFocus = false) => {
+      toggle.setAttribute("aria-expanded", String(open));
+      panel.hidden = !open;
+      if (open && focusFirst) panel.querySelector("button:not([disabled])")?.focus();
+      if (restoreFocus) toggle.focus();
+    };
+    toggle.addEventListener("click", () => set(!isOpen()));
+    const disclosure = { root, isOpen, set };
+    disclosures.push(disclosure);
+    return disclosure;
+  };
+
   const accountMenu = document.querySelector("[data-account-menu]");
-  const accountMenuToggle = accountMenu?.querySelector("[data-account-menu-toggle]");
-  const accountMenuPanel = accountMenu?.querySelector("[data-account-menu-panel]");
-  const setAccountMenu = (open, restoreFocus = false) => {
-    if (!accountMenuToggle || !accountMenuPanel) return;
-    accountMenuToggle.setAttribute("aria-expanded", String(open));
-    accountMenuPanel.hidden = !open;
-    if (restoreFocus) accountMenuToggle.focus();
-  };
+  bindDisclosure(
+    accountMenu,
+    accountMenu?.querySelector("[data-account-menu-toggle]"),
+    accountMenu?.querySelector("[data-account-menu-panel]"),
+  );
 
-  accountMenuToggle?.addEventListener("click", () => {
-    setAccountMenu(accountMenuToggle.getAttribute("aria-expanded") !== "true");
-  });
-
-  document.addEventListener("click", (event) => {
-    if (accountMenu && !accountMenu.contains(event.target)) setAccountMenu(false);
-  });
-
-  const actionMenus = [...document.querySelectorAll("[data-menu]")];
-  const setActionMenu = (menu, open, restoreFocus = false) => {
-    const toggle = menu.querySelector("[data-menu-toggle]");
-    const panel = menu.querySelector("[data-menu-panel]");
-    if (!toggle || !panel) return;
-    toggle.setAttribute("aria-expanded", String(open));
-    panel.hidden = !open;
-    if (open) panel.querySelector("button:not([disabled])")?.focus();
-    if (restoreFocus) toggle.focus();
-  };
-
-  actionMenus.forEach((menu) => {
-    const toggle = menu.querySelector("[data-menu-toggle]");
-    toggle?.addEventListener("click", () => {
-      setActionMenu(menu, toggle.getAttribute("aria-expanded") !== "true");
-    });
+  document.querySelectorAll("[data-menu]").forEach((menu) => {
+    const actionMenu = bindDisclosure(
+      menu,
+      menu.querySelector("[data-menu-toggle]"),
+      menu.querySelector("[data-menu-panel]"),
+      { focusFirst: true },
+    );
     // Fecha antes do diálogo de confirmação abrir sobre o menu.
-    menu.addEventListener("submit", () => setActionMenu(menu, false));
+    menu.addEventListener("submit", () => actionMenu?.set(false));
   });
 
   document.addEventListener("click", (event) => {
-    actionMenus.forEach((menu) => {
-      if (!menu.contains(event.target)) setActionMenu(menu, false);
+    disclosures.forEach(({ root, set }) => {
+      if (!root.contains(event.target)) set(false);
     });
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && body.classList.contains("sidebar-is-open")) {
-      setSidebar(false);
-    }
-    if (event.key === "Escape" && accountMenuToggle?.getAttribute("aria-expanded") === "true") {
-      setAccountMenu(false, true);
-    }
-    if (event.key === "Escape") {
-      actionMenus.forEach((menu) => {
-        if (menu.querySelector("[data-menu-toggle]")?.getAttribute("aria-expanded") === "true") {
-          setActionMenu(menu, false, true);
-        }
-      });
-    }
+    if (event.key !== "Escape") return;
+    if (body.classList.contains("sidebar-is-open")) setSidebar(false);
+    disclosures.forEach(({ isOpen, set }) => {
+      if (isOpen()) set(false, true);
+    });
   });
 
   document.querySelectorAll("[data-toast-close]").forEach((button) => {
@@ -433,20 +494,22 @@
     // agora faria o "Confirmar" enviar um formulário que saiu da página.
     if (document.querySelector("dialog[open]")) return;
 
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 8000);
     element.dataset.loading = "true";
     element.setAttribute("aria-busy", "true");
 
     try {
-      const response = await fetch(element.dataset.poll, {
-        headers: { "X-Partial": "1" },
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      // Sessão expirada redireciona para o login; não injetar essa página na região.
-      if (response.redirected) throw new Error("redirected");
-      applyPartial(element, await response.text());
+      const html = await fetchWithTimeout(
+        element.dataset.poll,
+        { headers: { "X-Partial": "1" } },
+        8000,
+        (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          // Sessão expirada redireciona para o login; não injetar essa página na região.
+          if (response.redirected) throw new Error("redirected");
+          return response.text();
+        },
+      );
+      applyPartial(element, html);
       initCustomSelects(element);
       element.removeAttribute("data-poll-error");
       element.dataset.updatedAt = String(Date.now());
@@ -454,7 +517,6 @@
     } catch (_error) {
       element.setAttribute("data-poll-error", "true");
     } finally {
-      window.clearTimeout(timeout);
       element.dataset.loading = "false";
       element.setAttribute("aria-busy", "false");
     }
@@ -550,28 +612,28 @@
 
     const payload = new FormData();
     connectionFields.forEach((field) => payload.append(field.name, field.value));
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 12000);
     echoButton.disabled = true;
     echoButton.classList.add("is-loading");
     setEchoStatus("Testando conexão…");
 
     try {
-      const response = await fetch(echoPanel.dataset.url, {
-        method: "POST",
-        body: payload,
-        headers: {
-          Accept: "application/json",
-          "X-CSRF-Token": unitForm.elements.namedItem("csrf_token").value,
+      const result = await fetchWithTimeout(
+        echoPanel.dataset.url,
+        {
+          method: "POST",
+          body: payload,
+          headers: {
+            Accept: "application/json",
+            "X-CSRF-Token": unitForm.elements.namedItem("csrf_token").value,
+          },
         },
-        signal: controller.signal,
-      });
-      const result = await response.json();
+        12000,
+        (response) => response.json(),
+      );
       setEchoStatus(result.ok ? "C-ECHO OK" : "FALHA C-ECHO", result.ok ? "success" : "error");
     } catch (error) {
       setEchoStatus("FALHA C-ECHO", "error");
     } finally {
-      window.clearTimeout(timeout);
       echoButton.disabled = false;
       echoButton.classList.remove("is-loading");
     }
@@ -583,47 +645,25 @@
       compressionPanel.querySelectorAll("[data-profile-input]"),
     );
     const profileSets = new Map(
-      profileInputs.map((input) => [
-        input.dataset.profileInput,
-        new Set(input.value.split(",").map((value) => value.trim()).filter(Boolean)),
-      ]),
+      profileInputs.map((input) => [input.dataset.profileInput, new Set(parseCsv(input.value))]),
     );
     const dropValue = compressionPanel.querySelector("[data-drop-value]");
     const dropInput = compressionPanel.querySelector("[data-drop-input]");
     const dropChips = compressionPanel.querySelector("[data-drop-chips]");
-    const drops = new Set(
-      (dropValue?.value || "").split(",").map((value) => value.trim()).filter(Boolean),
-    );
-
-    const sorted = (values) => Array.from(values).sort((left, right) => left.localeCompare(right));
-    const makeChip = (value, removable = false) => {
-      const chip = document.createElement("span");
-      chip.className = "modality-selection-chip";
-      chip.textContent = value;
-      if (removable) {
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.setAttribute("aria-label", `Remover ${value} do descarte`);
-        remove.textContent = "×";
-        remove.addEventListener("click", () => {
-          drops.delete(value);
-          renderCompressionSettings();
-        });
-        chip.append(remove);
-      }
-      return chip;
-    };
+    const drops = new Set(parseCsv(dropValue?.value));
 
     const renderCompressionSettings = () => {
       profileInputs.forEach((input) => {
         const profile = input.dataset.profileInput;
         const values = profileSets.get(profile) || new Set();
-        input.value = sorted(values).join(",");
+        input.value = sortedValues(values).join(",");
         const container = compressionPanel.querySelector(`[data-profile-chips="${profile}"]`);
         const count = compressionPanel.querySelector(`[data-profile-count="${profile}"]`);
         const dialogCount = compressionPanel.querySelector(`[data-dialog-count="${profile}"]`);
         if (count) count.textContent = String(values.size);
         if (dialogCount) dialogCount.textContent = String(values.size);
+        const dialogWord = compressionPanel.querySelector(`[data-dialog-count-word="${profile}"]`);
+        if (dialogWord) dialogWord.textContent = values.size === 1 ? "selecionada" : "selecionadas";
         if (container) {
           container.replaceChildren();
           if (values.size === 0) {
@@ -632,7 +672,7 @@
             empty.textContent = "Nenhuma modalidade específica";
             container.append(empty);
           } else {
-            sorted(values).forEach((value) => container.append(makeChip(value)));
+            sortedValues(values).forEach((value) => container.append(modalityChip(value)));
           }
         }
       });
@@ -651,13 +691,24 @@
         toggle.indeterminate = selected > 0 && selected < options.length;
       });
 
-      if (dropValue) dropValue.value = sorted(drops).join(",");
+      if (dropValue) dropValue.value = sortedValues(drops).join(",");
       if (dropChips) {
         dropChips.replaceChildren();
-        sorted(drops).forEach((value) => dropChips.append(makeChip(value, true)));
+        sortedValues(drops).forEach((value) =>
+          dropChips.append(
+            modalityChip(value, {
+              removeLabel: `Remover ${value} do descarte`,
+              onRemove: () => {
+                drops.delete(value);
+                renderCompressionSettings();
+              },
+            }),
+          ),
+        );
       }
     };
 
+    // Cada modalidade fica em um único perfil ou no descarte.
     const assignProfile = (profile, modality, selected) => {
       const target = profileSets.get(profile);
       if (!target) return;
@@ -670,64 +721,32 @@
       } else {
         target.delete(modality);
       }
-      renderCompressionSettings();
     };
 
     compressionPanel.querySelectorAll("[data-profile-option]").forEach((option) => {
       option.addEventListener("change", () => {
         assignProfile(option.dataset.profileOption, option.value, option.checked);
+        renderCompressionSettings();
       });
     });
     compressionPanel.querySelectorAll("[data-profile-select-all]").forEach((toggle) => {
       toggle.addEventListener("change", () => {
         const profile = toggle.dataset.profileSelectAll;
-        const selected = toggle.checked;
-        const target = profileSets.get(profile);
-        if (!target) return;
         compressionPanel
           .querySelectorAll(`[data-profile-option="${profile}"]`)
-          .forEach((option) => {
-            if (selected) {
-              profileSets.forEach((values, name) => {
-                if (name !== profile) values.delete(option.value);
-              });
-              drops.delete(option.value);
-              target.add(option.value);
-            } else {
-              target.delete(option.value);
-            }
-          });
+          .forEach((option) => assignProfile(profile, option.value, toggle.checked));
         renderCompressionSettings();
       });
     });
 
-    const addDrop = () => {
-      if (!dropInput) return true;
-      const modality = dropInput.value.trim().toUpperCase();
-      if (!modality) return true;
-      if (!/^[A-Z0-9]{1,8}$/.test(modality)) {
-        dropInput.setCustomValidity("Use um código DICOM com até 8 letras ou números.");
-        dropInput.reportValidity();
-        return false;
-      }
-      dropInput.setCustomValidity("");
-      drops.add(modality);
-      profileSets.forEach((values) => values.delete(modality));
-      dropInput.value = "";
-      renderCompressionSettings();
-      return true;
-    };
-    dropInput?.addEventListener("input", () => dropInput.setCustomValidity(""));
-    dropInput?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === ",") {
-        event.preventDefault();
-        addDrop();
-      } else if (event.key === "Backspace" && !dropInput.value && drops.size) {
-        drops.delete(sorted(drops).at(-1));
-        renderCompressionSettings();
-      }
+    bindModalityInput(dropInput, {
+      values: drops,
+      render: renderCompressionSettings,
+      onAdd: (modality) => {
+        drops.add(modality);
+        profileSets.forEach((values) => values.delete(modality));
+      },
     });
-    dropInput?.addEventListener("blur", addDrop);
 
     compressionPanel.querySelectorAll("[data-compression-open]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -745,10 +764,6 @@
         if (event.target === dialog) dialog.close();
       });
     });
-    unitForm?.addEventListener("submit", (event) => {
-      if (!addDrop()) event.preventDefault();
-      renderCompressionSettings();
-    });
     renderCompressionSettings();
   }
 
@@ -759,74 +774,45 @@
     const priorInput = priorField.querySelector("[data-prior-input]");
     const priorChips = priorField.querySelector("[data-prior-chips]");
     const priorToggle = unitForm.querySelector("#retrieve-prior-enabled");
-    const priors = new Set(
-      (priorValue?.value || "").split(",").map((value) => value.trim()).filter(Boolean),
-    );
-    const sortedPriors = () =>
-      Array.from(priors).sort((left, right) => left.localeCompare(right));
+    const priors = new Set(parseCsv(priorValue?.value));
     const priorEnabled = () => !priorToggle || priorToggle.checked;
 
     // ALL is exclusive: it stands alone and comes back when the list empties.
     const renderPriors = () => {
       if (!priors.size) priors.add(ALL);
-      if (priorValue) priorValue.value = sortedPriors().join(",");
+      if (priorValue) priorValue.value = sortedValues(priors).join(",");
       const enabled = priorEnabled();
       priorField.classList.toggle("is-disabled", !enabled);
       if (priorInput) priorInput.disabled = !enabled;
       if (!priorChips) return;
       priorChips.replaceChildren();
-      sortedPriors().forEach((value) => {
-        const chip = document.createElement("span");
-        chip.className = "modality-selection-chip";
-        chip.textContent = value === ALL ? "ALL · todas" : value;
-        if (value !== ALL) {
-          const remove = document.createElement("button");
-          remove.type = "button";
-          remove.disabled = !enabled;
-          remove.setAttribute("aria-label", `Remover ${value} dos exames anteriores`);
-          remove.textContent = "×";
-          remove.addEventListener("click", () => {
-            priors.delete(value);
-            renderPriors();
-          });
-          chip.append(remove);
-        }
-        priorChips.append(chip);
+      sortedValues(priors).forEach((value) => {
+        priorChips.append(
+          value === ALL
+            ? modalityChip("ALL · todas")
+            : modalityChip(value, {
+                removeLabel: `Remover ${value} dos exames anteriores`,
+                disabled: !enabled,
+                onRemove: () => {
+                  priors.delete(value);
+                  renderPriors();
+                },
+              }),
+        );
       });
     };
 
-    const addPrior = () => {
-      if (!priorInput || priorInput.disabled) return true;
-      const modality = priorInput.value.trim().toUpperCase();
-      if (!modality) return true;
-      if (!/^[A-Z0-9]{1,8}$/.test(modality)) {
-        priorInput.setCustomValidity("Use um código DICOM com até 8 letras ou números.");
-        priorInput.reportValidity();
-        return false;
-      }
-      priorInput.setCustomValidity("");
-      if (modality === ALL) priors.clear();
-      else priors.delete(ALL);
-      priors.add(modality);
-      priorInput.value = "";
-      renderPriors();
-      return true;
-    };
-    priorInput?.addEventListener("input", () => priorInput.setCustomValidity(""));
-    priorInput?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === ",") {
-        event.preventDefault();
-        addPrior();
-      } else if (event.key === "Backspace" && !priorInput.value && !priors.has(ALL)) {
-        priors.delete(sortedPriors().at(-1));
-        renderPriors();
-      }
+    bindModalityInput(priorInput, {
+      values: priors,
+      render: renderPriors,
+      onAdd: (modality) => {
+        if (modality === ALL) priors.clear();
+        else priors.delete(ALL);
+        priors.add(modality);
+      },
+      canPop: () => !priors.has(ALL),
     });
-    priorInput?.addEventListener("blur", addPrior);
     priorToggle?.addEventListener("change", renderPriors);
-    unitForm.addEventListener("submit", (event) => {
-      if (!addPrior()) event.preventDefault();
-    });
     renderPriors();
   }
 

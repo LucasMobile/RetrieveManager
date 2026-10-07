@@ -15,10 +15,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pydicom
-from sqlalchemy import select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
-from app.models import DicomInstance, DicomStudy
+from app.models import DicomInstance, DicomStudy, Unit
 
 ACTIVE_STATES = frozenset({"received", "compacting"})
 DONE_STATES = frozenset({"compacted", "discarded", "rejected"})
@@ -101,6 +101,13 @@ def record_instance(db: Session, obj: ReceivedObject) -> Decision:
     )
     same = next((row for row in rows if row.source_sha256 == obj.sha256), None)
     if same is not None:
+        # A copy sent again still counts as a delivery: the worker checks
+        # last_received_at to confirm that a C-MOVE reached this receiver.
+        db.execute(
+            update(DicomStudy)
+            .where(DicomStudy.id == same.study_id)
+            .values(last_received_at=datetime.now())
+        )
         return _same_content(same, obj)
 
     now = datetime.now()
@@ -172,3 +179,71 @@ def _same_content(row: DicomInstance, obj: ReceivedObject) -> Decision:
     # The tracked file vanished; this identical copy takes its place.
     row.source_path = obj.conflict_path if row.state == "conflict" else obj.path
     return Decision("duplicate", row.id, row.state, row.source_path, keep=True)
+
+
+@dataclass(frozen=True)
+class ClearResult:
+    instances: int
+    files_removed: int
+    files_kept: int
+
+
+def clear_issue_instances(
+    db: Session, states: list[str], unit_id: int | None = None
+) -> ClearResult:
+    """Forget instances in ``states`` and delete their files, inside the caller's
+    transaction, so the PACS can send the same objects again as new ones.
+
+    The DELETE re-checks the state and locks the rows: an instance the receiver
+    revives at the same moment is either committed first (and kept here) or
+    waits for this transaction, fails and is acknowledged 0xA700, so the PACS
+    sends it again (the receiver acknowledges early only SOPs it never
+    recorded, never a revival). Files go before the commit, while the rows are
+    locked.
+    Only files inside the unit's receive or error folder are touched.
+    """
+    query = delete(DicomInstance).where(DicomInstance.state.in_(states))
+    if unit_id:
+        query = query.where(DicomInstance.unit_id == unit_id)
+    rows = db.execute(
+        query.returning(
+            DicomInstance.unit_id,
+            DicomInstance.study_id,
+            DicomInstance.state,
+            DicomInstance.source_path,
+        ).execution_options(synchronize_session=False)
+    ).all()
+    if not rows:
+        return ClearResult(0, 0, 0)
+
+    counted: dict[int, int] = {}
+    for row in rows:
+        if row.state != "conflict":  # conflicts never counted in the study
+            counted[row.study_id] = counted.get(row.study_id, 0) + 1
+    for study_id, amount in counted.items():
+        db.execute(
+            update(DicomStudy)
+            .where(DicomStudy.id == study_id)
+            .values(instance_count=func.greatest(DicomStudy.instance_count - amount, 0))
+        )
+
+    folders = {
+        unit.id: (Path(unit.receive_dir).resolve(), Path(unit.error_dir).resolve())
+        for unit in db.scalars(
+            select(Unit).where(Unit.id.in_({row.unit_id for row in rows}))
+        )
+    }
+    removed = kept = 0
+    for row in rows:
+        path = Path(row.source_path).resolve(strict=False)
+        if not any(path.is_relative_to(folder) for folder in folders[row.unit_id]):
+            kept += 1
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError:
+            kept += 1
+    return ClearResult(len(rows), removed, kept)

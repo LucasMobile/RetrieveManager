@@ -22,6 +22,33 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
         raise RuntimeError(f"{name} deve ser um número inteiro") from exc
 
 
+def available_cpus(cgroup_root: Path = Path("/sys/fs/cgroup")) -> int:
+    """CPUs this process may use: affinity, then a container CPU quota."""
+    count = os.process_cpu_count() or os.cpu_count() or 1
+    try:
+        quota, period = (cgroup_root / "cpu.max").read_text().split()[:2]
+        if quota != "max":
+            # "200000 100000" = 2 CPUs; a fraction still gets one.
+            count = min(count, max(1, -(-int(quota) // int(period))))
+    except OSError, ValueError:
+        pass
+    return count
+
+
+def compact_workers_for(cpus: int) -> int:
+    """Codec processes by default: two CPUs stay free for the receiver,
+    PostgreSQL and the rest of the worker, at least one process."""
+    return max(1, cpus - 2)
+
+
+def _env_compact_workers() -> int:
+    """COMPACT_GLOBAL_WORKERS when set; empty, 0 or "auto" use the CPUs."""
+    raw = os.getenv("COMPACT_GLOBAL_WORKERS", "").strip().lower()
+    if raw in {"", "0", "auto"}:
+        return compact_workers_for(available_cpus())
+    return _env_int("COMPACT_GLOBAL_WORKERS", 1)
+
+
 def _read_secret(name: str, default: str) -> str:
     """Read a secret directly or from NAME_FILE (Docker/Kubernetes secret mount)."""
     file_path = os.getenv(f"{name}_FILE", "").strip()
@@ -137,13 +164,22 @@ FIND_BATCH_SIZE = _env_int("FIND_BATCH_SIZE", 10)
 FIND_UNIT_SCHEDULERS = _env_int("FIND_UNIT_SCHEDULERS", 8)
 FIND_ORDERS_PER_UNIT = _env_int("FIND_ORDERS_PER_UNIT", 4)
 FIND_TIMEOUT_SECONDS = _env_int("FIND_TIMEOUT_SECONDS", 20)
+# A C-MOVE whose PACS sends no image (no pending response, no new sub-op) for
+# this long is aborted, so a stalled transfer frees its slot instead of holding
+# it for the whole unit timeout. 0 disables the check.
+MOVE_IDLE_TIMEOUT_SECONDS = _env_int("MOVE_IDLE_TIMEOUT_SECONDS", 120, minimum=0)
+# After a C-MOVE the PACS calls successful, how long to wait for the receiver
+# to record at least one image of it before treating the images as lost.
+MOVE_RECEIVE_CONFIRM_SECONDS = _env_int("MOVE_RECEIVE_CONFIRM_SECONDS", 15, minimum=0)
 # Monitoring checks (C-FIND of studies already retrieved) have their own
 # threads, so a long monitoring queue never delays the search for new exams.
 MONITOR_UNIT_SCHEDULERS = _env_int("MONITOR_UNIT_SCHEDULERS", 4)
 MONITOR_CHECKS_PER_UNIT = _env_int("MONITOR_CHECKS_PER_UNIT", 2)
 MONITOR_BATCH_SIZE = _env_int("MONITOR_BATCH_SIZE", 25)
 COMPACT_BATCH_SIZE = _env_int("COMPACT_BATCH_SIZE", 250)
-COMPACT_GLOBAL_WORKERS = _env_int("COMPACT_GLOBAL_WORKERS", 8)
+# Codec processes of the whole server, shared fairly by the units compacting
+# at the same time (pipeline.compact.FairSlots).
+COMPACT_GLOBAL_WORKERS = _env_compact_workers()
 COMPACT_DB_BATCH_SIZE = _env_int("COMPACT_DB_BATCH_SIZE", 25)
 COMPACT_TEMP_MAX_AGE_SECONDS = _env_int("COMPACT_TEMP_MAX_AGE_SECONDS", 3600)
 COMPACT_FILE_TIMEOUT_SECONDS = _env_int("COMPACT_FILE_TIMEOUT_SECONDS", 300)
@@ -194,10 +230,19 @@ RECEIVER_MIN_FREE_MB = _env_int("RECEIVER_MIN_FREE_MB", 1024, minimum=0)
 # fsync each received file before acknowledging it. Off by default: the rename
 # is atomic and a process crash keeps the page cache; only a power loss inside
 # the flush window can lose a file already acknowledged (the instance is then
-# marked missing and can be retrieved again).
+# marked missing and can be retrieved again; one acknowledged early whose row
+# was not committed yet in that instant leaves no trace).
 RECEIVER_FSYNC = _env_bool("RECEIVER_FSYNC", False)
 # How long a C-STORE waits for its database commit before answering 0xA700.
 RECEIVER_COMMIT_TIMEOUT_SECONDS = _env_int("RECEIVER_COMMIT_TIMEOUT_SECONDS", 30)
+# Acknowledge a SOP the unit never recorded as soon as its file is on disk and
+# commit its row right after, as storescp did: the PACS no longer waits for the
+# database on every image. Resends, revivals and conflicts, a failing writer or
+# a long queue still wait for the commit. A file whose row cannot be recorded
+# stays in the receive folder and is adopted by the worker.
+RECEIVER_EARLY_ACK = _env_bool("RECEIVER_EARLY_ACK", True)
+# Objects waiting for their commit above which new ones wait too (backpressure).
+RECEIVER_EARLY_ACK_MAX_PENDING = _env_int("RECEIVER_EARLY_ACK_MAX_PENDING", 100)
 # Files in the receive folder without a database row (legacy storescp files,
 # "reprocessar erros") are adopted after this age, at most once per interval.
 RECEIVE_ADOPT_MIN_AGE_SECONDS = _env_int("RECEIVE_ADOPT_MIN_AGE_SECONDS", 60)

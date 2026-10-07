@@ -105,6 +105,10 @@ def configure_logging() -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(LOG_LEVEL)
+    # pynetdicom logs every PDU and every C-MOVE pending response at INFO: two
+    # lines per image filled the 30 MB of Docker logs in minutes. Warnings and
+    # errors still pass; the pipeline logs its own outcome of each operation.
+    logging.getLogger("pynetdicom").setLevel(logging.WARNING)
 
 
 def _safe_stack(tb) -> list[dict[str, Any]]:
@@ -166,6 +170,8 @@ def log_event(
     }
     if error is not None:
         extra["error_stack"] = _safe_stack(error.__traceback__)
+        # Pass error_detail explicitly to override it, or None to omit it.
+        fields.setdefault("error_detail", safe_error_detail(error))
     for key, value in fields.items():
         safe_key = f"event_{key}" if key in _RESERVED_EXTRA_FIELDS else key
         extra[safe_key] = value

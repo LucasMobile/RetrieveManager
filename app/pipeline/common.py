@@ -5,15 +5,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from sqlalchemy.exc import SQLAlchemyError
-
 from app.models import (
     Order,
     Unit,
 )
 from app.observability import (
     new_correlation_id,
-    safe_error_detail,
 )
 
 log = logging.getLogger("worker")
@@ -28,11 +25,6 @@ def ensure_order_correlation(order: Order) -> str:
 def bounded_db_text(value: object, limit: int) -> str:
     """Normalize external PACS/file text before writing bounded DB columns."""
     return str(value or "").replace("\x00", " ").strip()[:limit]
-
-
-def database_error_detail(exc: SQLAlchemyError) -> str:
-    """Backward-compatible alias used by existing operational logging."""
-    return safe_error_detail(exc)
 
 
 def append_diagnostic(parts: list[str], label: str, output: str) -> None:

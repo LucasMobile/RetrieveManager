@@ -1,3 +1,4 @@
+{% from "components/page.html" import empty_state %}
 {% from "icons.html" import icon %}
 {% from "components/forms.html" import post_action %}
   <section class="surface orders-table-card" aria-labelledby="orders-table-title" data-poll-slot="table">
@@ -5,17 +6,18 @@
       <div><h2 id="orders-table-title">{{ 'Pedidos arquivados' if history else 'Pedidos encontrados' }}</h2><p>Ordenados dos mais recentes para os mais antigos.</p></div>
       <div class="orders-table-card__meta">
         {% if poll_seconds %}<span class="live-indicator"><i aria-hidden="true"></i>Atualização automática a cada {{ poll_seconds }} segundos</span>{% endif %}
-        <span>{{ pager.total }} resultado{% if pager.total != 1 %}s{% endif %}</span>
-        <a class="orders-refresh" href="{{ orders_path }}{% if qs %}?{{ qs }}{% endif %}" title="Atualizar pedidos" aria-label="Atualizar tabela de pedidos">{{ icon("retry") }} Atualizar</a>
+        <span>{{ pager.total }} {{ pager.total | plural("resultado", "resultados") }}</span>
+        <a class="btn btn--secondary btn--sm" href="{{ orders_path }}{% if qs %}?{{ qs }}{% endif %}" title="Atualizar pedidos" aria-label="Atualizar tabela de pedidos">{{ icon("retry") }} Atualizar</a>
       </div>
     </div>
     {% if not orders %}
-    <div class="empty-state">
-      <div class="empty-state__content">
-        <div class="empty-state__icon">{{ icon("orders") }}</div>
-        {% if unit_id or status or q %}<h2>Nenhum pedido encontrado</h2><p>Revise os filtros ou limpe a busca.</p><a class="btn btn--secondary" href="{{ orders_path }}">Limpar filtros</a>{% elif history %}<h2>O histórico está vazio</h2><p>Pedidos arquivados aparecerão aqui para consulta futura.</p>{% else %}<h2>A fila está vazia</h2><p>Os pedidos aparecerão aqui assim que forem detectados nas unidades ativas.</p>{% endif %}
-      </div>
-    </div>
+    {% if unit_id or status or q %}
+    {{ empty_state("orders", "Nenhum pedido encontrado", "Revise os filtros ou limpe a busca.", action_href=orders_path, action_label="Limpar filtros") }}
+    {% elif history %}
+    {{ empty_state("orders", "O histórico está vazio", "Pedidos arquivados aparecerão aqui para consulta futura.") }}
+    {% else %}
+    {{ empty_state("orders", "A fila está vazia", "Os pedidos aparecerão aqui assim que forem detectados nas unidades ativas.") }}
+    {% endif %}
     {% else %}
     <div class="table-wrap">
       <table class="data-table orders-table">
@@ -34,7 +36,7 @@
               {% elif o.prior_status == 'error' %}<strong class="text-danger">Erro no histórico</strong><small>Disponível para reprocessamento</small>
               {% elif o.retrieve_at and o.status == 'wait_retrieve' %}<strong>1º retrieve às {{ o.retrieve_at.strftime('%H:%M') }}</strong><small>Execução automática</small>
               {% elif o.status in ('wait_update', 'retrieving_update') %}<strong>Buscando novas imagens</strong><small>{% if o.monitor_until %}Monitorando até {{ o.monitor_until.strftime('%d/%m %H:%M') }}{% else %}C-MOVE de atualização{% endif %}</small>
-              {% elif o.status == 'monitoring' and o.monitor_next_at %}<strong>Próxima verificação às {{ o.monitor_next_at.strftime('%H:%M') }}</strong><small>Monitorando até {{ o.monitor_until.strftime('%d/%m %H:%M') }} · {{ o.monitor_checks }} verificaç{{ 'ão' if o.monitor_checks == 1 else 'ões' }}</small>
+              {% elif o.status == 'monitoring' and o.monitor_next_at %}<strong>Próxima verificação às {{ o.monitor_next_at.strftime('%H:%M') }}</strong><small>Monitorando até {{ o.monitor_until.strftime('%d/%m %H:%M') }} · {{ o.monitor_checks }} {{ o.monitor_checks | plural("verificação", "verificações") }}</small>
               {% elif o.last_error %}<strong class="text-danger">Reprocessamento necessário</strong><small>{{ o.last_error[:70] }}</small>
               {% elif o.status == 'done' %}<strong>Fluxo finalizado</strong><small>Sem ações pendentes</small>
               {% elif o.status == 'cancelled' %}<strong>Pedido cancelado</strong><small>Sem processamento ativo</small>

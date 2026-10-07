@@ -10,7 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.dicom_net import MoveResult
 from app.models import ImageTransfer, ManualMoveRequest, Order, Unit
 from app.orders_api import AckResult
-from app.pipeline.move import _run_manual_move
+from app.pipeline.move import Arrival, _run_manual_move
 from app.pipeline.orders import acknowledge_pending_orders, recover_stale_locks
 from app.pipeline.send import SendResult, send_unit
 from tests.support import DatabaseTestCase, make_unit
@@ -73,7 +73,13 @@ class NetworkTransactionTest(DatabaseTestCase):
                 self.assertFalse(db.in_transaction())
                 return MoveResult(True, 0x0000, completed=1)
 
-            with patch("app.pipeline.move.move_study", side_effect=remote):
+            with (
+                patch("app.pipeline.move.move_study", side_effect=remote),
+                patch(
+                    "app.pipeline.move._confirm_arrival",
+                    side_effect=lambda _db, _unit, _uid, moved, _at: Arrival(moved, 1),
+                ),
+            ):
                 _run_manual_move(db, request_id)
             self.assertEqual(db.get(ManualMoveRequest, request_id).status, "done")
 

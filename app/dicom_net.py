@@ -19,6 +19,9 @@ from pynetdicom.sop_class import (
     Verification,
 )
 
+from app.config import MOVE_IDLE_TIMEOUT_SECONDS
+from app.wording import counted
+
 # Same as the receiver: DICOM limits AE titles to 16 characters.
 _PENDING = frozenset({0xFF00, 0xFF01})
 STATUS_MOVE_DESTINATION_UNKNOWN = 0xA801
@@ -53,7 +56,7 @@ class FindResult:
     @property
     def summary(self) -> str:
         """Diagnostic line without patient data."""
-        parts = [f"{len(self.responses)} resposta(s)"]
+        parts = [counted(len(self.responses), "resposta", "respostas")]
         if self.status is not None:
             parts.append(f"status final 0x{self.status:04X}")
         if self.error:
@@ -74,7 +77,7 @@ class MoveResult:
     @property
     def summary(self) -> str:
         parts = [
-            f"{self.completed} imagem(ns) enviada(s)",
+            counted(self.completed, "imagem enviada", "imagens enviadas"),
             f"falhas={self.failed}",
             f"avisos={self.warning}",
         ]
@@ -175,22 +178,44 @@ def find(node: PacsNode, identifier: Dataset, *, timeout: float) -> FindResult:
 
 
 def move(
-    node: PacsNode, identifier: Dataset, *, destination_aet: str, timeout: float
+    node: PacsNode,
+    identifier: Dataset,
+    *,
+    destination_aet: str,
+    timeout: float,
+    idle_timeout: float | None = None,
 ) -> MoveResult:
-    """Study Root C-MOVE; success requires Success and zero failed sub-ops."""
+    """Study Root C-MOVE; success requires Success and zero failed sub-ops.
+
+    ``timeout`` bounds the whole operation. ``idle_timeout`` bounds the time
+    without progress once the PACS has sent its first pending response: a
+    PACS that reports each sub-operation and then goes silent, or keeps
+    answering without sending images, has stalled. The first response may
+    take longer, since some PACS only answer after preparing the study.
+    """
+    if idle_timeout is None:
+        idle_timeout = MOVE_IDLE_TIMEOUT_SECONDS
     deadline = monotonic() + timeout
     assoc, error = _associate(node, StudyRootQueryRetrieveInformationModelMove, timeout)
     if error:
         return MoveResult(False, error=error)
     counts = {"completed": 0, "failed": 0, "warning": 0, "remaining": 0}
     final: int | None = None
+    progress: tuple[int, ...] | None = None
+    last_response = last_progress = monotonic()
+    idle_armed = False
     try:
         for status, _identifier in assoc.send_c_move(
             identifier, destination_aet, StudyRootQueryRetrieveInformationModelMove
         ):
+            now = monotonic()
             if not status:
-                error = "tempo esgotado ou associação interrompida"
+                if idle_armed and now - last_response >= idle_timeout - 1:
+                    error = f"PACS sem enviar imagens por {int(idle_timeout)} s"
+                else:
+                    error = "tempo esgotado ou associação interrompida"
                 break
+            last_response = now
             for key, keyword in (
                 ("completed", "NumberOfCompletedSuboperations"),
                 ("failed", "NumberOfFailedSuboperations"),
@@ -202,11 +227,26 @@ def move(
                     counts[key] = int(value)
             code = int(status.Status)
             if code in _PENDING:
-                if monotonic() > deadline:
+                if now > deadline:
                     # Aborting stops the PACS from sending further sub-ops.
                     error = "tempo esgotado"
                     assoc.abort()
                     break
+                done = tuple(counts.values())
+                if done != progress:
+                    progress, last_progress = done, now
+                elif idle_timeout and now - last_progress > idle_timeout:
+                    error = f"PACS sem enviar imagens por {int(idle_timeout)} s"
+                    assoc.abort()
+                    break
+                # pynetdicom reads the association's DIMSE timeout before each
+                # wait: a silent PACS is now cut at the idle limit, and never
+                # past the overall deadline.
+                wait = max(1.0, deadline - now)
+                if idle_timeout:
+                    idle_armed = True
+                    wait = min(wait, idle_timeout)
+                assoc.dimse_timeout = wait
                 continue
             final = code
             # Pending counts are stale once the final response arrives.

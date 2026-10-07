@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from time import monotonic, perf_counter
+from time import monotonic, perf_counter, sleep
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import MOVE_RECEIVE_CONFIRM_SECONDS
 from app.dicom_net import (
     MoveResult,
     PacsNode,
@@ -19,6 +20,7 @@ from app.dicom_net import (
 )
 from app.events import add_event
 from app.models import (
+    DicomStudy,
     HistoricalSeries,
     HistoricalStudy,
     ManualMoveRequest,
@@ -44,11 +46,84 @@ from app.pipeline.common import (
 from app.pipeline.find import prior_identity_matches
 from app.pipeline.monitor import continue_monitoring, start_monitoring
 from app.rules import monitor_plan_for
+from app.wording import counted
 
 PRIOR_RETRY_DELAYS = (60, 300)
 
 
 CURRENT_MOVE_RETRY_DELAYS = (60, 300)
+
+
+@dataclass(frozen=True)
+class Arrival:
+    """What the receiver recorded of a study after a C-MOVE."""
+
+    moved: MoveResult  # failed when the PACS reported images that never arrived
+    instance_count: int  # distinct images of the study held by the receiver
+
+
+def _study_receipt(
+    db: Session, unit_id: int, study_uid: str
+) -> tuple[datetime | None, int]:
+    row = db.execute(
+        select(DicomStudy.last_received_at, DicomStudy.instance_count).where(
+            DicomStudy.unit_id == unit_id, DicomStudy.study_uid == study_uid
+        )
+    ).one_or_none()
+    return (row[0], int(row[1])) if row else (None, 0)
+
+
+def _confirm_arrival(
+    db: Session, unit: Unit, study_uid: str, moved: MoveResult, started: datetime
+) -> Arrival:
+    """Check that a C-MOVE the PACS called successful reached this receiver.
+
+    The PACS counts the images it delivered to the destination AE. When that
+    AE resolves to another Store SCP (another service on the port, a wrong IP
+    or port in the PACS), the C-MOVE succeeds and nothing arrives here, so the
+    order would be marked retrieved with no images. The receiver commits each
+    image right after acknowledging it: wait until it has recorded images of
+    the study since ``started`` and its count stops growing.
+
+    Called right after the C-MOVE, with nothing pending in the session: each
+    read is committed so no connection stays idle in a transaction meanwhile.
+    """
+    last, count = _study_receipt(db, unit.id, study_uid)
+    if not moved.ok or not (moved.completed or moved.warning):
+        return Arrival(moved, count)
+    deadline = monotonic() + MOVE_RECEIVE_CONFIRM_SECONDS
+    previous: int | None = None
+    while True:
+        arrived = last is not None and last >= started
+        if arrived and count == previous:
+            return Arrival(moved, count)
+        if monotonic() >= deadline:
+            break
+        previous = count if arrived else None
+        db.commit()
+        sleep(0.5)
+        last, count = _study_receipt(db, unit.id, study_uid)
+    if arrived:
+        return Arrival(moved, count)
+    error = (
+        "o PACS informou "
+        + counted(moved.completed + moved.warning, "imagem enviada", "imagens enviadas")
+        + f", mas nenhuma chegou ao receptor; confira no PACS se o AE "
+        f"{unit.calling_aet} aponta para este servidor na porta {unit.store_port}"
+    )
+    log_event(
+        log,
+        logging.ERROR,
+        "dicom.move.arrival",
+        resource=f"unit:{unit.id}",
+        status="failure",
+        error_type="ImagesNotReceived",
+        unit_id=unit.id,
+        completed_count=moved.completed,
+        store_port=unit.store_port,
+        calling_aet=unit.calling_aet,
+    )
+    return Arrival(replace(moved, ok=False, error=error), count)
 
 
 def _move_log_fields(moved: MoveResult) -> dict[str, object]:
@@ -61,46 +136,85 @@ def _move_log_fields(moved: MoveResult) -> dict[str, object]:
     }
 
 
-def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
-    now = datetime.now()
-    current_inflight = (
-        db.scalar(
-            select(func.count()).where(
-                Order.unit_id == unit.id,
+@dataclass(frozen=True)
+class MoveSlots:
+    """How the unit's parallel C-MOVEs are shared between kinds of work.
+
+    ``total`` is the unit's limit (what its PACS accepts at once). The 1st
+    retrieve and manual moves may use any free slot. The background work,
+    monitoring updates and prior studies, never takes the last slot, so a new
+    exam starts within one claim cycle; and neither of the two takes more than
+    half, so dozens of monitored CTs cannot hold every slot while the prior
+    queue waits, nor the other way round. A unit with one slot shares it in
+    priority order.
+    """
+
+    total: int
+    background: int
+    update: int
+    prior: int
+
+
+def move_slots(max_parallel_moves: int) -> MoveSlots:
+    total = max(1, max_parallel_moves)
+    if total == 1:
+        return MoveSlots(1, 1, 1, 1)
+    half = (total + 1) // 2
+    return MoveSlots(total, total - 1, half, half)
+
+
+def _moves_in_flight(db: Session, unit_id: int) -> dict[str, int]:
+    """Running C-MOVEs of the unit by kind: current, update, prior, manual."""
+    by_status = dict(
+        db.execute(
+            select(Order.status, func.count())
+            .where(
+                Order.unit_id == unit_id,
                 Order.archived_at.is_(None),
                 Order.status.in_(ACTIVE_ORDER_STATUSES),
             )
+            .group_by(Order.status)
+        ).all()
+    )
+    update = by_status.pop("retrieving_update", 0)
+    prior = db.scalar(
+        select(func.count()).where(
+            Order.unit_id == unit_id,
+            Order.archived_at.is_(None),
+            Order.prior_status == "retrieving",
         )
-        or 0
     )
-    prior_inflight = (
-        db.scalar(
-            select(func.count()).where(
-                Order.unit_id == unit.id,
-                Order.archived_at.is_(None),
-                Order.prior_status == "retrieving",
-            )
+    manual = db.scalar(
+        select(func.count()).where(
+            ManualMoveRequest.unit_id == unit_id,
+            ManualMoveRequest.status == "running",
         )
-        or 0
     )
-    manual_inflight = (
-        db.scalar(
-            select(func.count()).where(
-                ManualMoveRequest.unit_id == unit.id,
-                ManualMoveRequest.status == "running",
-            )
-        )
-        or 0
-    )
-    slots = (
-        max(1, unit.max_parallel_moves)
-        - current_inflight
-        - prior_inflight
-        - manual_inflight
-    )
+    return {
+        "current": sum(by_status.values()),
+        "update": update,
+        "prior": prior or 0,
+        "manual": manual or 0,
+    }
+
+
+def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
+    now = datetime.now()
+    limits = move_slots(unit.max_parallel_moves)
+    running = _moves_in_flight(db, unit.id)
+    slots = limits.total - sum(running.values())
     claimed: list[tuple[int, str]] = []
     if slots <= 0:
         return claimed
+    background_free = limits.background - running["update"] - running["prior"]
+    update_free = min(slots, background_free, limits.update - running["update"])
+    # With the prior retrieve turned off nothing historical starts; saving
+    # the unit withdraws the queue (rules.cancel_unwanted_priors).
+    prior_free = (
+        min(slots, background_free, limits.prior - running["prior"])
+        if unit.retrieve_prior_enabled
+        else 0
+    )
 
     active_manual_order_ids = select(ManualMoveRequest.order_id).where(
         ManualMoveRequest.status.in_(("queued", "running"))
@@ -137,48 +251,66 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             .with_for_update(skip_locked=True)
         )
     )
-    update = list(
-        db.scalars(
-            select(Order)
-            .where(
-                Order.unit_id == unit.id,
-                Order.archived_at.is_(None),
-                Order.status == "wait_update",
-                Order.id.notin_(active_manual_order_ids),
-                Order.monitor_next_at.is_not(None),
-                Order.monitor_next_at <= now,
+    update = (
+        list(
+            db.scalars(
+                select(Order)
+                .where(
+                    Order.unit_id == unit.id,
+                    Order.archived_at.is_(None),
+                    Order.status == "wait_update",
+                    Order.id.notin_(active_manual_order_ids),
+                    Order.monitor_next_at.is_not(None),
+                    Order.monitor_next_at <= now,
+                )
+                .order_by(Order.monitor_next_at)
+                .limit(update_free)
+                .with_for_update(skip_locked=True)
             )
-            .order_by(Order.monitor_next_at)
-            .limit(slots)
-            .with_for_update(skip_locked=True)
         )
+        if update_free > 0
+        else []
     )
-    prior = list(
-        db.scalars(
-            select(Order)
-            .where(
-                Order.unit_id == unit.id,
-                Order.archived_at.is_(None),
-                Order.prior_status.in_(("queued", "retry_wait")),
-                Order.prior_due_at.is_not(None),
-                Order.prior_due_at <= now,
+    prior = (
+        list(
+            db.scalars(
+                select(Order)
+                .where(
+                    Order.unit_id == unit.id,
+                    Order.archived_at.is_(None),
+                    Order.prior_status.in_(("queued", "retry_wait")),
+                    Order.prior_due_at.is_not(None),
+                    Order.prior_due_at <= now,
+                )
+                .order_by(Order.prior_due_at, Order.id)
+                .limit(prior_free)
+                .with_for_update(skip_locked=True)
             )
-            .order_by(Order.prior_due_at, Order.id)
-            .limit(slots)
-            .with_for_update(skip_locked=True)
         )
+        if prior_free > 0
+        else []
     )
-    candidates = (
-        [(request.created_at, -1, request.id, "manual", request) for request in manual]
-        + [(order.retrieve_at, 1, order.id, "first", order) for order in first]
-        + [(order.monitor_next_at, 2, order.id, "update", order) for order in update]
-        + [(order.prior_due_at, 0, order.id, "prior", order) for order in prior]
+    # Manual requests, then the 1st retrieves by due time; then the background
+    # work by due time, whichever kind waited longer, within its own share.
+    foreground = [
+        (request.created_at, request.id, "manual", request) for request in manual
+    ]
+    foreground += [(order.retrieve_at, order.id, "first", order) for order in first]
+    background = sorted(
+        [(order.monitor_next_at, order.id, "update", order) for order in update]
+        + [(order.prior_due_at, order.id, "prior", order) for order in prior],
+        key=lambda item: (item[0], item[1]),
     )
-    kind_priority = {"manual": 0, "first": 1, "update": 1, "prior": 2}
-    candidates.sort(
-        key=lambda item: (kind_priority[item[3]], item[0], item[1], item[2])
-    )
-    for _due_at, _priority, _resource_id, kind, resource in candidates[:slots]:
+    background_room = {"update": update_free, "prior": prior_free}
+    for _due_at, _resource_id, kind, resource in foreground + background:
+        if slots <= 0:
+            break
+        if kind in background_room:
+            if background_room[kind] <= 0 or background_free <= 0:
+                continue
+            background_room[kind] -= 1
+            background_free -= 1
+        slots -= 1
         if kind == "manual":
             resource.status = "running"
             resource.started_at = now
@@ -205,6 +337,7 @@ def claim_due_moves(db: Session, unit: Unit) -> list[tuple[int, str]]:
             unit_id=unit.id,
             claimed_count=len(claimed),
             move_kinds=[kind for _resource_id, kind in claimed],
+            running=running,
         )
     return claimed
 
@@ -382,11 +515,13 @@ def _run_manual_move(db: Session, request_id: int) -> None:
             manual_move_request_id=move_request.id,
         )
         db.commit()
+        move_started = datetime.now()
         moved = move_study(
             PacsNode.from_unit(unit),
             order.study_uid,
             timeout=unit.move_timeout_first,
         )
+        moved = _confirm_arrival(db, unit, order.study_uid, moved, move_started).moved
         move_request.completed_at = datetime.now()
         if moved.ok:
             move_request.status = "done"
@@ -549,6 +684,7 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
         discovered_studies = 0
         discovered_series = 0
         foreign_series = 0
+        stopped = False
         if found.ok:
             parsed_series = prior_series_results(found.responses)
             if found.responses and not parsed_series:
@@ -565,8 +701,9 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
                 foreign_series = len(parsed_series) - len(trusted_series)
                 if foreign_series:
                     outputs.append(
-                        f"{foreign_series} série(s) ignorada(s): identificação do "
-                        "paciente ou nascimento diferente do pedido."
+                        counted(foreign_series, "série ignorada", "séries ignoradas")
+                        + ": identificação do paciente ou nascimento diferente "
+                        "do pedido."
                     )
                     log_event(
                         log,
@@ -596,6 +733,10 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
                 db.commit()
                 operation = "C-MOVE histórico"
                 for series_job in series_jobs:
+                    if not _prior_enabled(db, unit.id):
+                        # Turned off on the unit meanwhile: stop between series.
+                        stopped = True
+                        break
                     remaining = int(deadline - monotonic())
                     if remaining <= 0:
                         failure = failure or "tempo total do histórico esgotado"
@@ -605,12 +746,16 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
                     series_job.attempts += 1
                     series_job.last_error = ""
                     db.commit()
+                    move_started = datetime.now()
                     moved = move_series(
                         node,
                         series_job.study_uid,
                         series_job.series_uid,
                         timeout=remaining,
                     )
+                    moved = _confirm_arrival(
+                        db, unit, series_job.study_uid, moved, move_started
+                    ).moved
                     append_diagnostic(
                         outputs,
                         "C-MOVE histórico "
@@ -631,23 +776,40 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
         safe_output = "\n\n".join(outputs)
         finished_at = datetime.now()
         order.prior_heartbeat_at = finished_at
-        if not failure:
+        if stopped:
+            order.prior_status = "disabled"
+            order.prior_due_at = None
+            order.prior_last_error = ""
+            done_series = sum(1 for job in series_jobs if job.status == "done")
+            add_event(
+                db,
+                order,
+                "Retrieve histórico interrompido: desativado na unidade ("
+                + counted(done_series, "série concluída", "séries concluídas")
+                + f" de {len(series_jobs)})",
+                safe_output,
+            )
+            event_level = logging.INFO
+            event_status = "cancelled"
+        elif not failure:
             order.prior_status = "done"
             order.prior_completed_at = finished_at
             order.prior_last_error = ""
             if discovered_series:
                 message = (
                     "Retrieve histórico concluído: "
-                    f"{discovered_studies} exame(s), {discovered_series} série(s)"
+                    f"{counted(discovered_studies, 'exame', 'exames')}, "
+                    f"{counted(discovered_series, 'série', 'séries')}"
                 )
             else:
                 message = (
                     "Retrieve histórico concluído: nenhum exame anterior localizado"
                 )
             if foreign_series:
-                message += (
-                    f"; {foreign_series} série(s) com identificação divergente "
-                    "ignorada(s)"
+                message += "; " + counted(
+                    foreign_series,
+                    "série com identificação divergente ignorada",
+                    "séries com identificação divergente ignoradas",
                 )
             add_event(db, order, message, safe_output)
             event_level = logging.INFO
@@ -694,6 +856,13 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
         )
 
 
+def _prior_enabled(db: Session, unit_id: int) -> bool:
+    """Current setting, read again: the unit may be edited during a retrieve."""
+    return bool(
+        db.scalar(select(Unit.retrieve_prior_enabled).where(Unit.id == unit_id))
+    )
+
+
 def _run_move(db: Session, unit: Unit, order: Order) -> None:
     correlation_id = ensure_order_correlation(order)
     started_at = perf_counter()
@@ -713,23 +882,31 @@ def _run_move(db: Session, unit: Unit, order: Order) -> None:
             retrieve_number=1,
             attempt=order.attempts,
         )
+        move_started = datetime.now()
         moved = move_study(
             PacsNode.from_unit(unit), order.study_uid, timeout=unit.move_timeout_first
         )
+        arrival = _confirm_arrival(db, unit, order.study_uid, moved, move_started)
+        moved = arrival.moved
         if moved.ok:
             now = datetime.now()
             order.last_error = ""
             order.heartbeat_at = now
             # As tentativas medem somente o 1º C-MOVE.
             order.attempts = 0
+            detail = f"{moved.summary}\nReceptor: " + counted(
+                arrival.instance_count,
+                "imagem do estudo registrada",
+                "imagens do estudo registradas",
+            )
             plan = monitor_plan_for(db, order.modality)
             if plan is None:
                 order.status = "done"
                 order.done_at = now
-                add_event(db, order, "1º C-MOVE concluído", moved.summary)
+                add_event(db, order, "1º C-MOVE concluído", detail)
             else:
                 window = start_monitoring(order, plan, now)
-                add_event(db, order, f"1º C-MOVE concluído. {window}", moved.summary)
+                add_event(db, order, f"1º C-MOVE concluído. {window}", detail)
             event_level = logging.INFO
             event_status = "success"
         else:
@@ -767,6 +944,7 @@ def _run_update_move(db: Session, unit: Unit, order: Order) -> None:
     started_at = perf_counter()
     order.status = "retrieving_update"
     order.heartbeat_at = datetime.now()
+    _last, held_before = _study_receipt(db, unit.id, order.study_uid)
     db.commit()
     series = tuple(
         uid for uid in (order.monitor_pending_series or "").splitlines() if uid
@@ -785,19 +963,28 @@ def _run_update_move(db: Session, unit: Unit, order: Order) -> None:
         )
         node = PacsNode.from_unit(unit)
         timeout = unit.move_timeout_update
+        move_started = datetime.now()
         if series:
             moved = _move_series_list(node, order.study_uid, series, timeout)
         else:
             moved = move_study(node, order.study_uid, timeout=timeout)
-        order.monitor_new_images = (order.monitor_new_images or 0) + moved.completed
-        target = f"{len(series)} série(s)" if series else "estudo completo"
+        arrival = _confirm_arrival(db, unit, order.study_uid, moved, move_started)
+        moved = arrival.moved
+        # The PACS sends each series whole, images already held included: count
+        # what the receiver gained, not what the PACS sent.
+        received = max(0, arrival.instance_count - held_before)
+        order.monitor_new_images = (order.monitor_new_images or 0) + received
+        target = (
+            counted(len(series), "série", "séries") if series else "estudo completo"
+        )
         next_step = continue_monitoring(order, datetime.now())
         if moved.ok:
             add_event(
                 db,
                 order,
                 f"C-MOVE de novas imagens concluído ({target}): "
-                f"{moved.completed} imagem(ns) recebida(s). {next_step}",
+                + counted(received, "imagem nova recebida", "imagens novas recebidas")
+                + f". {next_step}",
                 moved.summary,
             )
             event_level = logging.INFO

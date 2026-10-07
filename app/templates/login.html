@@ -10,14 +10,23 @@
   <link rel="alternate icon" type="image/x-icon" href="/static/favicon.ico?v=1">
   <title>Entrar · Retrieve Manager</title>
   <script src="/static/theme.js?v=1"></script>
-  <link rel="stylesheet" href="/static/app.css?v=54">
-  <script src="/static/app.js?v=21" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=57">
+  <script src="/static/app.js?v=23" defer></script>
 </head>
 <body class="login-page">
 <a class="skip-link" href="#login-form">Pular para o formulário</a>
 <main class="login-shell">
   <div class="login-visual" aria-hidden="true">
-    <img src="/static/login-background.webp?v=1" alt="" width="2500" height="3125">
+    {# Versões pré-reduzidas: o navegador escolhe a mais próxima do tamanho exibido e evita reduzir muito (serrilhado).
+       Com object-fit: cover a largura necessária é a maior entre a coluna (~41vw) e 80vh (proporção 4:5). #}
+    <img src="/static/login-background.webp?v=2"
+         srcset="/static/login-background-640.webp?v=1 640w,
+                 /static/login-background-960.webp?v=1 960w,
+                 /static/login-background-1280.webp?v=1 1280w,
+                 /static/login-background-1600.webp?v=1 1600w,
+                 /static/login-background.webp?v=2 2500w"
+         sizes="(max-width: 48rem) 100vw, max(41vw, 80vh)"
+         alt="" width="2500" height="3125">
   </div>
 
   <section class="login-main" aria-labelledby="login-title">

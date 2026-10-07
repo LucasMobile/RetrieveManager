@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from app.models import Order, Unit
@@ -23,14 +24,15 @@ class DashboardTest(DatabaseTestCase):
         super().tearDown()
 
     def _unit(self, name: str, *, enabled: bool) -> Unit:
-        path = self.temp_dir.name
+        # Each unit owns its folders and port: shared ones block the store.
+        path = str(Path(self.temp_dir.name) / name)
         return make_unit(
             name=name,
             enabled=enabled,
             orders_api_url="https://integracao.example/v1/pedidos",
             orders_api_token="integration-token",
             pacs_port=2104,
-            store_port=444,
+            store_port=11000 + sum(map(ord, name)),
             receive_dir=path,
             send_dir=path,
             error_dir=path,

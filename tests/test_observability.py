@@ -4,7 +4,12 @@ import unittest
 from datetime import timedelta, timezone
 from unittest.mock import patch
 
-from app.observability import JsonFormatter, log_context, log_event
+from app.observability import (
+    JsonFormatter,
+    configure_logging,
+    log_context,
+    log_event,
+)
 
 
 class ObservabilityTest(unittest.TestCase):
@@ -65,6 +70,39 @@ class ObservabilityTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertTrue(records[0].event_created)
 
+    def test_error_detail_is_derived_from_the_error_unless_given(self):
+        records = []
+
+        class RecordingHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger("test.error_detail")
+        logger.handlers = [RecordingHandler()]
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        error = RuntimeError("line one\nline two")
+
+        log_event(logger, logging.ERROR, "a", status="failure", error=error)
+        log_event(
+            logger,
+            logging.ERROR,
+            "b",
+            status="failure",
+            error=error,
+            error_detail="HTTP 401",
+        )
+        log_event(
+            logger, logging.ERROR, "c", status="failure", error=error, error_detail=None
+        )
+        log_event(logger, logging.INFO, "d", status="success")
+
+        derived, explicit, omitted, success = records
+        self.assertEqual(derived.error_detail, "line one line two")
+        self.assertEqual(explicit.error_detail, "HTTP 401")
+        self.assertIsNone(omitted.error_detail)
+        self.assertFalse(hasattr(success, "error_detail"))
+
     def test_exception_stack_has_locations_without_patient_or_secret_text(self):
         try:
             raise RuntimeError("patient=PRIVATE; token=SECRET")
@@ -86,6 +124,23 @@ class ObservabilityTest(unittest.TestCase):
         self.assertEqual(payload["error_stack"][-1]["file"], "test_observability.py")
         self.assertNotIn("PRIVATE", rendered)
         self.assertNotIn("SECRET", rendered)
+
+    def test_pynetdicom_logs_only_warnings_in_every_service(self):
+        # Two INFO lines per image of a C-MOVE filled the Docker log in minutes.
+        root = logging.getLogger()
+        handlers, level = root.handlers[:], root.level
+        pynetdicom = logging.getLogger("pynetdicom")
+        previous = pynetdicom.level
+        self.addCleanup(pynetdicom.setLevel, previous)
+        self.addCleanup(root.setLevel, level)
+        self.addCleanup(setattr, root, "handlers", handlers)
+        pynetdicom.setLevel(logging.NOTSET)
+
+        configure_logging()
+
+        association = logging.getLogger("pynetdicom.association")
+        self.assertFalse(association.isEnabledFor(logging.INFO))
+        self.assertTrue(association.isEnabledFor(logging.WARNING))
 
 
 if __name__ == "__main__":

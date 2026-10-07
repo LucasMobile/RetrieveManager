@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import (
     DASHBOARD_FILE_COUNT_CACHE_SECONDS,
 )
-from app.db import get_db
+from app.db import count_rows, get_db
 from app.models import (
     Order,
     Unit,
@@ -25,6 +25,7 @@ from app.models import (
 from app.netutil import port_listening
 from app.pager import paginate
 from app.pipeline import folder_counts
+from app.store_routing import StoreEndpoint, build_routing_plan
 from app.web import DASH_PAGE, ctx, require_user, templates
 
 router = APIRouter()
@@ -71,12 +72,7 @@ def _unit_runtime(unit: Unit) -> tuple[dict[str, int], bool]:
 def _dashboard_units(
     db: Session, page: int
 ) -> tuple[list[Unit], dict[str, int | bool], dict[str, int]]:
-    total = (
-        db.scalar(
-            select(func.count()).select_from(Unit).where(Unit.deleted_at.is_(None))
-        )
-        or 0
-    )
+    total = count_rows(db, Unit, Unit.deleted_at.is_(None))
     pager = paginate(total, page, DASH_PAGE)
     units = list(
         db.scalars(
@@ -158,16 +154,8 @@ def _dashboard_units(
             for row in rows:
                 stats[int(row[0])] = tuple(int(value or 0) for value in row[1:5])
             summary = {
-                "enabled": int(
-                    db.scalar(
-                        select(func.count())
-                        .select_from(Unit)
-                        .where(
-                            Unit.enabled.is_(True),
-                            Unit.deleted_at.is_(None),
-                        )
-                    )
-                    or 0
+                "enabled": count_rows(
+                    db, Unit, Unit.enabled.is_(True), Unit.deleted_at.is_(None)
                 ),
                 "watching": sum(row[0] for row in stats.values()),
                 "queue": sum(row[1] for row in stats.values()),
@@ -181,11 +169,18 @@ def _dashboard_units(
                 summary=summary,
             )
     if units:
+        # A listening port is not enough: the unit must also be routable.
+        plan = build_routing_plan(
+            StoreEndpoint.from_unit(unit)
+            for unit in db.scalars(select(Unit).where(Unit.deleted_at.is_(None)))
+        )
         with ThreadPoolExecutor(max_workers=len(units)) as executor:
             runtime = list(executor.map(_unit_runtime, units))
         for unit, (folders, store_up) in zip(units, runtime, strict=True):
+            problem = plan.unit_problems.get(unit.id)
             unit.folders = folders  # type: ignore[attr-defined]
-            unit.store_up = store_up  # type: ignore[attr-defined]
+            unit.store_problem = problem  # type: ignore[attr-defined]
+            unit.store_up = store_up and problem is None  # type: ignore[attr-defined]
     views = []
     for unit in units:
         watching, queue, running, errors = stats.get(unit.id, (0, 0, 0, 0))
@@ -207,26 +202,11 @@ def dashboard(
     user: User = Depends(require_user),
 ):
     units, pager, summary = _dashboard_units(db, page)
+    # O polling pede só o conteúdo da região, sem o layout da página.
+    partial = request.headers.get("x-partial") == "1"
     return templates.TemplateResponse(
         request=request,
-        name="dashboard.html",
-        context=ctx(
-            request, db, "dash", units=units, pager=pager, summary=summary, qs=""
-        ),
-    )
-
-
-@router.get("/dashboard/partial", response_class=HTMLResponse)
-def dashboard_partial(
-    request: Request,
-    page: int = 1,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_user),
-):
-    units, pager, summary = _dashboard_units(db, page)
-    return templates.TemplateResponse(
-        request=request,
-        name="dashboard_partial.html",
+        name="dashboard_partial.html" if partial else "dashboard.html",
         context=ctx(
             request, db, "dash", units=units, pager=pager, summary=summary, qs=""
         ),

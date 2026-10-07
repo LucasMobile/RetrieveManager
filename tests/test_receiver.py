@@ -1,6 +1,8 @@
 import hashlib
 import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from pynetdicom import AE
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
+from app.instances import record_instance
 from app.models import DicomInstance, DicomStudy
 from app.receiver import (
     STATUS_CANNOT_UNDERSTAND,
@@ -113,13 +116,19 @@ class ReceiverTest(unittest.TestCase):
             status = assoc.send_c_store(ds)
             statuses.append(status.Status if "Status" in status else None)
         assoc.release()
+        # New objects are acknowledged before their commit ends.
+        self.wait_writer()
         return assoc, statuses
 
+    def wait_writer(self):
+        self.assertTrue(self.receiver.writer.wait_idle(10))
+
     def rows(self):
+        self.wait_writer()
         with self.Session() as db:
             return list(db.scalars(select(DicomInstance).order_by(DicomInstance.id)))
 
-    def test_store_writes_received_bytes_and_commits_before_ack(self):
+    def test_store_writes_received_bytes_and_records_the_instance(self):
         image = ct_image()
         _assoc, statuses = self.send(image)
 
@@ -225,11 +234,139 @@ class ReceiverTest(unittest.TestCase):
         self.assertEqual(statuses, [STATUS_SUCCESS])
         self.assertEqual(len(self.rows()), 2)
 
-    def test_database_failure_is_not_acknowledged(self):
+    def test_new_object_is_acknowledged_before_its_commit(self):
+        image = ct_image()
+        commit_allowed = threading.Event()
+
+        def held_record(db, obj):
+            commit_allowed.wait(10)
+            return record_instance(db, obj)
+
+        ae = AE(ae_title="SRVPACS")
+        ae.add_requested_context(CTImageStorage, [ExplicitVRLittleEndian])
+        with patch("app.receiver.record_instance", side_effect=held_record):
+            assoc = ae.associate("127.0.0.1", self.port, ae_title="RETRIEVE")
+            self.assertTrue(assoc.is_established)
+            status = assoc.send_c_store(image)
+
+            # Acknowledged while its commit is still held: the file is final.
+            self.assertEqual(status.Status, STATUS_SUCCESS)
+            with self.Session() as db:
+                self.assertEqual(
+                    db.scalar(select(func.count()).select_from(DicomInstance)), 0
+                )
+            (path,) = self.receive_dir.iterdir()
+            self.assertEqual(pydicom.dcmread(path).SOPInstanceUID, image.SOPInstanceUID)
+
+            commit_allowed.set()
+            assoc.release()
+            self.wait_writer()
+        (row,) = self.rows()
+        self.assertEqual(row.state, "received")
+        self.assertEqual(Path(row.source_path), path)
+        self.assertEqual(
+            row.source_sha256, hashlib.sha256(dataset_bytes(path)).hexdigest()
+        )
+
+    def test_record_failure_after_the_ack_leaves_the_file_for_adoption(self):
+        from app.pipeline.compact import _adopt_receive_files
+
+        first, second, third = ct_image(), ct_image(), ct_image()
         with patch("app.receiver.record_instance", side_effect=RuntimeError("down")):
+            with self.assertLogs("receiver", "ERROR"):
+                _assoc, statuses = self.send(first)
+            # Already acknowledged when its commit failed.
+            self.assertEqual(statuses, [STATUS_SUCCESS])
+            self.assertFalse(self.receiver.writer.accepts_early_ack())
+
+            # While the writer fails, new objects wait for their commit again.
+            _assoc, statuses = self.send(second)
+            self.assertEqual(statuses, [STATUS_OUT_OF_RESOURCES])
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(len(list(self.receive_dir.iterdir())), 2)
+
+        # The next successful commit lifts the fallback.
+        _assoc, statuses = self.send(third)
+        self.assertEqual(statuses, [STATUS_SUCCESS])
+        self.assertTrue(self.receiver.writer.accepts_early_ack())
+
+        # The worker adopts the files that have no row.
+        with (
+            self.Session() as db,
+            patch("app.pipeline.compact.RECEIVE_ADOPT_MIN_AGE_SECONDS", 0),
+        ):
+            _adopt_receive_files(db, self.unit, self.receive_dir, self.error_dir)
+        rows = {row.sop_uid: row for row in self.rows()}
+        self.assertEqual(
+            set(rows),
+            {first.SOPInstanceUID, second.SOPInstanceUID, third.SOPInstanceUID},
+        )
+        adopted = rows[first.SOPInstanceUID]
+        self.assertEqual(adopted.state, "received")
+        self.assertEqual(
+            adopted.source_sha256,
+            hashlib.sha256(dataset_bytes(Path(adopted.source_path))).hexdigest(),
+        )
+
+    def test_unreadable_database_is_refused_before_any_write(self):
+        with patch.object(
+            Receiver, "_recorded_state", side_effect=RuntimeError("down")
+        ):
             _assoc, statuses = self.send(ct_image())
         self.assertEqual(statuses, [STATUS_OUT_OF_RESOURCES])
-        self.assertEqual(self.rows(), [])
+        self.assertFalse(self.receive_dir.exists() and any(self.receive_dir.iterdir()))
+
+    def test_revival_still_waits_for_its_commit(self):
+        image = ct_image()
+        self.send(image)
+        (row,) = self.rows()
+        Path(row.source_path).unlink()
+        with self.Session() as db:
+            db.get(DicomInstance, row.id).state = "error"
+            db.commit()
+
+        with patch("app.receiver.record_instance", side_effect=RuntimeError("down")):
+            _assoc, statuses = self.send(image)
+
+        self.assertEqual(statuses, [STATUS_OUT_OF_RESOURCES])
+        (row,) = self.rows()
+        self.assertEqual(row.state, "error")
+
+    def test_new_object_waits_for_its_commit_when_early_ack_is_off_or_queue_long(self):
+        for setting, value in (
+            ("RECEIVER_EARLY_ACK", False),
+            ("RECEIVER_EARLY_ACK_MAX_PENDING", 0),
+        ):
+            with (
+                self.subTest(setting),
+                patch(f"app.receiver.{setting}", value),
+                patch("app.receiver.record_instance", side_effect=RuntimeError("down")),
+            ):
+                _assoc, statuses = self.send(ct_image())
+                self.assertEqual(statuses, [STATUS_OUT_OF_RESOURCES])
+            # A successful commit clears the writer's failure for the next case.
+            _assoc, statuses = self.send(ct_image())
+            self.assertEqual(statuses, [STATUS_SUCCESS])
+
+    def test_association_summary_counts_early_acknowledgements(self):
+        with self.assertLogs("receiver", "INFO") as logs:
+            self.send(*[ct_image() for _ in range(3)])
+            # The summary is logged by the receiver once the release ends.
+            deadline = time.monotonic() + 10
+            summaries = []
+            while not summaries and time.monotonic() < deadline:
+                summaries = [
+                    record
+                    for record in logs.records
+                    if record.getMessage() == "dicom.receive.association"
+                ]
+                if not summaries:
+                    time.sleep(0.05)
+        (summary,) = summaries
+        self.assertEqual(
+            (summary.stored_count, summary.unrecorded_count, summary.pending_count),
+            (3, 0, 0),
+        )
 
     def test_low_disk_space_is_refused_for_retry(self):
         with patch(

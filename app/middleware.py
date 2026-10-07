@@ -105,6 +105,8 @@ async def request_middleware(
                     status="failure",
                     started_at=started_at,
                     error=exc,
+                    # The message may echo request data: log only type and stack.
+                    error_detail=None,
                 )
                 raise
 

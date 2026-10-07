@@ -24,7 +24,7 @@ from app.routes import admin, auth, dashboard, orders, rules, units
 from app.security import (
     verify_csrf,
 )
-from app.web import LoginRedirect, error_page, wants_html
+from app.web import FlashRedirect, LoginRedirect, error_page, flash, wants_html
 
 configure_logging()
 
@@ -61,6 +61,13 @@ app.mount(
 @app.exception_handler(LoginRedirect)
 async def _login_redirect(_request: Request, _exc: LoginRedirect):
     return RedirectResponse("/login", status_code=303)
+
+
+@app.exception_handler(FlashRedirect)
+async def _flash_redirect(request: Request, exc: FlashRedirect):
+    if exc.message:
+        flash(request, exc.message, exc.kind)
+    return RedirectResponse(exc.url, status_code=303)
 
 
 @app.exception_handler(StarletteHTTPException)

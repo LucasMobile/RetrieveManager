@@ -3,6 +3,7 @@ import unittest
 from app.config import BASE_DIR, store_bind_port
 from app.validation import (
     validate_cloud_url,
+    validate_host,
     validate_unit_form,
 )
 
@@ -89,3 +90,20 @@ class ValidationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PacsHostValidationTest(unittest.TestCase):
+    def test_accepts_ips_and_dns_names(self):
+        for host in (
+            "192.168.3.103",
+            "fe80::1",
+            "pacs",
+            "pacs.hospital.local",
+            "pacs-01",
+        ):
+            self.assertEqual(validate_host(f" {host} "), host)
+
+    def test_mistyped_ip_is_refused_instead_of_looked_up_in_dns(self):
+        for host in ("192.1683.103", "192.168.3", "10.0.0.256", "192.168.3.103.5"):
+            with self.assertRaisesRegex(ValueError, "não é um endereço IP válido"):
+                validate_host(host)

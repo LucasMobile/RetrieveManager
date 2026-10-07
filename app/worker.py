@@ -23,7 +23,7 @@ from app.config import (
 )
 from app.db import SessionLocal, init_db
 from app.models import Unit
-from app.observability import configure_logging, log_event, safe_error_detail
+from app.observability import configure_logging, log_event
 from app.pipeline import (
     acknowledge_pending_orders,
     archive_completed_orders,
@@ -63,7 +63,6 @@ def _touch_health() -> None:
                 resource="worker",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
             )
             _health_touch_error_logged = True
 
@@ -85,7 +84,6 @@ def _move_job(resource_id: int, kind: str) -> None:
                     resource=f"{kind}:{resource_id}",
                     status="failure",
                     error=persist_exc,
-                    error_detail=safe_error_detail(persist_exc),
                     original_error_type=type(exc).__name__,
                     resource_id=resource_id,
                     move_kind=kind,
@@ -97,7 +95,6 @@ def _move_job(resource_id: int, kind: str) -> None:
                 resource=f"{kind}:{resource_id}",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 resource_id=resource_id,
                 move_kind=kind,
             )
@@ -120,7 +117,6 @@ def _ack_job(unit_id: int) -> None:
                 resource=f"unit:{unit_id}",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 stage="orders.ack",
                 unit_id=unit_id,
             )
@@ -152,7 +148,6 @@ def _schedule_ack_job(
                 resource=f"unit:{unit_id}",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit_id,
             )
     jobs[unit_id] = pool.submit(_ack_job, unit_id)
@@ -227,7 +222,6 @@ def _schedule_find_jobs(
                         resource=f"unit:{unit_id}",
                         status="failure",
                         error=exc,
-                        error_detail=safe_error_detail(exc),
                         stage=stage,
                         unit_id=unit_id,
                     )
@@ -263,7 +257,6 @@ def _find_scheduler_loop(
                 resource="worker",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
             )
         stop_event.wait(max(1, WORKER_INTERVAL_SECONDS))
 
@@ -302,7 +295,6 @@ def _schedule_unit_job(
                 resource=f"unit:{unit_id}",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 stage=stage,
                 unit_id=unit_id,
             )
@@ -316,7 +308,6 @@ def _schedule_unit_job(
             resource=f"unit:{unit_id}",
             status="skipped",
             error=exc,
-            error_detail=safe_error_detail(exc),
             stage=stage,
             unit_id=unit_id,
         )
@@ -400,7 +391,6 @@ def main() -> None:
                     resource="worker",
                     status="failure",
                     error=exc,
-                    error_detail=safe_error_detail(exc),
                 )
             stop_event.wait(WORKER_INTERVAL_SECONDS)
     finally:
@@ -423,7 +413,6 @@ def main() -> None:
                 resource="worker",
                 status="failure",
                 error=exc,
-                error_detail=safe_error_detail(exc),
             )
         log_event(
             log,
@@ -520,7 +509,6 @@ def _run_db_stage(stage: str, callback):
                 status="failure",
                 started_at=started_at,
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 stage=stage,
             )
             return None
@@ -559,7 +547,6 @@ def _run_unit_stage(unit_id: int, stage: str, callback):
                 status="failure",
                 started_at=started_at,
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 stage=stage,
                 unit_id=unit_id,
             )
@@ -590,7 +577,6 @@ def _persist_dispatch_failure(resource_id: int, kind: str, exc: Exception) -> No
                 resource=f"{kind}:{resource_id}",
                 status="failure",
                 error=persist_exc,
-                error_detail=safe_error_detail(persist_exc),
                 resource_id=resource_id,
                 move_kind=kind,
             )

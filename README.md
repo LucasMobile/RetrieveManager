@@ -32,9 +32,17 @@ receptor.
 
 O receptor (`python -m app.receiver`, serviço `receiver` do Compose) grava cada
 objeto exatamente como chegou, sem decodificar o pixel data, calcula o SHA-256 e
-registra a instância na tabela `dicom_instances`. O PACS só recebe sucesso depois
-desse commit; falha de banco ou disco com menos de `RECEIVER_MIN_FREE_MB` livres
-responde `0xA700` para o PACS reenviar. O mesmo SOP com o mesmo conteúdo (2º
+registra a instância na tabela `dicom_instances`. Um SOP que a unidade nunca
+registrou recebe sucesso assim que o arquivo está gravado com o nome final, e a
+linha é commitada logo em seguida, sem o PACS esperar o banco a cada imagem
+(`RECEIVER_EARLY_ACK`, como fazia o storescp). Reenvios, instâncias com erro
+recebidas de novo e versões conflitantes continuam recebendo sucesso só depois
+do commit, assim como qualquer objeto enquanto a gravação no banco estiver
+falhando ou com mais de `RECEIVER_EARLY_ACK_MAX_PENDING` objetos na fila. Se a
+linha de um objeto já confirmado não puder ser gravada, o arquivo fica na pasta
+de recebimento e o worker o adota. Banco inacessível ou disco com menos de
+`RECEIVER_MIN_FREE_MB` livres responde `0xA700` antes de gravar qualquer coisa,
+para o PACS reenviar. O mesmo SOP com o mesmo conteúdo (2º
 retrieve, reenvio do PACS) é confirmado sem ser compactado ou enviado de novo; o
 mesmo SOP com conteúdo diferente é guardado na pasta de erro como `conflict`, sem
 substituir a primeira versão. A compactação consome essa tabela em vez de varrer
@@ -281,14 +289,35 @@ A fila e os Logs mantêm paginação por cursor para evitar o custo crescente de
 próxima e anterior. Nessas telas é possível exibir 10, 20, 30, 40 ou 50 itens por
 página; o padrão é 30. O PostgreSQL recebe índices parciais para registros ativos,
 histórico e limpeza automática, além de índices `pg_trgm` para busca por accession,
-Patient ID e ID de origem. Os agregados da Visão geral têm cache curto de cinco
+Patient ID e ID de origem. Na inicialização, cada serviço (um de cada vez)
+converte para `bigint` os IDs que crescem a cada imagem (`image_transfers`,
+`dicom_instances`, `historical_image_links`, `dicom_rule_applications`) quando o
+banco ainda os tem como `integer`, cria com `CREATE INDEX CONCURRENTLY` os
+índices que faltam, refaz os que ficaram inválidos, remove índices de versões
+anteriores que nenhuma consulta usa e ajusta o autovacuum das tabelas que
+crescem sempre (`dicom_instances`, `image_transfers`, `orders`,
+`order_events`); tudo fica em `app/db.py`. A conversão reescreve cada tabela uma
+única vez, com a tabela bloqueada (`db.schema.bigint` no log mostra a duração);
+se não obtiver o bloqueio em 60 s, o serviço reinicia e tenta de novo. A
+configuração do PostgreSQL (memória, checkpoints, timeout de transação parada e
+log de consultas lentas) fica no `command` do serviço `postgres` do Compose,
+ajustável pelas variáveis `PG_*` do `.env.example`. Os
+agregados da Visão geral têm cache curto de cinco
 segundos para que vários navegadores não repitam as mesmas varreduras do banco a
 cada atualização.
 
 Na compactação, cada arquivo é lido, alterado (charset, token, regras) e
 codificado em um processo persistente e isolado; um crash ou travamento do
 codec derruba só aquele processo. O número de processos é
-`COMPACT_GLOBAL_WORKERS` e o tempo máximo por arquivo,
+`COMPACT_GLOBAL_WORKERS`, que por padrão (vazio ou `auto`) é o número de CPUs
+disponíveis para o container menos 2, com mínimo 1: 6 CPUs → 4, 4 → 2, 2 → 1.
+As duas CPUs livres ficam para o receptor, o PostgreSQL e o resto do worker;
+compactar mais devagar só aumenta a fila, enquanto CPU esgotada atrasa a
+confirmação das imagens ao PACS. Um número fixo no `.env` sempre prevalece.
+Esses processos são divididos de forma justa entre as unidades que estão
+compactando ao mesmo tempo: sozinha, uma unidade usa todos; com duas com fila,
+cada uma fica com metade, e assim por diante. **Workers de compactação** da
+unidade é só o teto dela. O tempo máximo por arquivo é
 `COMPACT_FILE_TIMEOUT_SECONDS`. Um crash é repetido uma vez em processo novo;
 se repetir, ou em timeout, o original vai íntegro para a pasta de erro.
 Persistências usam lotes pequenos configurados por `COMPACT_DB_BATCH_SIZE` e
@@ -328,9 +357,9 @@ Campos principais:
 - PACS: AET, IP, porta e a opção **Usar * no Patient ID no C-FIND** (desmarcada
   por padrão)
 - Calling AET e Dest AET
-- Porta do receptor (única no servidor) e, opcionalmente, os **IPs autorizados a
-  enviar** e os **AE Titles autorizados a enviar** (vazios aceitam qualquer
-  remetente)
+- Porta do receptor (pode ser compartilhada; veja abaixo) e, opcionalmente, os
+  **IPs autorizados a enviar** e os **AE Titles autorizados a enviar** (vazios
+  aceitam qualquer remetente)
 - Token (identificação na nuvem)
 - Endpoint de envio para a nuvem
 - Retrieve de exames anteriores (opcional) e timeout, com padrão de 30 minutos
@@ -343,12 +372,33 @@ Depois de salvar, cadastre o Dest AET + porta **no PACS**.
 **AE Titles autorizados a enviar** restringe quem pode entregar exames ao receptor
 da unidade. A associação de outro Calling AET é recusada já na abertura
 (A-ASSOCIATE-RJ, "calling AE title not recognized"), sem diferenciar maiúsculas;
-um Called AET diferente do Calling AET da unidade também é recusado. O receptor
+um Called AET que nenhuma unidade da porta usa também é recusado. O receptor
 grava o AE de origem no meta header (`SourceApplicationEntityTitle`, 0002,0016) e
 a compactação confere de novo antes de qualquer processamento: objetos de outros
 AEs vão para a pasta de erro com status `rejected_sender`, sem criar pedido. O AE
 pode ser falsificado por quem alcança a porta, então prefira restringir também o
 IP. Com o campo vazio, qualquer remetente é aceito.
+
+**Porta compartilhada entre unidades.** Várias unidades podem usar a mesma porta
+e o mesmo Calling AET; o AE Title do remetente decide a unidade. Exemplo: Empresa1
+e Empresa2 na porta 445 com AET `MOBILEMED`, a primeira com `serverPacs1` e a
+segunda com `serverPacs2` em **AE Titles autorizados a enviar**. Regras validadas
+ao salvar (contando unidades pausadas):
+
+- todas as unidades que compartilham porta e AET precisam ter a lista preenchida,
+  e um AE Title não pode aparecer em duas delas;
+- nenhuma pasta (recebimento, envio, erro) pode ser igual a uma pasta de outra
+  unidade nem ficar dentro dela, com ou sem porta compartilhada.
+
+A unidade é escolhida na abertura da associação e não muda até o fim dela. Se o
+banco ficar ambíguo por outro caminho (SQL manual), o receptor recusa os
+remetentes envolvidos e registra `StoreRouteConflict`; nunca escolhe uma unidade
+por conta própria. O dashboard mostra **Store bloqueado** nessas unidades. Pausar,
+arquivar ou alterar uma unidade aborta as associações abertas dela (o PACS
+reenvia), sem afetar as outras unidades da porta. Cada unidade tem o próprio
+limite de `RECEIVER_MAX_ASSOCIATIONS` associações simultâneas. Alterações salvas
+na tela chegam ao receptor na hora (`LISTEN/NOTIFY` do PostgreSQL); a consulta a
+cada `WORKER_INTERVAL_SECONDS` continua como garantia.
 
 **IPs autorizados a enviar** aceita endereços e faixas CIDR separados por vírgula
 (ex.: `192.168.3.103, 10.10.0.0/24`). Conexões de outro endereço são recusadas na
@@ -365,6 +415,14 @@ exemplo, devolvidos por **Reprocessar erros**) são adotados pelo
 worker depois de `RECEIVE_ADOPT_MIN_AGE_SECONDS` (60 s) e seguem o mesmo fluxo;
 uma instância que falhou na compactação volta para a fila quando o mesmo conteúdo
 chega de novo.
+
+Em **Operação → Instâncias com pendência**, o botão **Limpar pendências** exclui os
+registros em conflito, com arquivo ausente ou com erro que o filtro atual mostra
+(unidade e situação), junto com os arquivos deles. Depois disso, o PACS pode
+reenviar os mesmos objetos, que entram como novos. Só são apagados arquivos dentro
+das pastas de recebimento e de erro da própria unidade, e a ação fica registrada
+nos logs de auditoria. Um conflito limpo volta a ser conflito se o primeiro
+objeto com o mesmo SOP Instance UID ainda estiver registrado.
 
 O receptor mantém cada objeto em memória enquanto o grava: o pico de memória fica
 perto de `RECEIVER_MAX_ASSOCIATIONS` × maior objeto recebido. Em unidades com
@@ -415,9 +473,10 @@ Patient ID no C-FIND**: a consulta passa a usar `12345*` e são aceitos IDs que
 começam com o do pedido. Os Study UIDs encontrados são registrados antes da
 transferência, e cada série é recuperada por seus Study UID e Series UID exatos.
 Se a consulta não encontrar exames anteriores, o histórico termina com sucesso e
-nenhum C-MOVE é executado. O processo compartilha o limite de paralelismo da
-unidade, mas não bloqueia um retrieve atual que já esteja no horário e haja
-capacidade disponível. Cada série histórica concluída recebe um checkpoint e não
+nenhum C-MOVE é executado. O processo compartilha o limite de C-MOVEs paralelos
+da unidade: o histórico e o C-MOVE de novas imagens do monitoramento nunca usam
+a última vaga, reservada ao 1º retrieve dos exames novos, e cada um fica com no
+máximo metade das vagas (com 4: até 2 de cada, 3 no total). Cada série histórica concluída recebe um checkpoint e não
 é repetida se outra série precisar de retry. O exame atual continua sendo
 recuperado pelo Study UID; seus tempos e o monitoramento de novas imagens não se
 aplicam aos exames anteriores.
@@ -468,7 +527,16 @@ As verificações usam threads próprias (`MONITOR_UNIT_SCHEDULERS`, com
 `MONITOR_CHECKS_PER_UNIT` consultas simultâneas por unidade e até
 `MONITOR_BATCH_SIZE` pedidos por rodada), separadas do C-FIND de exames novos.
 O C-MOVE de novas imagens usa o timeout **Timeout do C-MOVE de novas imagens**
-da unidade e respeita o limite de C-MOVE em paralelo.
+da unidade e respeita o limite de C-MOVE em paralelo. O evento informa as
+imagens novas que o receptor registrou, não o total que o PACS reenviou (ele
+manda cada série inteira).
+
+Todo C-MOVE (1º retrieve, novas imagens, histórico e manual) é abortado quando o
+PACS passa `MOVE_IDLE_TIMEOUT_SECONDS` (padrão 120) sem enviar imagem, e só
+conta como sucesso se o receptor registrar imagens do estudo em até
+`MOVE_RECEIVE_CONFIRM_SECONDS` (padrão 15). Se o PACS disser que enviou e nada
+chegar, o pedido mostra "nenhuma chegou ao receptor": confira no PACS o IP e a
+porta do AE de destino (Calling AET da unidade).
 
 ## Regras padrão (editáveis na tela)
 

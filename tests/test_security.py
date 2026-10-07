@@ -39,6 +39,7 @@ from app.rate_limit import (
 )
 from app.security import hash_password, verify_password
 from app.validation import validate_cloud_url
+from app.web import AUDIT_ACTION_BADGES, AUDIT_ACTION_LABELS
 from tests.support import make_unit, postgres_test_engine
 
 
@@ -254,6 +255,39 @@ class SecurityTest(unittest.TestCase):
         self.assertIn(
             "Histórico ativo · todas as modalidades", self.client.get("/units").text
         )
+
+    def test_disabling_prior_retrieve_withdraws_the_queued_ones(self):
+        self.login()
+        token = self.token("/units/new")
+        data = self.unit_form_data(csrf_token=token, retrieve_prior_enabled="1")
+        self.client.post("/units/new", data=data)
+        with self.Session() as db:
+            unit_id = db.scalar(select(Unit.id))
+            for acc, state in (("queued", "queued"), ("running", "retrieving")):
+                db.add(
+                    Order(
+                        unit_id=unit_id,
+                        acc=acc,
+                        birth_date="19691027",
+                        modality="CT",
+                        status="monitoring",
+                        prior_status=state,
+                        prior_due_at=datetime.now(),
+                    )
+                )
+            db.commit()
+
+        response = self.client.post(
+            f"/units/{unit_id}", data={**data, "retrieve_prior_enabled": "0"}
+        )
+
+        self.assertIn(
+            "1 retrieve histórico que estava na fila foi cancelado.",
+            response.text,
+        )
+        with self.Session() as db:
+            states = dict(db.execute(select(Order.acc, Order.prior_status)).all())
+        self.assertEqual(states, {"queued": "disabled", "running": "retrieving"})
 
     def test_all_post_routes_require_csrf(self):
         self.login()
@@ -618,11 +652,17 @@ class SecurityTest(unittest.TestCase):
                 self.assertEqual(self.client.get(path).status_code, 403)
 
         token = self.token("/")
+        # Authorization runs before the resource lookup: missing ids stay 403.
         for path in (
             "/units/1/toggle",
+            "/units/999999/delete",
             "/orders/1/retry",
             "/orders/1/cancel",
             "/orders/1/delete",
+            "/orders/999999/retry-prior",
+            "/rules/dicom/999999/toggle",
+            "/rules/retrieve/999999/delete",
+            "/users/999999/delete",
         ):
             with self.subTest(path=path):
                 self.assertEqual(
@@ -648,6 +688,9 @@ class SecurityTest(unittest.TestCase):
         )
         response = self.client.post("/rules/retrieve", data=invalid)
         self.assertIn("não pode ser maior que o tempo máximo", response.text)
+        out_of_range = dict(form, modality="US", wait_minutes="2000")
+        response = self.client.post("/rules/retrieve", data=out_of_range)
+        self.assertEqual(response.status_code, 422)
         # A disabled toggle does not post its fields; stored values are kept.
         with self.Session() as db:
             rule = db.scalar(select(ModalityRule).where(ModalityRule.modality == "CT"))
@@ -674,6 +717,16 @@ class SecurityTest(unittest.TestCase):
             rule = db.get(ModalityRule, rule_id)
             self.assertFalse(rule.monitor_enabled)
             self.assertEqual(rule.monitor_interval_minutes, 5)
+
+    def test_dashboard_polls_its_own_url_for_the_partial(self):
+        self.login()
+        page = self.client.get("/")
+        self.assertIn('data-poll="/?page=1"', page.text)
+        partial = self.client.get("/?page=1", headers={"X-Partial": "1"})
+        self.assertEqual(partial.status_code, 200)
+        self.assertNotIn("<html", partial.text)
+        self.assertIn("dashboard-overview", partial.text)
+        self.assertEqual(self.client.get("/dashboard/partial").status_code, 404)
 
     def test_order_queue_polls_summary_and_table_only(self):
         self.login()
@@ -702,6 +755,69 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(response.headers["location"], "/orders")
         queue = self.client.get("/orders")
         self.assertIn("Pedido não encontrado.", queue.text)
+
+    def test_admin_actions_on_missing_resources_redirect(self):
+        self.login()
+        token = self.token("/")
+        order_missing = "Pedido não encontrado."
+        cases = (
+            ("get", "/units/999999", "/units", None),
+            ("post", "/units/999999/toggle", "/units", None),
+            ("post", "/orders/999999/retry", "/orders", order_missing),
+            ("post", "/orders/999999/monitor-stop", "/orders", order_missing),
+            ("post", "/rules/dicom/999999/delete", "/rules", "Regra não encontrada."),
+            (
+                "post",
+                "/rules/retrieve/999999/delete",
+                "/rules/retrieve",
+                "Regra não encontrada.",
+            ),
+            ("get", "/users/999999", "/users", None),
+        )
+        for method, path, location, notice in cases:
+            with self.subTest(path=path):
+                kwargs = {"data": {"csrf_token": token}} if method == "post" else {}
+                response = getattr(self.client, method)(
+                    path, follow_redirects=False, **kwargs
+                )
+                self.assertEqual(response.status_code, 303)
+                self.assertEqual(response.headers["location"], location)
+                if notice:
+                    self.assertIn(notice, self.client.get(location).text)
+
+    def test_archived_order_rejects_actions_with_notice(self):
+        self.login()
+        with self.Session() as db:
+            unit = make_unit()
+            db.add(unit)
+            db.flush()
+            order = Order(
+                unit_id=unit.id,
+                source_id="archived-actions",
+                pat_id="P1",
+                acc="ACC-ARCHIVED",
+                birth_date="19800101",
+                status="done",
+                study_uid="1.2.3",
+                archived_at=datetime.now(),
+            )
+            db.add(order)
+            db.commit()
+            order_id = order.id
+        token = self.token("/")
+        for action in ("retrieve-now", "retry-prior", "resend-failed"):
+            with self.subTest(action=action):
+                response = self.client.post(
+                    f"/orders/{order_id}/{action}",
+                    data={"csrf_token": token},
+                    follow_redirects=False,
+                )
+                self.assertEqual(response.status_code, 303)
+                self.assertEqual(response.headers["location"], f"/orders/{order_id}")
+                self.assertIn(
+                    "Pedidos arquivados são somente para consulta.",
+                    self.client.get(f"/orders/{order_id}").text,
+                )
 
     def test_monitoring_can_be_checked_now_or_stopped(self):
         self.login()
@@ -822,6 +938,27 @@ class SecurityTest(unittest.TestCase):
         ten_per_page = self.client.get("/logs", params={"page_size": 10})
         self.assertEqual(ten_per_page.text.count('class="log-date"'), 10)
         self.assertRegex(ten_per_page.text, r"before=\d+&amp;page=3")
+
+    def test_system_restore_entries_are_labelled_and_filterable(self):
+        self.login()
+        with self.Session() as db:
+            db.add(
+                AuditLog(
+                    actor_username="Sistema",
+                    actor_role="system",
+                    action="restore",
+                    resource_type="order",
+                    resource_id="1",
+                    resource_name="ACC-1",
+                    summary="Pedido restaurado automaticamente.",
+                )
+            )
+            db.commit()
+
+        response = self.client.get("/logs", params={"action": "restore"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('status-badge--success">Restauração</span>', response.text)
+        self.assertEqual(set(AUDIT_ACTION_LABELS), set(AUDIT_ACTION_BADGES))
 
     def test_admin_can_create_update_and_delete_users_with_self_protection(self):
         self.login()
@@ -1369,7 +1506,7 @@ class SecurityTest(unittest.TestCase):
             unit_id, order_id = unit.id, order.id
 
         page = self.client.get(f"/orders/{order_id}")
-        self.assertIn("Reenviar 2 imagem(ns) com falha de envio", page.text)
+        self.assertIn("Reenviar 2 imagens com falha de envio", page.text)
         token = re.search(r'name="csrf_token" value="([^"]+)"', page.text)[1]
         response = self.client.post(
             f"/orders/{order_id}/resend-failed",

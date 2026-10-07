@@ -11,13 +11,13 @@ from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.audit import audit
 from app.compaction import CompactResult
 from app.config import (
     COMPACT_DB_BATCH_SIZE,
 )
 from app.events import add_event
 from app.models import (
-    AuditLog,
     DicomInstance,
     DicomRuleApplication,
     HistoricalImageLink,
@@ -30,13 +30,12 @@ from app.observability import (
     log_context,
     log_event,
     new_correlation_id,
-    safe_error_detail,
 )
+from app.order_state import queue_prior_retrieve
 from app.parse import (
     patient_id_matches,
 )
 from app.pipeline.common import bounded_db_text, ensure_order_correlation, log
-from app.pipeline.find import prior_date_range
 from app.pipeline.monitor import reset_monitoring, start_monitoring
 from app.rules import monitor_plan_for, prior_skip_reason, schedule_from_now
 
@@ -115,7 +114,6 @@ def _persist_compact_result_with_retry(
                 resource=f"unit:{unit.id}",
                 status="failure" if exhausted else "retry",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit.id,
                 filename=result.output_name or result.source_name,
                 attempt=persist_attempt,
@@ -170,7 +168,6 @@ def persist_compact_chunk(
                 resource=f"unit:{unit.id}",
                 status="fallback",
                 error=exc,
-                error_detail=safe_error_detail(exc),
                 unit_id=unit.id,
                 file_count=len(results),
             )
@@ -468,7 +465,6 @@ def _quarantine_compacted_output(unit: Unit, result: CompactResult) -> None:
             resource=f"unit:{unit.id}",
             status="failure",
             error=exc,
-            error_detail=safe_error_detail(exc),
             unit_id=unit.id,
             filename=filename,
         )
@@ -541,21 +537,18 @@ def _register_store_received_order(
         db.add(order)
         db.flush()
         window = start_monitoring(order, monitor, now) if monitor else ""
-        db.add(
-            AuditLog(
-                actor_id=None,
-                actor_username="Sistema",
-                actor_role="system",
-                action="create",
-                resource_type="order",
-                resource_id=str(order.id),
-                resource_name=order.acc,
-                summary=(
-                    "Pedido criado automaticamente a partir de exame recebido "
-                    f"diretamente pelo Store SCP da unidade {unit.name}."
-                ),
-                ip_address="",
-            )
+        audit(
+            db,
+            None,
+            None,
+            action="create",
+            resource_type="order",
+            resource_id=order.id,
+            resource_name=order.acc,
+            summary=(
+                "Pedido criado automaticamente a partir de exame recebido "
+                f"diretamente pelo Store SCP da unidade {unit.name}."
+            ),
         )
         if window:
             message = f"Exame recebido diretamente pelo Store SCP. {window}"
@@ -597,16 +590,7 @@ def _register_store_received_order(
                 order.done_at = now
         prior_skip = prior_skip_reason(db, unit, order.modality) if was_watching else ""
         if prior_skip is None:
-            prior_from, prior_to = prior_date_range(now.date())
-            order.prior_status = "queued"
-            order.prior_date_from = prior_from
-            order.prior_date_to = prior_to
-            order.prior_due_at = now
-            order.prior_started_at = None
-            order.prior_completed_at = None
-            order.prior_heartbeat_at = None
-            order.prior_attempts = 0
-            order.prior_last_error = ""
+            queue_prior_retrieve(order, now, refresh_window=True)
         elif prior_skip:
             add_event(db, order, prior_skip)
         if was_archived:
@@ -614,21 +598,18 @@ def _register_store_received_order(
             order.archive_reason = ""
             order.archived_by_user_id = None
             order.archived_by_username = ""
-            db.add(
-                AuditLog(
-                    actor_id=None,
-                    actor_username="Sistema",
-                    actor_role="system",
-                    action="restore",
-                    resource_type="order",
-                    resource_id=str(order.id),
-                    resource_name=order.acc,
-                    summary=(
-                        "Pedido restaurado automaticamente após novo recebimento "
-                        "do mesmo Study Instance UID pelo Store SCP."
-                    ),
-                    ip_address="",
-                )
+            audit(
+                db,
+                None,
+                None,
+                action="restore",
+                resource_type="order",
+                resource_id=order.id,
+                resource_name=order.acc,
+                summary=(
+                    "Pedido restaurado automaticamente após novo recebimento "
+                    "do mesmo Study Instance UID pelo Store SCP."
+                ),
             )
             add_event(
                 db,

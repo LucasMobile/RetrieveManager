@@ -1,4 +1,4 @@
-"""Shared web layer: templates, session user, context, audit and labels."""
+"""Shared web layer: templates, session user, context, actions and labels."""
 
 from __future__ import annotations
 
@@ -6,20 +6,22 @@ import logging
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from app.audit import audit
 from app.config import (
     BASE_DIR,
+    COMPACT_GLOBAL_WORKERS,
 )
 from app.db import get_db
-from app.models import (
-    AuditLog,
-    User,
-)
+from app.models import User
+from app.observability import log_event
 from app.security import (
     csrf_token,
 )
+from app.wording import plural
 
 EVENTS_PAGE = 10
 
@@ -61,6 +63,7 @@ AUDIT_ACTION_LABELS = {
     "password": "Senha alterada",
     "archive": "Arquivamento",
     "resend": "Reenvio",
+    "restore": "Restauração",
 }
 
 
@@ -68,6 +71,7 @@ AUDIT_RESOURCE_LABELS = {
     "unit": "Unidade",
     "order": "Pedido",
     "dicom_rule": "Regra DICOM",
+    "instance": "Instâncias",
     "retrieve_rule": "Regra de retrieve",
     "user": "Usuário",
 }
@@ -84,6 +88,7 @@ AUDIT_ACTION_BADGES = {
     "password": "info",
     "archive": "neutral",
     "resend": "warning",
+    "restore": "success",
 }
 
 
@@ -116,6 +121,11 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 
 
 templates.env.globals["csrf_token"] = csrf_token
+templates.env.globals["compact_global_workers"] = COMPACT_GLOBAL_WORKERS
+
+
+# Jinja: ``{{ n | plural("regra ativa", "regras ativas") }}``.
+templates.env.filters["plural"] = plural
 
 
 def _flash(request: Request) -> dict | None:
@@ -160,6 +170,16 @@ class LoginRedirect(Exception):
     pass
 
 
+class FlashRedirect(Exception):
+    """Abort a request with a 303 to ``url``, optionally flashing ``message``."""
+
+    def __init__(self, url: str, message: str = "", kind: str = "err") -> None:
+        super().__init__(url)
+        self.url = url
+        self.message = message
+        self.kind = kind
+
+
 def wants_html(request: Request) -> bool:
     return "text/html" in request.headers.get("accept", "")
 
@@ -201,35 +221,55 @@ def ctx(request: Request, db: Session, nav: str, **extra: Any) -> dict:
     return data
 
 
-def audit(
+async def form_strings(request: Request) -> dict[str, str]:
+    """Posted form fields, ignoring uploads."""
+    return {k: v for k, v in (await request.form()).items() if isinstance(v, str)}
+
+
+def redirect(url: str) -> RedirectResponse:
+    """303 so the browser follows a POST with a GET."""
+    return RedirectResponse(url, status_code=303)
+
+
+def commit_action(
     db: Session,
-    request: Request | None,
-    user: User | None,
+    request: Request,
+    user: User,
     *,
     action: str,
     resource_type: str,
-    resource_id: int | str | None,
+    resource_id: int | str,
     resource_name: str,
     summary: str,
-) -> None:
-    actor_id = getattr(user, "id", None)
-    actor_username = getattr(user, "username", None)
-    actor_role = getattr(user, "role", None)
-    client = getattr(request, "client", None) if request else None
-    db.add(
-        AuditLog(
-            actor_id=actor_id,
-            actor_username=actor_username
-            or (f"Usuário #{actor_id}" if actor_id else "Sistema"),
-            actor_role=actor_role or ("admin" if actor_id else "system"),
-            action=action,
-            resource_type=resource_type,
-            resource_id=str(resource_id or ""),
-            resource_name=resource_name[:255],
-            summary=summary[:500],
-            ip_address=(client.host if client else "")[:64],
-        )
+    notice: str,
+    redirect_to: str,
+    event: str | None = None,
+    **event_fields: Any,
+) -> RedirectResponse:
+    """Audit and commit a user action, log ``event`` and redirect with a notice."""
+    audit(
+        db,
+        request,
+        user,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        resource_name=resource_name,
+        summary=summary,
     )
+    db.commit()
+    if event:
+        log_event(
+            log,
+            logging.INFO,
+            event,
+            resource=f"{resource_type.replace('_', '-')}:{resource_id}",
+            status="success",
+            user_id=user.id,
+            **event_fields,
+        )
+    flash(request, notice)
+    return redirect(redirect_to)
 
 
 def badge_for(status: str) -> str:
@@ -245,27 +285,6 @@ def badge_for(status: str) -> str:
         "retrieving_update": "progress",
         "receiving": "progress",
     }.get(status, "off")
-
-
-def cursor_page_cursors(
-    db: Session,
-    filtered,
-    id_column,
-    pager: dict,
-) -> dict[int, int | None]:
-    """Return the keyset boundary required to open every visible page."""
-    cursors: dict[int, int | None] = {}
-    for target_page in pager["page_items"]:
-        if target_page in (None, 1, pager["page"], pager["pages"]):
-            continue
-        boundary_offset = ((target_page - 1) * pager["size"]) - 1
-        cursors[target_page] = db.scalar(
-            filtered.with_only_columns(id_column)
-            .order_by(id_column.desc())
-            .offset(boundary_offset)
-            .limit(1)
-        )
-    return cursors
 
 
 def normalize_username(value: str) -> str:

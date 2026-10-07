@@ -1,33 +1,19 @@
 {% extends "base.html" %}
+{% from "components/summary.html" import summary_item %}
+{% from "components/page.html" import empty_state, page_header %}
 {% from "icons.html" import icon %}
-{% from "components/forms.html" import csrf_input %}
+{% from "components/forms.html" import post_action %}
 {% block title %}Unidades · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack units-page">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Operação</p>
-      <h1>Unidades</h1>
-      <p class="page-header__description">Gerencie a API de pedidos, as conexões PACS e o recebimento de cada unidade.</p>
-    </div>
-    {% if summary.total %}<div class="page-header__actions">
-      <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>
-    </div>{% endif %}
-  </header>
+  {% call page_header("Operação", "Unidades", "Gerencie a API de pedidos, as conexões PACS e o recebimento de cada unidade.") %}
+    {% if summary.total %}<a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Nova unidade</a>{% endif %}
+  {% endcall %}
 
   <section class="units-summary summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das unidades">
-    <div class="summary-strip__item">
-      <span class="summary-strip__icon">{{ icon("building") }}</span>
-      <div class="summary-strip__copy"><strong>{{ summary.total }}</strong><span>unidade{% if summary.total != 1 %}s{% endif %} cadastrada{% if summary.total != 1 %}s{% endif %}</span></div>
-    </div>
-    <div class="summary-strip__item">
-      <span class="summary-strip__icon">{{ icon("check") }}</span>
-      <div class="summary-strip__copy"><strong>{{ summary.enabled }}</strong><span>unidade{% if summary.enabled != 1 %}s{% endif %} ativa{% if summary.enabled != 1 %}s{% endif %}</span></div>
-    </div>
-    <div class="summary-strip__item">
-      <span class="summary-strip__icon">{{ icon("pause") }}</span>
-      <div class="summary-strip__copy"><strong>{{ summary.paused }}</strong><span>unidade{% if summary.paused != 1 %}s{% endif %} pausada{% if summary.paused != 1 %}s{% endif %}</span></div>
-    </div>
+    {{ summary_item("building", summary.total, summary.total | plural("unidade cadastrada", "unidades cadastradas")) }}
+    {{ summary_item("check", summary.enabled, summary.enabled | plural("unidade ativa", "unidades ativas")) }}
+    {{ summary_item("pause", summary.paused, summary.paused | plural("unidade pausada", "unidades pausadas")) }}
   </section>
 
   <section class="surface units-table-card" aria-labelledby="units-title">
@@ -36,22 +22,23 @@
         <h2 id="units-title">Infraestrutura cadastrada</h2>
         <p>Configurações usadas para buscar, receber e processar os exames.</p>
       </div>
-      <span>{{ pager.total }} unidade{% if pager.total != 1 %}s{% endif %}</span>
+      <span>{{ pager.total }} {{ pager.total | plural("unidade", "unidades") }}</span>
     </div>
 
     {% if not units %}
-    <div class="empty-state">
-      <div class="empty-state__content">
-        <div class="empty-state__icon">{{ icon("building") }}</div>
-        <h2>Nenhuma unidade cadastrada</h2>
-        <p>O retrieve poderá começar assim que a primeira conexão PACS estiver configurada.</p>
-        <a class="btn btn--primary" href="/units/new">{{ icon("plus") }} Cadastrar unidade</a>
-      </div>
-    </div>
+    {{ empty_state(
+      "building",
+      "Nenhuma unidade cadastrada",
+      "O retrieve poderá começar assim que a primeira conexão PACS estiver configurada.",
+      action_href="/units/new",
+      action_label="Cadastrar unidade",
+      action_icon="plus",
+      action_primary=true,
+    ) }}
     {% else %}
     <div class="table-wrap">
       <table class="data-table units-table">
-        <caption class="visually-hidden">{{ pager.total }} unidade{% if pager.total != 1 %}s{% endif %} cadastrada{% if pager.total != 1 %}s{% endif %}</caption>
+        <caption class="visually-hidden">{{ pager.total }} {{ pager.total | plural("unidade cadastrada", "unidades cadastradas") }}</caption>
         <thead>
           <tr>
             <th scope="col">Unidade</th>
@@ -93,14 +80,9 @@
             <td>
               <div class="table-actions units-table__actions">
                 <a class="action-icon" href="/units/{{ u.id }}" data-tooltip="Editar unidade" aria-label="Editar unidade">{{ icon("edit") }}</a>
-                <form class="inline-form" method="post" action="/units/{{ u.id }}/toggle">
-        {{ csrf_input(request) }}
-                  <button class="action-icon" type="submit" data-tooltip="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}" aria-label="{% if u.enabled %}Pausar unidade{% else %}Ativar unidade{% endif %}">{{ icon("pause" if u.enabled else "play") }}</button>
-                </form>
-                <form class="inline-form" method="post" action="/units/{{ u.id }}/delete" data-confirm="Arquivar a unidade {{ u.name }}? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
-        {{ csrf_input(request) }}
-                  <button class="action-icon" type="submit" data-tooltip="Arquivar unidade" aria-label="Arquivar unidade">{{ icon("archive") }}</button>
-                </form>
+                {% set toggle_label = "Pausar unidade" if u.enabled else "Ativar unidade" %}
+                {{ post_action(request, "/units/" ~ u.id ~ "/toggle", "action-icon", toggle_label, icon_name="pause" if u.enabled else "play", tooltip=toggle_label, title="") }}
+                {{ post_action(request, "/units/" ~ u.id ~ "/delete", "action-icon", "Arquivar unidade", icon_name="archive", tooltip="Arquivar unidade", title="", confirm="Arquivar a unidade " ~ u.name ~ "? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados.", confirm_label="Arquivar unidade") }}
               </div>
             </td>
           </tr>

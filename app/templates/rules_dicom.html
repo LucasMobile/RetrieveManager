@@ -1,29 +1,25 @@
 {% extends "base.html" %}
+{% from "components/page.html" import empty_state, page_header %}
 {% from "components/summary.html" import summary_item %}
 {% from "icons.html" import icon %}
 {% from "components/forms.html" import csrf_input %}
 {% block title %}Regras DICOM · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack dicom-rules-page">
-  <header class="page-header">
-    <div class="page-header__copy">
-      <p class="eyebrow">Configurações</p>
-      <h1>Regras DICOM</h1>
-      <p class="page-header__description">Crie condições específicas por tag DICOM e escolha em quais unidades serão aplicadas antes da compactação.</p>
-    </div>
-    <div class="page-header__actions"><a class="btn btn--primary" href="#rule-editor">{{ icon("plus") }} Nova regra</a></div>
-  </header>
+  {% call page_header("Configurações", "Regras DICOM", "Crie condições específicas por tag DICOM e escolha em quais unidades serão aplicadas antes da compactação.") %}
+    <a class="btn btn--primary" href="#rule-editor">{{ icon("plus") }} Nova regra</a>
+  {% endcall %}
 
   <section class="summary-strip summary-strip--three summary-strip--surface" aria-label="Resumo das regras">
-    {{ summary_item("rules", summary.total, "regra cadastrada" if summary.total == 1 else "regras cadastradas") }}
-    {{ summary_item("check", summary.active, "regra ativa" if summary.active == 1 else "regras ativas", "success") }}
-    {{ summary_item("building", summary.units, "unidade coberta" if summary.units == 1 else "unidades cobertas") }}
+    {{ summary_item("rules", summary.total, summary.total | plural("regra cadastrada", "regras cadastradas")) }}
+    {{ summary_item("check", summary.active, summary.active | plural("regra ativa", "regras ativas"), "success") }}
+    {{ summary_item("building", summary.units, summary.units | plural("unidade coberta", "unidades cobertas")) }}
   </section>
 
   <section class="surface dicom-rules-list" aria-labelledby="rules-list-title">
     <header class="dicom-rules-list__header">
       <div><h2 id="rules-list-title">Regras cadastradas</h2><p>Valores menores de prioridade são processados primeiro.</p></div>
-      <span class="chip">{{ summary.active }} ativa{% if summary.active != 1 %}s{% endif %}</span>
+      <span class="chip">{{ summary.active }} {{ summary.active | plural("ativa", "ativas") }}</span>
     </header>
     {% if rules %}
     <div class="dicom-rule-cards">
@@ -42,7 +38,7 @@
             {% endfor %}
           </div>
           <div class="dicom-rule-card__action"><span>ENTÃO</span><strong>{{ rule.action_label }}</strong>{% if rule.action_tag %}<code>{{ rule.action_tag }}</code><small>{{ rule.action_tag_name }}{% if rule.action == 'replace' %} → “{{ rule.action_value }}”{% endif %}</small>{% endif %}</div>
-          <div class="dicom-rule-card__units">{{ icon("building") }} <span>{{ rule.unit_names|join(', ') if rule.unit_names else 'Nenhuma unidade selecionada' }} · {{ rule.application_count }} imagem{% if rule.application_count != 1 %}s{% endif %} correspondida{% if rule.application_count != 1 %}s{% endif %}</span></div>
+          <div class="dicom-rule-card__units">{{ icon("building") }} <span>{{ rule.unit_names|join(', ') if rule.unit_names else 'Nenhuma unidade selecionada' }} · {{ rule.application_count }} {{ rule.application_count | plural("imagem correspondida", "imagens correspondidas") }}</span></div>
         </div>
         <div class="dicom-rule-card__actions">
           <a class="action-icon" href="/rules?edit={{ rule.id }}#rule-editor" data-tooltip="Editar regra" aria-label="Editar {{ rule.name }}">{{ icon("edit") }}</a>
@@ -53,7 +49,7 @@
       {% endfor %}
     </div>
     {% else %}
-    <div class="empty-state"><div class="empty-state__content"><div class="empty-state__icon">{{ icon("rules") }}</div><h2>Nenhuma regra cadastrada</h2><p>Crie uma regra para avaliar tags dos próximos arquivos recebidos.</p></div></div>
+    {{ empty_state("rules", "Nenhuma regra cadastrada", "Crie uma regra para avaliar tags dos próximos arquivos recebidos.") }}
     {% endif %}
   </section>
 

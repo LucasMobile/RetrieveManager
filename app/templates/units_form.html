@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "icons.html" import icon %}
-{% from "components/forms.html" import csrf_input %}
+{% from "components/forms.html" import csrf_input, post_action %}
 {% block title %}{% if unit %}{{ unit.name }}{% else %}Nova unidade{% endif %} · Retrieve Manager{% endblock %}
 {% block body %}
 <div class="page-stack unit-form-page">
@@ -188,12 +188,14 @@
               <div class="field">
                 <label for="store-port">Porta do Store SCP</label>
                 <input id="store-port" class="mono" name="store_port" type="number" min="1" max="65535" value="{{ unit.store_port if unit else 444 }}" required>
-                <span class="field__hint">Use uma porta publicada pelo container e liberada no host.</span>
+                <span class="field__hint">Use uma porta publicada pelo container e liberada no host. Várias unidades podem usar a mesma porta e AET; o AE Title do remetente decide a unidade.</span>
+                {% if store_shared_with %}<span class="field__hint">Porta e AET compartilhados com: {{ store_shared_with | join(", ") }}.</span>{% endif %}
+                {% if store_route_problem %}<span class="field__hint" role="alert"><strong class="text-danger">Recebimento bloqueado: {{ store_route_problem }}</strong></span>{% endif %}
               </div>
               <div class="field">
                 <label for="store-allowed-aets">AE Titles autorizados a enviar</label>
                 <input id="store-allowed-aets" class="mono" name="store_allowed_aets" maxlength="600" value="{{ unit.store_allowed_aets if unit else '' }}" placeholder="Todos" autocapitalize="characters" spellcheck="false">
-                <span class="field__hint">Opcional. Separe por vírgula; normalmente o AET do PACS. Vazio aceita qualquer remetente. Objetos de outros AEs vão para a pasta de erro, sem criar pedido nem subir para a nuvem.</span>
+                <span class="field__hint">Separe por vírgula; normalmente o AET do PACS. Vazio aceita qualquer remetente. Obrigatório quando outra unidade usa a mesma porta e AET: define quais remetentes vêm para esta unidade. Associações de outros AEs são recusadas antes de receber qualquer imagem.</span>
               </div>
               <div class="field">
                 <label for="store-allowed-ips">IPs autorizados a enviar</label>
@@ -211,7 +213,7 @@
               <div class="field field--full">
                 <label for="error-dir">Arquivos com erro</label>
                 <input id="error-dir" class="mono" name="error_dir" value="{{ unit.error_dir if unit else '' }}" spellcheck="false" required>
-                <span class="field__hint">Use caminhos absolutos acessíveis dentro do container.</span>
+                <span class="field__hint">Use caminhos absolutos acessíveis dentro do container. Nenhuma pasta pode ser igual a uma pasta de outra unidade nem ficar dentro dela.</span>
               </div>
             </div>
           </div>
@@ -300,7 +302,7 @@
               </div>
             </div>
             <footer class="compression-dialog__footer">
-              <span><strong data-dialog-count="{{ profile }}">{{ compression_settings.profiles[profile] | length }}</strong> selecionada(s)</span>
+              <span><strong data-dialog-count="{{ profile }}">{{ compression_settings.profiles[profile] | length }}</strong> <span data-dialog-count-word="{{ profile }}">{{ compression_settings.profiles[profile] | length | plural("selecionada", "selecionadas") }}</span></span>
               <button class="btn btn--primary" type="button" data-compression-close>{{ icon('check') }} Concluir</button>
             </footer>
           </dialog>
@@ -335,9 +337,9 @@
             <div class="form-grid form-grid--3">
               <div class="field"><label for="move-timeout-first">Timeout do 1º C-MOVE</label><input id="move-timeout-first" name="move_timeout_first" type="number" min="10" max="7200" value="{{ unit.move_timeout_first if unit else 600 }}"><span class="field__hint">Em segundos.</span></div>
               <div class="field"><label for="move-timeout-update">Timeout do C-MOVE de novas imagens</label><input id="move-timeout-update" name="move_timeout_update" type="number" min="10" max="7200" value="{{ unit.move_timeout_update if unit else 900 }}"><span class="field__hint">Em segundos. Usado durante o monitoramento.</span></div>
-              <div class="field"><label for="parallel-moves">C-MOVEs paralelos</label><input id="parallel-moves" name="max_parallel_moves" type="number" min="1" max="16" value="{{ unit.max_parallel_moves if unit else 1 }}"></div>
+              <div class="field"><label for="parallel-moves">C-MOVEs paralelos</label><input id="parallel-moves" name="max_parallel_moves" type="number" min="1" max="16" value="{{ unit.max_parallel_moves if unit else 1 }}"><span class="field__hint">Total aceito pelo PACS. Monitoramento e histórico nunca usam a última vaga, e cada um fica com no máximo metade.</span></div>
               <div class="field"><label for="find-interval">Intervalo de busca</label><input id="find-interval" name="find_interval_seconds" type="number" min="5" max="3600" value="{{ unit.find_interval_seconds if unit else 30 }}"><span class="field__hint">Em segundos.</span></div>
-              <div class="field"><label for="compact-workers">Workers de compactação</label><input id="compact-workers" name="compact_workers" type="number" min="1" max="32" value="{{ unit.compact_workers if unit else 8 }}"></div>
+              <div class="field"><label for="compact-workers">Workers de compactação</label><input id="compact-workers" name="compact_workers" type="number" min="1" max="32" value="{{ unit.compact_workers if unit else compact_global_workers }}"><span class="field__hint">Teto desta unidade. O servidor compacta {{ compact_global_workers }} {{ compact_global_workers | plural("arquivo", "arquivos") }} por vez ao todo, divididos entre as unidades com fila.</span></div>
               <div class="field"><label for="send-workers">Workers de envio</label><input id="send-workers" name="send_workers" type="number" min="1" max="64" value="{{ unit.send_workers if unit else 16 }}"></div>
             </div>
           </div>
@@ -359,18 +361,9 @@
           <p>Ações administrativas que afetam o fluxo ou os dados desta unidade.</p>
         </div>
         <div class="button-group">
-          <form class="inline-form" method="post" action="/units/{{ unit.id }}/retry-errors">
-        {{ csrf_input(request) }}
-            <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reprocessar erros</button>
-          </form>
-          <form class="inline-form" method="post" action="/units/{{ unit.id }}/resend-failed" data-confirm="Reenviar todas as imagens desta unidade que esgotaram as tentativas de envio?" data-confirm-label="Reenviar">
-        {{ csrf_input(request) }}
-            <button class="btn btn--secondary" type="submit">{{ icon("retry") }} Reenviar falhas de envio</button>
-          </form>
-          <form class="inline-form" method="post" action="/units/{{ unit.id }}/delete" data-confirm="Arquivar esta unidade? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados." data-confirm-label="Arquivar unidade">
-        {{ csrf_input(request) }}
-            <button class="btn btn--secondary" type="submit">{{ icon("archive") }} Arquivar unidade</button>
-          </form>
+          {{ post_action(request, "/units/" ~ unit.id ~ "/retry-errors", "btn btn--secondary", "", icon_name="retry", text="Reprocessar erros") }}
+          {{ post_action(request, "/units/" ~ unit.id ~ "/resend-failed", "btn btn--secondary", "", icon_name="retry", text="Reenviar falhas de envio", confirm="Reenviar todas as imagens desta unidade que esgotaram as tentativas de envio?", confirm_label="Reenviar") }}
+          {{ post_action(request, "/units/" ~ unit.id ~ "/delete", "btn btn--secondary", "", icon_name="archive", text="Arquivar unidade", confirm="Arquivar esta unidade? Ela será desativada e seus pedidos irão para o histórico, sem perda de dados.", confirm_label="Arquivar unidade") }}
         </div>
       </section>
       {% endif %}
