@@ -576,6 +576,60 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertEqual(order.prior_status, "queued")
             self.assertIsNotNone(order.prior_due_at)
 
+    def test_second_study_with_same_accession_complements_the_order(self):
+        with self.Session() as db:
+            unit = make_unit(name="unit")
+            db.add(unit)
+            db.flush()
+            self._add_retrieve_rules(db)
+            order = Order(
+                unit_id=unit.id,
+                source_id="api-order",
+                acc="ACC-SPLIT",
+                pat_id="123456",
+                birth_date="19800102",
+                status="done",
+                study_uid="1.2.first",
+                modality="CT",
+                api_read_status="confirmed",
+            )
+            db.add(order)
+            db.commit()
+
+            for index in range(2):
+                _record_compact_result(
+                    db,
+                    unit,
+                    CompactResult(
+                        f"recon-{index}",
+                        f"recon-{index}.dcm",
+                        "1.2.reconstruction",
+                        "compressed",
+                        patient_id="123456",
+                        birth_date="19800102",
+                        study_date="20260915",
+                        accession="ACC-SPLIT",
+                        modality="CT",
+                        observed_at=datetime.now(),
+                    ),
+                )
+                db.commit()
+
+            self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+            db.refresh(order)
+            self.assertEqual(order.study_uid, "1.2.first")
+            self.assertEqual(order.status, "done")
+            transfers = list(db.scalars(select(ImageTransfer)))
+            self.assertEqual({t.status for t in transfers}, {"publishing"})
+            self.assertEqual({t.order_id for t in transfers}, {order.id})
+            complement_events = [
+                event.message
+                for event in order.events
+                if event.message.startswith("Estudo complementar")
+            ]
+            self.assertEqual(len(complement_events), 1)
+            self.assertIn("1.2.reconstruction", complement_events[0])
+
     def test_archived_order_is_reused_and_restored_by_study_uid(self):
         with self.Session() as db:
             unit = make_unit(name="unit")
@@ -662,45 +716,6 @@ class TransferTrackingTest(DatabaseTestCase):
             self.assertIn("PatientID", transfer.last_error)
             self.assertFalse(path.exists())
             self.assertTrue((Path(error_dir) / "invalid.dcm").exists())
-
-    def test_accession_for_another_study_is_rejected(self):
-        with self.Session() as db:
-            unit = make_unit(name="unit")
-            db.add(unit)
-            db.flush()
-            order = Order(
-                unit_id=unit.id,
-                source_id="existing",
-                acc="ACC-CONFLICT",
-                pat_id="123456",
-                birth_date="19800102",
-                status="done",
-                study_uid="1.2.existing",
-            )
-            db.add(order)
-            db.commit()
-
-            _record_compact_result(
-                db,
-                unit,
-                CompactResult(
-                    "image",
-                    "image.dcm",
-                    "1.2.different",
-                    "compressed",
-                    patient_id="123456",
-                    birth_date="19800102",
-                    accession="ACC-CONFLICT",
-                    modality="CT",
-                    observed_at=datetime.now(),
-                ),
-            )
-            db.commit()
-
-            self.assertEqual(len(list(db.scalars(select(Order)))), 1)
-            transfer = db.scalar(select(ImageTransfer))
-            self.assertEqual(transfer.status, "metadata_error")
-            self.assertIsNone(transfer.order_id)
 
     def test_applied_dicom_rule_is_audited_on_transfer(self):
         with self.Session() as db:

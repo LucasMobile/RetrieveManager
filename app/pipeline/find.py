@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from time import perf_counter
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -51,6 +51,34 @@ from app.pipeline.monitor import reset_monitoring
 from app.rules import prior_skip_reason, schedule_from_now
 from app.wording import counted
 
+# Orders the PACS has not answered yet are searched less often as they age:
+# the unit's interval for the first minutes, then twice and four times it, so
+# hours of pending orders do not take the C-FIND slots from the fresh ones.
+# The longer waits never exceed FIND_BACKOFF_MAX_WAIT (or the interval itself).
+FIND_BACKOFF_STEPS = (
+    (timedelta(minutes=15), 1),
+    (timedelta(hours=1), 2),
+)
+FIND_BACKOFF_FACTOR = 4
+FIND_BACKOFF_MAX_WAIT = timedelta(minutes=5)
+
+
+def find_due(now: datetime, interval: timedelta):
+    """SQL condition: a watching order is due for its next C-FIND."""
+    cap = max(interval, FIND_BACKOFF_MAX_WAIT)
+    conditions = [Order.last_find_at.is_(None)]
+    for age, factor in FIND_BACKOFF_STEPS:
+        conditions.append(
+            and_(
+                Order.created_at > now - age,
+                Order.last_find_at <= now - min(interval * factor, cap),
+            )
+        )
+    conditions.append(
+        Order.last_find_at <= now - min(interval * FIND_BACKOFF_FACTOR, cap)
+    )
+    return or_(*conditions)
+
 
 def find_pending(db: Session, unit: Unit, max_orders: int | None = None) -> int:
     now = datetime.now()
@@ -69,10 +97,7 @@ def find_pending(db: Session, unit: Unit, max_orders: int | None = None) -> int:
                     Order.heartbeat_at.is_(None),
                     Order.heartbeat_at <= in_flight_cutoff,
                 ),
-                or_(
-                    Order.last_find_at.is_(None),
-                    Order.last_find_at <= now - interval,
-                ),
+                find_due(now, interval),
             )
             # PostgreSQL puts NULL last in ascending order by default. Without
             # this, repeatedly due orders can starve orders never searched.
@@ -181,6 +206,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 f"C-FIND falhou ({found.error}); consulta será repetida",
                 found.summary,
                 "warn",
+                kind="find_failed",
             )
             db.commit()
             log_event(
@@ -235,6 +261,15 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                     mismatched_fields=mismatched_fields,
                 )
                 return
+            if _find_patient_id_diverges(unit, order, responses, study_uids[0]):
+                add_event(
+                    db,
+                    order,
+                    "PatientID no PACS difere do pedido; estudo aceito por "
+                    "Accession e data de nascimento",
+                    diagnostic,
+                    "warn",
+                )
         response = next(
             (item for item in responses if item.study_uid), StudyFindResponse()
         )
@@ -250,6 +285,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 order,
                 "C-FIND sem StudyInstanceUID (exame ainda não no PACS)",
                 diagnostic,
+                kind="find_not_found",
             )
             db.commit()
             log_event(
@@ -293,6 +329,7 @@ def _find_one(db: Session, unit: Unit, order: Order, now: datetime) -> None:
                 order,
                 "C-FIND sem modalidade clínica válida; consulta será repetida",
                 safe_output,
+                kind="find_no_modality",
             )
             db.commit()
             log_event(
@@ -382,8 +419,9 @@ def _find_identity_conflict(
 ) -> tuple[str, list[str]]:
     """Refuse ambiguous or foreign C-FIND matches before any C-MOVE.
 
-    Accession + birth date are only matching keys; a PACS may ignore one of
-    them or reuse an accession. Every returned identifier must confirm the order.
+    Accession + birth date are the order's identity: a PACS may ignore one of
+    them as a matching key, so the returned values must confirm both. PatientID
+    is not checked here because units type it by hand when the worklist is down.
     """
     if len(study_uids) > 1:
         return (
@@ -396,14 +434,6 @@ def _find_identity_conflict(
         if response.study_uid != study_uids[0]:
             continue
         checks = (
-            (
-                "PatientID",
-                patient_id_matches(
-                    response.patient_id,
-                    order.pat_id,
-                    allow_suffix=unit.pacs_patient_id_wildcard,
-                ),
-            ),
             ("PatientBirthDate", response.birth_date.strip() == order.birth_date),
             ("AccessionNumber", response.accession.strip() == order.acc.strip()),
         )
@@ -417,6 +447,21 @@ def _find_identity_conflict(
             mismatched,
         )
     return "", []
+
+
+def _find_patient_id_diverges(
+    unit: Unit, order: Order, responses: tuple[StudyFindResponse, ...], study_uid: str
+) -> bool:
+    """True when the PACS names the study under another PatientID."""
+    return any(
+        not patient_id_matches(
+            response.patient_id,
+            order.pat_id,
+            allow_suffix=unit.pacs_patient_id_wildcard,
+        )
+        for response in responses
+        if response.study_uid == study_uid
+    )
 
 
 def prior_identity_matches(unit: Unit, order: Order, result: PriorSeriesResult) -> bool:

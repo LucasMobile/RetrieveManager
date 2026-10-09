@@ -12,7 +12,7 @@ from app.models import ImageTransfer, ManualMoveRequest, Order, Unit
 from app.orders_api import AckResult
 from app.pipeline.move import Arrival, _run_manual_move
 from app.pipeline.orders import acknowledge_pending_orders, recover_stale_locks
-from app.pipeline.send import SendResult, send_unit
+from app.pipeline.send import SendResult, close_upload_runtimes, send_unit
 from tests.support import DatabaseTestCase, make_unit
 
 
@@ -108,6 +108,11 @@ class NetworkTransactionTest(DatabaseTestCase):
 
 
 class ProgressiveUploadTest(DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        # send_unit keeps this thread's HTTP session between drains.
+        self.addCleanup(close_upload_runtimes)
+
     def make_transfers(self, db, directory):
         unit = make_unit(send_dir=directory, send_workers=2)
         db.add(unit)

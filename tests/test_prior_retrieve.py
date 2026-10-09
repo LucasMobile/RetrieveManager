@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ from pydicom.dataset import Dataset
 from sqlalchemy import func, select
 from sqlalchemy.exc import DataError
 
+from app.config import PRIOR_MOVE_IDLE_TIMEOUT_SECONDS
 from app.dicom_net import FindResult, MoveResult
 from app.models import (
     HistoricalSeries,
@@ -492,7 +494,6 @@ class PriorRetrieveTest(DatabaseTestCase):
 
     def test_find_blocks_study_whose_returned_identity_differs_from_order(self):
         cases = {
-            "PatientID": {"PatientID": "99999999"},
             "PatientBirthDate": {"PatientBirthDate": "19700101"},
             "AccessionNumber": {"AccessionNumber": "other-accession"},
         }
@@ -511,37 +512,40 @@ class PriorRetrieveTest(DatabaseTestCase):
                 schedule.assert_not_called()
                 self.assertEqual(order.status, "error")
                 self.assertIn(field, order.last_error)
-                self.assertNotIn("99999999", order.last_error)
+                self.assertNotIn("19700101", order.last_error)
 
-    def test_find_rejects_missing_patient_id_in_pacs_response(self):
-        with self.Session() as db:
-            unit, order = self._watching_order(db)
-            output = study_find_output(
-                {
-                    "StudyInstanceUID": "1.2.3.current",
-                    "ModalitiesInStudy": "MR",
-                    "PatientID": None,
-                }
-            )
-            self._run_find(db, unit, order, output)
-            self.assertEqual(order.status, "error")
-            self.assertIn("PatientID", order.last_error)
+    def test_find_accepts_divergent_patient_id_with_warning(self):
+        # Units type PatientID by hand when the worklist is down; accession +
+        # birth date identify the study.
+        for patient_id in ("0004555934", None):
+            with self.subTest(patient_id=patient_id), self.Session() as db:
+                unit, order = self._watching_order(db, pacs_patient_id_wildcard=True)
+                output = study_find_output(
+                    {
+                        "StudyInstanceUID": "1.2.3.current",
+                        "ModalitiesInStudy": "MR",
+                        "PatientID": patient_id,
+                    }
+                )
+                self._run_find(db, unit, order, output)
+                self.assertEqual(order.status, "wait_retrieve")
+                self.assertEqual(order.study_uid, "1.2.3.current")
+                warnings = [e.message for e in order.events if e.level == "warn"]
+                self.assertTrue(any("PatientID no PACS difere" in m for m in warnings))
 
-    def test_find_patient_id_suffix_requires_unit_opt_in(self):
+    def test_find_matching_patient_id_adds_no_warning(self):
         suffixed = {
             "StudyInstanceUID": "1.2.3.current",
             "ModalitiesInStudy": "MR",
             "PatientID": "30211738-1",
         }
         with self.Session() as db:
-            unit, order = self._watching_order(db)
-            self._run_find(db, unit, order, study_find_output(suffixed))
-            self.assertEqual(order.status, "error")
-        with self.Session() as db:
             unit, order = self._watching_order(db, pacs_patient_id_wildcard=True)
             self._run_find(db, unit, order, study_find_output(suffixed))
             self.assertEqual(order.status, "wait_retrieve")
-            self.assertEqual(order.study_uid, "1.2.3.current")
+            self.assertFalse(
+                any("PatientID no PACS difere" in e.message for e in order.events)
+            )
 
     def test_prior_find_is_exact_and_ignores_series_from_other_patients(self):
         with self.Session() as db:
@@ -590,6 +594,10 @@ class PriorRetrieveTest(DatabaseTestCase):
             self.assertFalse(find.call_args.kwargs["patient_id_wildcard"])
             move.assert_called_once()
             self.assertEqual(move.call_args.args[2], "1.2.own.series")
+            # Old studies get the longer historical stall limit.
+            self.assertEqual(
+                move.call_args.kwargs["idle_timeout"], PRIOR_MOVE_IDLE_TIMEOUT_SECONDS
+            )
             self.assertEqual(
                 list(db.scalars(select(HistoricalStudy.study_uid))), ["1.2.own"]
             )
@@ -933,6 +941,71 @@ class PriorRetrieveTest(DatabaseTestCase):
                 )
             )
             self.assertEqual(len(completed_series), 2)
+
+    def test_prior_series_share_an_association_and_one_check_per_study(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.flush()
+            order = self._order(unit.id, prior_status="retrieving")
+            db.add(order)
+            db.commit()
+            output = find_result(
+                *(
+                    {
+                        "PatientID": "30211738",
+                        "PatientBirthDate": "19691027",
+                        "StudyDate": "20250110",
+                        "Modality": "MR",
+                        "StudyInstanceUID": study,
+                        "SeriesInstanceUID": f"{study}.series.{number}",
+                    }
+                    for study, number in (
+                        ("1.2.lost", 1),
+                        ("1.2.old", 1),
+                        ("1.2.lost", 2),
+                        ("1.2.old", 2),
+                    )
+                )
+            )
+            checked = []
+
+            def arrival(_db, _unit, study_uid, moved, _started):
+                checked.append((study_uid, moved.completed))
+                if study_uid == "1.2.lost":
+                    return Arrival(replace(moved, ok=False, error="nada chegou"), 0)
+                return Arrival(moved, moved.completed)
+
+            with (
+                patch("app.pipeline.move.find_prior_series", return_value=output),
+                patch("app.pipeline.move.move_series", return_value=MOVE_OK) as move,
+                patch("app.pipeline.move._confirm_arrival", side_effect=arrival),
+            ):
+                _run_prior_move(db, unit, order)
+
+            sessions = {id(call.kwargs["session"]) for call in move.call_args_list}
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(
+                [call.args[1] for call in move.call_args_list],
+                ["1.2.lost", "1.2.lost", "1.2.old", "1.2.old"],
+            )
+            # One check per study, covering both of its series.
+            self.assertEqual(checked, [("1.2.lost", 2), ("1.2.old", 2)])
+            statuses = dict(
+                db.execute(
+                    select(HistoricalSeries.series_uid, HistoricalSeries.status)
+                ).all()
+            )
+            self.assertEqual(
+                statuses,
+                {
+                    "1.2.lost.series.1": "error",
+                    "1.2.lost.series.2": "error",
+                    "1.2.old.series.1": "done",
+                    "1.2.old.series.2": "done",
+                },
+            )
+            self.assertEqual(order.prior_status, "retry_wait")
 
     def test_prior_retry_skips_series_already_completed(self):
         with self.Session() as db:

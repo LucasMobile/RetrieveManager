@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Generator
-from time import perf_counter, sleep
+from threading import Lock
+from time import monotonic, perf_counter, sleep
 from typing import Any
 
 from sqlalchemy import (
@@ -8,6 +9,7 @@ from sqlalchemy import (
     Connection,
     Engine,
     create_engine,
+    event,
     func,
     select,
     text,
@@ -43,6 +45,47 @@ engine = create_engine(
     pool_timeout=DB_POOL_TIMEOUT_SECONDS,
 )
 
+# A saturated pool is logged at most this often per process.
+POOL_SATURATION_LOG_SECONDS = 60
+
+
+def watch_pool_saturation(bind: Engine, capacity: int) -> None:
+    """Log ``db.pool.saturated`` when every pooled connection is in use.
+
+    From then on any other thread waits for a connection (up to
+    DB_POOL_TIMEOUT_SECONDS). The warning says when DB_POOL_SIZE and
+    DB_MAX_OVERFLOW are too small for a service, with how often it happened.
+    """
+    lock = Lock()
+    state = {"logged_at": float("-inf"), "count": 0}
+
+    def on_checkout(_dbapi_connection, _record, _proxy) -> None:
+        checked_out = bind.pool.checkedout()  # type: ignore[attr-defined]
+        if checked_out < capacity:
+            return
+        with lock:
+            state["count"] += 1
+            now = monotonic()
+            if now - state["logged_at"] < POOL_SATURATION_LOG_SECONDS:
+                return
+            occurrences, state["count"] = state["count"], 0
+            state["logged_at"] = now
+        log_event(
+            log,
+            logging.WARNING,
+            "db.pool.saturated",
+            resource="db.pool",
+            status="saturated",
+            checked_out=checked_out,
+            capacity=capacity,
+            occurrences=occurrences,
+        )
+
+    event.listen(bind, "checkout", on_checkout)
+
+
+watch_pool_saturation(engine, DB_POOL_SIZE + DB_MAX_OVERFLOW)
+
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -63,6 +106,9 @@ def count_rows(db: Session, model: Any, *where: ColumnElement[bool]) -> int:
 # NOTIFY channel raised by any change to the units table; the receiver
 # listens on it to apply routing changes without waiting for its next poll.
 UNITS_CHANGED_CHANNEL = "units_changed"
+# NOTIFY channel raised by the receiver when it commits instances to compact,
+# with the unit id as payload; the worker starts that unit's compaction at once.
+INSTANCES_RECEIVED_CHANNEL = "instances_received"
 
 
 def init_db() -> None:
@@ -110,6 +156,14 @@ POSTGRESQL_INDEXES: tuple[tuple[str, str], ...] = (
         "ix_dicom_instance_received_partial",
         "dicom_instances (unit_id, id) WHERE state = 'received'",
     ),
+    # Recovery of stale claims and the pending-instances page read only the
+    # states still open; the finished ones (nearly every row) stay out, so
+    # finishing an instance does not insert into this index.
+    (
+        "ix_dicom_instance_open_state_partial",
+        "dicom_instances (unit_id, state, id) "
+        "WHERE state IN ('received', 'compacting', 'error', 'missing', 'conflict')",
+    ),
     # Adoption only looks up the files of instances still being processed.
     (
         "ix_dicom_instance_active_path_partial",
@@ -128,6 +182,13 @@ POSTGRESQL_INDEXES: tuple[tuple[str, str], ...] = (
         "ix_transfer_pending_unit_id_partial",
         "image_transfers (unit_id, id) WHERE status IN ('compressed', 'upload_error')",
     ),
+    # Exhausted uploads (probe and resend) and publications to recover; an
+    # uploaded transfer, nearly every row, stays out.
+    (
+        "ix_transfer_attention_partial",
+        "image_transfers (unit_id, status, id) "
+        "WHERE status IN ('publishing', 'send_error')",
+    ),
 )
 
 # Indexes of earlier versions that no query uses, or that another index covers
@@ -138,6 +199,11 @@ OBSOLETE_POSTGRESQL_INDEXES: tuple[str, ...] = (
     "ix_dicom_instance_unit_sop",
     # Replaced by ix_dicom_instance_active_path_partial.
     "ix_dicom_instance_unit_path",
+    # Replaced by ix_dicom_instance_open_state_partial.
+    "ix_dicom_instance_unit_state_id",
+    # Replaced by ix_transfer_pending_unit_id_partial and
+    # ix_transfer_attention_partial.
+    "ix_transfer_unit_status_retry",
     # correlation_id is written for the logs, never searched.
     "ix_orders_correlation_id",
     "ix_image_transfers_correlation_id",
@@ -179,6 +245,15 @@ BIGINT_COLUMNS: dict[str, tuple[str, ...]] = {
     "dicom_rule_applications": ("id", "transfer_id"),
 }
 
+# Columns added to existing tables after their creation, as
+# (table, column, definition). A constant default makes ADD COLUMN a catalog
+# change only: the table is not rewritten.
+ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("order_events", "kind", "varchar(32) NOT NULL DEFAULT ''"),
+    ("order_events", "repeat_count", "integer NOT NULL DEFAULT 1"),
+    ("order_events", "last_seen_at", "timestamp without time zone"),
+)
+
 # How long a column type change waits for its exclusive table lock before the
 # service gives up (and is restarted), instead of queueing every other query on
 # the table behind it. Concurrent index builds block no one and wait freely.
@@ -204,6 +279,7 @@ def ensure_postgresql_schema(bind: Engine) -> None:
             sleep(0.5)
         try:
             _widen_ids(connection)
+            _add_columns(connection)
             _ensure_indexes(connection)
             _ensure_autovacuum(connection)
         finally:
@@ -211,6 +287,39 @@ def ensure_postgresql_schema(bind: Engine) -> None:
                 text("SELECT pg_advisory_unlock(:key)"),
                 {"key": _SCHEMA_MAINTENANCE_LOCK},
             )
+
+
+def _add_columns(connection: Connection) -> None:
+    """Add the columns of ADDED_COLUMNS that an older database lacks."""
+    for table, column, definition in ADDED_COLUMNS:
+        exists = connection.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = :table "
+                "AND column_name = :column"
+            ),
+            {"table": table, "column": column},
+        )
+        if exists:
+            continue
+        connection.execute(text(f"SET lock_timeout = '{SCHEMA_LOCK_TIMEOUT}'"))
+        try:
+            connection.execute(
+                text(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} "
+                    f"{definition}"
+                )
+            )
+        finally:
+            connection.execute(text("RESET lock_timeout"))
+        log_event(
+            log,
+            logging.INFO,
+            "db.schema.column",
+            resource=f"table:{table}",
+            status="success",
+            column=column,
+        )
 
 
 def _widen_ids(connection: Connection) -> None:

@@ -6,10 +6,13 @@ import asyncio
 import logging
 import random
 import stat
-from dataclasses import dataclass
+import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
 from time import monotonic, perf_counter
 
 import aiohttp
@@ -121,7 +124,7 @@ def _due_send_transfers(
 
 
 def _next_send_jobs(
-    db: Session, unit: Unit, after_id: int, limit: int
+    db: Session, unit: Unit | DeliveryRoute, after_id: int, limit: int
 ) -> tuple[list[tuple[int, Path, str]], int, bool, int]:
     """Take the next due transfers after `after_id`.
 
@@ -193,11 +196,75 @@ def send_unit(db: Session, unit: Unit, cloud_url: str) -> bool:
             directory=str(origin),
         )
         return False
-    return asyncio.run(_stream_uploads(db, unit, cloud_url, circuit))
+    runtime = _upload_runtime()
+    return runtime.runner.run(_stream_uploads(db, unit, cloud_url, circuit, runtime))
+
+
+@dataclass
+class UploadRuntime:
+    """The event loop and HTTP session of one sending thread, kept between drains.
+
+    A unit's backlog is sent in drains of SEND_DRAIN_SECONDS; reusing the loop
+    and its session keeps the connections to the cloud open from one drain to
+    the next, instead of a new TCP and TLS handshake for each of them.
+    """
+
+    runner: asyncio.Runner = field(default_factory=asyncio.Runner)
+    session: aiohttp.ClientSession | None = None
+    closed: bool = False
+
+
+_upload_local = threading.local()
+
+
+_upload_runtimes: list[UploadRuntime] = []
+
+
+_upload_runtimes_lock = Lock()
+
+
+def _upload_runtime() -> UploadRuntime:
+    runtime = getattr(_upload_local, "runtime", None)
+    if runtime is None or runtime.closed:
+        runtime = UploadRuntime()
+        _upload_local.runtime = runtime
+        with _upload_runtimes_lock:
+            _upload_runtimes.append(runtime)
+    return runtime
+
+
+@asynccontextmanager
+async def _kept_session(
+    runtime: UploadRuntime | None,
+) -> AsyncIterator[aiohttp.ClientSession]:
+    """The runtime's session, left open; without a runtime, a one-off session."""
+    if runtime is None:
+        async with _upload_session() as session:
+            yield session
+        return
+    if runtime.session is None or runtime.session.closed:
+        runtime.session = _upload_session()
+    yield runtime.session
+
+
+def close_upload_runtimes() -> None:
+    """Close every kept session and loop, once the sending threads are idle."""
+    with _upload_runtimes_lock:
+        runtimes = list(_upload_runtimes)
+        _upload_runtimes.clear()
+    for runtime in runtimes:
+        runtime.closed = True
+        if runtime.session is not None and not runtime.session.closed:
+            runtime.runner.run(runtime.session.close())
+        runtime.runner.close()
 
 
 async def _stream_uploads(
-    db: Session, unit: Unit, cloud_url: str, circuit: CircuitState
+    db: Session,
+    unit: Unit,
+    cloud_url: str,
+    circuit: CircuitState,
+    runtime: UploadRuntime | None = None,
 ) -> bool:
     """Keep the unit's upload slots busy, refilling from the FIFO queue.
 
@@ -222,6 +289,12 @@ async def _stream_uploads(
     buffer: list[SendResult] = []
     buffered_at = monotonic()
 
+    def read_queue(after_id: int, limit: int):
+        # In a thread, so the uploads keep flowing during the read; with its own
+        # Session, as persist_results below.
+        with Session(bind=bind, expire_on_commit=False) as queue_db:
+            return _next_send_jobs(queue_db, delivery_route, after_id, limit)
+
     def persist_results(results: list[SendResult]) -> tuple[int, int]:
         # Runs in a writer thread. Never pass the caller's Session
         # or ORM instances across threads; keep HTTP's event loop responsive.
@@ -241,7 +314,7 @@ async def _stream_uploads(
             totals["failure"] += failures
             totals["success"] += successes
 
-    async with _upload_session() as session:
+    async with _kept_session(runtime) as session:
         await _probe_send_errors(db, unit, cloud_url, session)
         try:
             while True:
@@ -251,8 +324,8 @@ async def _stream_uploads(
                     and (cursor == 0 or monotonic() < deadline)
                     and not _circuit_open(circuit)
                 ):
-                    jobs, cursor, exhausted, missing = _next_send_jobs(
-                        db, unit, cursor, 2 * workers - len(pending)
+                    jobs, cursor, exhausted, missing = await asyncio.to_thread(
+                        read_queue, cursor, 2 * workers - len(pending)
                     )
                     totals["missing"] += missing
                     if not jobs and not pending:

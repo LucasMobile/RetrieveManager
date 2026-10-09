@@ -1,17 +1,20 @@
 import asyncio
 import hashlib
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from aiohttp import web
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.compaction import CompactResult
-from app.models import DicomInstance, DicomStudy, ImageTransfer
+from app.models import DicomInstance, DicomStudy, ImageTransfer, Unit
 from app.pipeline.compact import _publish_outputs, _recover_publishing_transfers
 from app.pipeline.send import (
     CircuitState,
@@ -20,9 +23,12 @@ from app.pipeline.send import (
     _cloud_circuits,
     _record_send_results,
     _send_error_probes,
+    _upload_runtime,
+    close_upload_runtimes,
     resend_failed_transfers,
     send_unit,
 )
+from app.wakeup import SEND, Wakeups
 from app.worker import _send_job, stop_event
 from tests.support import DatabaseTestCase, make_unit
 
@@ -33,11 +39,12 @@ def ok(transfer_id, correlation_id):
     return SendResult(transfer_id, correlation_id, True, http_status=200)
 
 
-class SendQueueTest(DatabaseTestCase):
+class SendQueueFixture(DatabaseTestCase):
     def setUp(self):
         super().setUp()
         _cloud_circuits.clear()
         _send_error_probes.clear()
+        self.addCleanup(close_upload_runtimes)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.send_dir = Path(temporary.name)
@@ -69,6 +76,8 @@ class SendQueueTest(DatabaseTestCase):
         db.expire_all()
         return list(db.scalars(select(ImageTransfer.status).order_by(ImageTransfer.id)))
 
+
+class SendQueueTest(SendQueueFixture):
     def test_uploads_start_in_fifo_order_without_open_transaction(self):
         with self.Session() as db:
             unit = self.make_queue(db, 5)
@@ -380,12 +389,15 @@ class PublishTest(DatabaseTestCase):
                 source_path=str(source),
                 temp_output=str(temp),
             )
-            _publish_outputs(
-                db, self.unit, [result], [(result, transfer.id, "publishing")]
-            )
+            with patch("app.pipeline.compact.wakeups", Wakeups()) as wakeups:
+                _publish_outputs(
+                    db, self.unit, [result], [(result, transfer.id, "publishing")]
+                )
 
             db.refresh(transfer)
             self.assertEqual(transfer.status, "compressed")
+            # The upload of the unit starts without waiting for the next tick.
+            self.assertEqual(wakeups.take(), {SEND: {self.unit.id}})
             self.assertEqual((self.send / "CT.1.dcm").read_bytes(), b"compacted")
             self.assertFalse(source.exists())
             self.assertFalse(temp.exists())
@@ -443,6 +455,90 @@ class PublishTest(DatabaseTestCase):
             _recover_publishing_transfers(db, self.unit)
             db.refresh(transfer)
             self.assertEqual(transfer.status, "publishing")
+
+
+class CloudServer:
+    """A local HTTP endpoint that records the client port of each upload."""
+
+    def __init__(self):
+        self.peers: list[int] = []
+        self.loop = asyncio.new_event_loop()
+        self.port = 0
+        ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(ready,), daemon=True)
+        self.thread.start()
+        ready.wait(10)
+
+    def _run(self, ready):
+        asyncio.set_event_loop(self.loop)
+
+        async def upload(request):
+            await request.read()
+            self.peers.append(request.transport.get_extra_info("peername")[1])
+            return web.Response(text="ok")
+
+        app = web.Application()
+        app.router.add_post("/upload", upload)
+        self.runner = web.AppRunner(app)
+        self.loop.run_until_complete(self.runner.setup())
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        self.loop.run_until_complete(site.start())
+        self.port = site._server.sockets[0].getsockname()[1]
+        ready.set()
+        self.loop.run_forever()
+
+    def stop(self):
+        asyncio.run_coroutine_threadsafe(self.runner.cleanup(), self.loop).result(10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(10)
+
+
+class SendConnectionReuseTest(SendQueueFixture):
+    def test_successive_drains_reuse_the_open_connection(self):
+        server = CloudServer()
+        self.addCleanup(server.stop)
+        url = f"http://127.0.0.1:{server.port}/upload"
+        with self.Session() as db:
+            unit = self.make_queue(db, 1, workers=1)
+            self.assertFalse(send_unit(db, unit, url))
+            (self.send_dir / "late.dcm").write_bytes(b"DICOM")
+            db.add(
+                ImageTransfer(
+                    unit_id=unit.id,
+                    filename="late.dcm",
+                    correlation_id="late",
+                    status="compressed",
+                )
+            )
+            db.commit()
+            self.assertFalse(send_unit(db, unit, url))
+            self.assertEqual(self.statuses(db), ["uploaded", "uploaded"])
+
+        # Two drains, one TCP connection.
+        self.assertEqual(len(server.peers), 2)
+        self.assertEqual(len(set(server.peers)), 1)
+
+    def test_sessions_of_the_sending_threads_are_closed_at_shutdown(self):
+        server = CloudServer()
+        self.addCleanup(server.stop)
+        url = f"http://127.0.0.1:{server.port}/upload"
+        with self.Session() as db:
+            unit = self.make_queue(db, 2, workers=1)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+
+            def drain():
+                with self.Session() as db:
+                    send_unit(db, db.get(Unit, unit.id), url)
+                return _upload_runtime()
+
+            runtime = pool.submit(drain).result(30)
+        self.assertFalse(runtime.session.closed)
+
+        close_upload_runtimes()  # from the main thread, as the worker does
+
+        self.assertTrue(runtime.session.closed)
+        self.assertTrue(runtime.closed)
+        self.assertEqual(len(server.peers), 2)
 
 
 class SendWorkerDrainTest(unittest.TestCase):

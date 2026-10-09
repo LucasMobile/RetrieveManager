@@ -56,8 +56,8 @@ def _prefetch_compact_state(
     db: Session,
     unit: Unit,
     results: list[CompactResult],
-) -> tuple[dict[str, Order], dict[str, ImageTransfer]]:
-    """Load common associations once for a persistence chunk."""
+) -> tuple[dict[str, Order], dict[str, ImageTransfer], dict[int, DicomInstance]]:
+    """Load common associations and the queue rows once for a persistence chunk."""
     study_uids = {result.study_uid for result in results if result.study_uid}
     filenames = {
         result.output_name or result.source_name
@@ -89,7 +89,16 @@ def _prefetch_compact_state(
                 )
             )
         }
-    return active_orders, transfers
+    instance_ids = {result.instance_id for result in results if result.instance_id}
+    instances: dict[int, DicomInstance] = {}
+    if instance_ids:
+        instances = {
+            instance.id: instance
+            for instance in db.scalars(
+                select(DicomInstance).where(DicomInstance.id.in_(instance_ids))
+            )
+        }
+    return active_orders, transfers, instances
 
 
 def _persist_compact_result_with_retry(
@@ -140,7 +149,10 @@ def persist_compact_chunk(
         return [], 0
     if len(results) > 1 and COMPACT_DB_BATCH_SIZE > 1:
         try:
-            active_orders, transfers = _prefetch_compact_state(db, unit, results)
+            active_orders, transfers, instances = _prefetch_compact_state(
+                db, unit, results
+            )
+            unfinished: list[tuple[CompactResult, ImageTransfer]] = []
             recorded = [
                 _record_compact_result(
                     db,
@@ -148,9 +160,13 @@ def persist_compact_chunk(
                     result,
                     active_orders=active_orders,
                     transfers=transfers,
+                    instances=instances,
+                    unfinished=unfinished,
                 )
                 for result in results
             ]
+            for result, transfer in unfinished:
+                _finish_instance(db, result, transfer, instances)
             db.commit()
             return (
                 [
@@ -195,12 +211,17 @@ def _instance_state_for(transfer_status: str) -> str:
 
 
 def _finish_instance(
-    db: Session, result: CompactResult, transfer: ImageTransfer
+    db: Session,
+    result: CompactResult,
+    transfer: ImageTransfer,
+    instances: dict[int, DicomInstance] | None = None,
 ) -> None:
     """Close the queue row in the same transaction as its transfer."""
     if result.instance_id is None:
         return
-    instance = db.get(DicomInstance, result.instance_id)
+    instance = (instances or {}).get(result.instance_id) or db.get(
+        DicomInstance, result.instance_id
+    )
     if instance is None:
         return
     instance.state = _instance_state_for(transfer.status)
@@ -216,15 +237,23 @@ def _record_compact_result(
     *,
     active_orders: dict[str, Order] | None = None,
     transfers: dict[str, ImageTransfer] | None = None,
+    instances: dict[int, DicomInstance] | None = None,
+    unfinished: list[tuple[CompactResult, ImageTransfer]] | None = None,
 ) -> tuple[int, str] | None:
-    """Record the result; returns the transfer id and status it ended in."""
+    """Record the result; returns the transfer id and status it ended in.
+
+    The order is resolved first, so the transfer row is written once with its
+    final state; its links, rule applications and queue row go with the commit.
+    With ``unfinished`` the queue row is left for the caller to close, so a
+    chunk updates all of them in one statement.
+    """
     # An exact active current-study match always wins. Completed/archived orders
     # are considered only after the historical matcher, otherwise a study that
     # is currently being retrieved as history could be attached to an old main
     # order instead of the active historical flow.
     order = None
     if result.status == "rejected_sender":
-        _record_rejected_sender(db, unit, result, transfers)
+        _record_rejected_sender(db, unit, result, transfers, instances)
         return None
     if result.study_uid:
         if active_orders is not None:
@@ -243,6 +272,32 @@ def _record_compact_result(
             )
     if order is not None:
         _enrich_order_from_received(order, result)
+
+    association = "current" if order is not None else ""
+    rejection_type = ""
+    rejection_detail = ""
+    historical_studies: list[HistoricalStudy] = []
+    if order is None:
+        historical_order, historical_studies = _historical_studies_for(db, unit, result)
+        if historical_order is not None:
+            order = historical_order
+            association = "historical"
+        elif not result.status.startswith("discarded"):
+            try:
+                order, association = _register_store_received_order(db, unit, result)
+            except InboundDicomRejected as exc:
+                rejection_type = type(exc).__name__
+                rejection_detail = str(exc)
+                _quarantine_compacted_output(unit, result)
+
+    if (
+        active_orders is not None
+        and order is not None
+        and order.study_uid == result.study_uid
+        and association != "historical"
+    ):
+        active_orders[result.study_uid] = order
+
     correlation_id = (
         ensure_order_correlation(order) if order is not None else new_correlation_id()
     )
@@ -256,57 +311,29 @@ def _record_compact_result(
                 ImageTransfer.filename == filename,
             )
         )
+    reused = transfer is not None
     if transfer is None:
         transfer = ImageTransfer(
             unit_id=unit.id,
-            order_id=order.id if order else None,
             filename=bounded_db_text(result.output_name or result.source_name, 500),
             correlation_id=correlation_id,
             study_uid=bounded_db_text(result.study_uid, 128),
         )
         db.add(transfer)
-        db.flush()
         if transfers is not None:
             transfers[filename] = transfer
     else:
-        transfer.order_id = order.id if order else transfer.order_id
-        transfer.correlation_id = correlation_id
         transfer.study_uid = (
             bounded_db_text(result.study_uid, 128) or transfer.study_uid
         )
         transfer.attempts = 0
         transfer.next_attempt_at = None
         transfer.last_http_status = None
-
-    association = "current" if order is not None else ""
-    rejection_type = ""
-    rejection_detail = ""
-    if order is None:
-        historical_order = _associate_historical_transfer(db, unit, result, transfer)
-        if historical_order is not None:
-            order = historical_order
-            association = "historical"
-            transfer.order_id = order.id
-            transfer.correlation_id = ensure_order_correlation(order)
-        elif not result.status.startswith("discarded"):
-            try:
-                order, association = _register_store_received_order(db, unit, result)
-            except InboundDicomRejected as exc:
-                rejection_type = type(exc).__name__
-                rejection_detail = str(exc)
-                transfer.order_id = None
-                _quarantine_compacted_output(unit, result)
-            else:
-                transfer.order_id = order.id
-                transfer.correlation_id = ensure_order_correlation(order)
-
-    if (
-        active_orders is not None
-        and order is not None
-        and order.study_uid == result.study_uid
-        and association != "historical"
-    ):
-        active_orders[result.study_uid] = order
+    if rejection_type:
+        transfer.order_id = None
+    elif order is not None:
+        transfer.order_id = order.id
+    transfer.correlation_id = correlation_id
 
     if rejection_type:
         transfer.status = "metadata_error"
@@ -321,12 +348,18 @@ def _record_compact_result(
         500,
     )
     db.flush()
-    _finish_instance(db, result, transfer)
-    db.execute(
-        delete(DicomRuleApplication).where(
-            DicomRuleApplication.transfer_id == transfer.id
+    for study in historical_studies:
+        _link_historical_transfer(db, study, transfer, result, new_transfer=not reused)
+    if unfinished is None:
+        _finish_instance(db, result, transfer, instances)
+    else:
+        unfinished.append((result, transfer))
+    if reused:
+        db.execute(
+            delete(DicomRuleApplication).where(
+                DicomRuleApplication.transfer_id == transfer.id
+            )
         )
-    )
     db.add_all(
         DicomRuleApplication(
             rule_id=match.rule_id,
@@ -380,6 +413,7 @@ def _record_rejected_sender(
     unit: Unit,
     result: CompactResult,
     transfers: dict[str, ImageTransfer] | None,
+    instances: dict[int, DicomInstance] | None = None,
 ) -> None:
     """Audit a quarantined object from a calling AE outside the allowlist."""
     filename = bounded_db_text(result.source_name, 500)
@@ -407,7 +441,7 @@ def _record_rejected_sender(
     transfer.last_error = result.error_type
     transfer.next_attempt_at = None
     db.flush()
-    _finish_instance(db, result, transfer)
+    _finish_instance(db, result, transfer, instances)
     with log_context(transfer.correlation_id):
         log_event(
             log,
@@ -503,9 +537,9 @@ def _register_store_received_order(
         )
         matched_by = "accession"
     if order is not None and order.study_uid and order.study_uid != study_uid:
-        raise InboundDicomRejected(
-            "AccessionNumber já pertence a outro StudyInstanceUID nesta unidade"
-        )
+        # Another study under the order's accession (reconstruction,
+        # post-processing, a split exam): its images complement the order.
+        return _register_complement_study(db, unit, order, study_uid)
 
     now = datetime.now()
     modality, _ignored_first_at = schedule_from_now(db, result.modality)
@@ -652,14 +686,49 @@ def _register_store_received_order(
     return order, f"storescp_{action}"
 
 
-def _associate_historical_transfer(
+def _register_complement_study(
+    db: Session, unit: Unit, order: Order, study_uid: str
+) -> tuple[Order, str]:
+    """Attach a second study with the order's accession to that order.
+
+    The order keeps its own study and state; only the first image of the
+    complementary study records an event.
+    """
+    known = db.scalar(
+        select(ImageTransfer.id)
+        .where(ImageTransfer.order_id == order.id, ImageTransfer.study_uid == study_uid)
+        .limit(1)
+    )
+    if known is None:
+        add_event(
+            db,
+            order,
+            "Estudo complementar recebido pelo Store SCP com o mesmo accession "
+            f"(Study UID {study_uid}); imagens associadas a este pedido",
+        )
+        with log_context(ensure_order_correlation(order)):
+            log_event(
+                log,
+                logging.INFO,
+                "order.storescp.ingest",
+                resource=f"order:{order.id}",
+                status="success",
+                order_id=order.id,
+                unit_id=unit.id,
+                result="complement",
+                matched_by="accession",
+            )
+    return order, "storescp_complement"
+
+
+def _historical_studies_for(
     db: Session,
     unit: Unit,
     result: CompactResult,
-    transfer: ImageTransfer,
-) -> Order | None:
+) -> tuple[Order | None, list[HistoricalStudy]]:
+    """The prior-retrieve order this image belongs to and the studies to link."""
     if not result.study_uid or result.observed_at is None:
-        return None
+        return None, []
     known_studies = list(
         db.scalars(
             select(HistoricalStudy)
@@ -680,12 +749,10 @@ def _associate_historical_transfer(
         )
     )
     if known_studies:
-        for study in known_studies:
-            _link_historical_transfer(db, study, transfer, result)
-        return known_studies[0].order
+        return known_studies[0].order, known_studies
 
     if not (result.birth_date and result.modality and result.study_date):
-        return None
+        return None, []
     # Push the selective identity/date predicates into SQL: this runs for every
     # file without a current order, so it must not load all active histories.
     filters = [
@@ -708,6 +775,7 @@ def _associate_historical_transfer(
         filters.append(Order.pat_id == result.patient_id.strip())
     candidates = list(db.scalars(select(Order).where(*filters)))
     matched_order = None
+    studies: list[HistoricalStudy] = []
     for order in candidates:
         if result.study_uid == order.study_uid:
             continue
@@ -752,9 +820,9 @@ def _associate_historical_transfer(
             )
             db.add(study)
             db.flush()
-        _link_historical_transfer(db, study, transfer, result)
+        studies.append(study)
         matched_order = matched_order or order
-    return matched_order
+    return matched_order, studies
 
 
 def _link_historical_transfer(
@@ -762,16 +830,23 @@ def _link_historical_transfer(
     study: HistoricalStudy,
     transfer: ImageTransfer,
     result: CompactResult,
+    *,
+    new_transfer: bool = False,
 ) -> None:
     study.accession = study.accession or bounded_db_text(result.accession, 64)
     study.study_date = study.study_date or bounded_db_text(result.study_date, 16)
     study.modality = study.modality or bounded_db_text(result.modality, 32)
     study.body_part = study.body_part or bounded_db_text(result.body_part, 64)
     study.description = study.description or bounded_db_text(result.description, 255)
-    link = db.scalar(
-        select(HistoricalImageLink).where(
-            HistoricalImageLink.historical_study_id == study.id,
-            HistoricalImageLink.transfer_id == transfer.id,
+    # A transfer created in this transaction has no links yet.
+    link = (
+        None
+        if new_transfer
+        else db.scalar(
+            select(HistoricalImageLink).where(
+                HistoricalImageLink.historical_study_id == study.id,
+                HistoricalImageLink.transfer_id == transfer.id,
+            )
         )
     )
     if link is None:

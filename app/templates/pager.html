@@ -2,7 +2,13 @@
 {% if pager and pager.total %}
 <nav class="pager" aria-label="Paginação">
   <div class="pager__summary">
+    {% if pager.capped and pager.page %}
+    <span>Exibindo {{ pager.from }}–{{ pager.to }} de {{ pager.total_label }} | Página {{ pager.page }}</span>
+    {% elif pager.capped %}
+    <span>Exibindo {{ pager.shown }} de {{ pager.total_label }}</span>
+    {% else %}
     <span>Exibindo {{ pager.from }}–{{ pager.to }} de {{ pager.total }} | Página {{ pager.page }} de {{ pager.pages }}</span>
+    {% endif %}
     {% if pager.size_options %}
     <form class="pager__size" method="get" action="{{ request.url.path }}">
       {% for name, value in pager.keep.items() %}

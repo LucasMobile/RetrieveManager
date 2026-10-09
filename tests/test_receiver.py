@@ -20,7 +20,7 @@ from pynetdicom import AE
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
-from app.instances import record_instance
+from app.instances import record_instances
 from app.models import DicomInstance, DicomStudy
 from app.receiver import (
     STATUS_CANNOT_UNDERSTAND,
@@ -194,6 +194,42 @@ class ReceiverTest(unittest.TestCase):
         self.assertTrue(Path(second.source_path).exists())
         self.assertEqual(len(list(self.receive_dir.iterdir())), 1)
 
+    def test_resend_differing_only_in_private_tags_is_a_duplicate(self):
+        # The PACS stamps (07A1,104A) with the user who opened the study.
+        def stamped(sop_uid, user=None):
+            image = ct_image(sop_uid=sop_uid)
+            block = image.private_block(0x07A1, "ELSCINT1", create=True)
+            block.add_new(0x10, "UL", 7)
+            if user:
+                block.add_new(0x4A, "LO", user)
+            return image
+
+        for ts in (ExplicitVRLittleEndian, ImplicitVRLittleEndian):
+            with self.subTest(ts=ts.name):
+                sop_uid = generate_uid()
+                self.send(stamped(sop_uid), ts=ts)
+                _assoc, statuses = self.send(stamped(sop_uid, "TFREITAS@CS"), ts=ts)
+
+                self.assertEqual(statuses, [STATUS_SUCCESS])
+                rows = [row for row in self.rows() if row.sop_uid == sop_uid]
+                self.assertEqual([row.state for row in rows], ["received"])
+                self.assertFalse(list(self.error_dir.glob("*")))
+
+                # Compacted, its source gone: still a duplicate.
+                Path(rows[0].source_path).unlink()
+                with self.Session() as db:
+                    db.get(DicomInstance, rows[0].id).state = "compacted"
+                    db.commit()
+                self.send(stamped(sop_uid, "OUTRO@CS"), ts=ts)
+                rows = [row for row in self.rows() if row.sop_uid == sop_uid]
+                self.assertEqual(len(rows), 1)
+
+    def test_public_tag_change_is_still_a_conflict(self):
+        sop_uid = generate_uid()
+        self.send(ct_image(sop_uid=sop_uid))
+        self.send(ct_image(sop_uid=sop_uid, PatientID="99999999"))
+        self.assertEqual([row.state for row in self.rows()], ["received", "conflict"])
+
     def test_failed_instance_is_revived_when_sent_again(self):
         image = ct_image()
         self.send(image)
@@ -238,13 +274,13 @@ class ReceiverTest(unittest.TestCase):
         image = ct_image()
         commit_allowed = threading.Event()
 
-        def held_record(db, obj):
+        def held_record(db, objs):
             commit_allowed.wait(10)
-            return record_instance(db, obj)
+            return record_instances(db, objs)
 
         ae = AE(ae_title="SRVPACS")
         ae.add_requested_context(CTImageStorage, [ExplicitVRLittleEndian])
-        with patch("app.receiver.record_instance", side_effect=held_record):
+        with patch("app.receiver.record_instances", side_effect=held_record):
             assoc = ae.associate("127.0.0.1", self.port, ae_title="RETRIEVE")
             self.assertTrue(assoc.is_established)
             status = assoc.send_c_store(image)
@@ -272,7 +308,7 @@ class ReceiverTest(unittest.TestCase):
         from app.pipeline.compact import _adopt_receive_files
 
         first, second, third = ct_image(), ct_image(), ct_image()
-        with patch("app.receiver.record_instance", side_effect=RuntimeError("down")):
+        with patch("app.receiver.record_instances", side_effect=RuntimeError("down")):
             with self.assertLogs("receiver", "ERROR"):
                 _assoc, statuses = self.send(first)
             # Already acknowledged when its commit failed.
@@ -325,7 +361,7 @@ class ReceiverTest(unittest.TestCase):
             db.get(DicomInstance, row.id).state = "error"
             db.commit()
 
-        with patch("app.receiver.record_instance", side_effect=RuntimeError("down")):
+        with patch("app.receiver.record_instances", side_effect=RuntimeError("down")):
             _assoc, statuses = self.send(image)
 
         self.assertEqual(statuses, [STATUS_OUT_OF_RESOURCES])
@@ -340,7 +376,9 @@ class ReceiverTest(unittest.TestCase):
             with (
                 self.subTest(setting),
                 patch(f"app.receiver.{setting}", value),
-                patch("app.receiver.record_instance", side_effect=RuntimeError("down")),
+                patch(
+                    "app.receiver.record_instances", side_effect=RuntimeError("down")
+                ),
             ):
                 _assoc, statuses = self.send(ct_image())
                 self.assertEqual(statuses, [STATUS_OUT_OF_RESOURCES])

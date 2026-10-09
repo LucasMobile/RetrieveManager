@@ -101,11 +101,22 @@ def keyset_page(
     last: bool,
     keep: Mapping[str, Any],
     options: Sequence[Any] = (),
+    count_limit: int | None = None,
+    total: int | None = None,
 ) -> tuple[list[Any], dict]:
     """Return one newest-first page of ``filtered`` and its cursor pager.
 
     ``before`` moves to older rows, ``after`` to newer rows and ``last`` to the
     oldest page; without a cursor the first page is shown.
+
+    With ``count_limit`` at most that many rows are counted, so a selection of
+    millions costs the same as one of ``count_limit``. Past it the pager is
+    "capped": the total reads "mais de N", the number of pages is unknown and
+    only the current page number is shown (0 when unknown, after a jump to
+    the oldest page).
+
+    ``total`` is a count of ``filtered`` the caller already has (for example
+    with other aggregates of the same rows), which saves the count query.
     """
     if page_size not in size_options:
         raise StarletteHTTPException(422, "Quantidade de itens por página inválida")
@@ -114,13 +125,30 @@ def keyset_page(
     if page > 1 and before is None and after is None and not last:
         raise StarletteHTTPException(422, "Cursor de paginação ausente")
 
-    total = int(db.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
-    pages = max(1, (total + page_size - 1) // page_size)
-    if last:
-        page = pages
-    elif before is None and after is None:
-        page = 1
-    pager = paginate(total, page, page_size)
+    if total is None or count_limit is not None:
+        counted = filtered.with_only_columns(id_column)
+        if count_limit is not None:
+            counted = counted.limit(count_limit + 1)
+        total = int(
+            db.scalar(select(func.count()).select_from(counted.subquery())) or 0
+        )
+    capped = count_limit is not None and total > count_limit
+    if capped:
+        total = count_limit  # type: ignore[assignment]
+        if last:
+            page = 0
+        elif before is None and after is None:
+            page = 1
+        pager = _capped_pager(total, page, page_size)
+    else:
+        pages = max(1, (total + page_size - 1) // page_size)
+        if last:
+            page = pages
+        elif before is None and after is None:
+            page = 1
+        pager = paginate(total, page, page_size)
+        pager["total_label"] = str(total)
+    pager["capped"] = capped
     pager["size_options"] = size_options
     pager["keep"] = dict(keep)
 
@@ -133,10 +161,18 @@ def keyset_page(
         stmt = stmt.where(id_column > after).order_by(id_column.asc())
     else:
         stmt = stmt.order_by(id_column.desc())
-    result_limit = (total - pager["offset"]) if last else pager["size"]
+    if capped:
+        # The oldest page is simply the oldest rows: its alignment is unknown.
+        result_limit = page_size
+    else:
+        result_limit = (total - pager["offset"]) if last else pager["size"]
     rows = list(db.scalars(stmt.limit(result_limit)))
     if after is not None or last:
         rows.reverse()
+    if capped:
+        pager["shown"] = len(rows)
+        if pager["page"]:
+            pager["to"] = pager["offset"] + len(rows)
 
     def _exists(condition) -> bool:
         return (
@@ -153,11 +189,35 @@ def keyset_page(
         prev_cursor=first_id,
         next_cursor=last_id,
     )
-    pager["page_links"] = cursor_page_links(
-        pager,
-        page_cursors=cursor_page_cursors(db, filtered, id_column, pager),
-    )
+    if capped:
+        # Numbered links need OFFSET over the whole selection; only arrows.
+        pager["page_links"] = (
+            [{"page": pager["page"], "current": True}] if pager["page"] else []
+        )
+    else:
+        pager["page_links"] = cursor_page_links(
+            pager,
+            page_cursors=cursor_page_cursors(db, filtered, id_column, pager),
+        )
     return rows, pager
+
+
+def _capped_pager(limit: int, page: int, size: int) -> dict:
+    """Pager of a selection larger than ``limit``; ``page`` 0 is unknown."""
+    offset = (page - 1) * size if page else 0
+    return {
+        "page": page,
+        "pages": 0,
+        "page_items": [page] if page else [],
+        "size": size,
+        "total": limit,
+        "total_label": "mais de " + f"{limit:,}".replace(",", "."),
+        "offset": offset,
+        "prev": max(page - 1, 1) if page else 0,
+        "next": page + 1 if page else 0,
+        "from": offset + 1 if page else 0,
+        "to": offset + size if page else 0,
+    }
 
 
 def query_keep(**params) -> str:

@@ -149,6 +149,9 @@ def _order_send_failures(db: Session, order_id: int) -> int:
 
 # Intervalo do auto-refresh da fila; a consulta é mais pesada que a da visão geral.
 ORDERS_POLL_SECONDS = 10
+# O histórico só cresce: a contagem para aqui ("mais de 10.000") para que abrir
+# a tela custe o mesmo com dez mil ou dez milhões de pedidos arquivados.
+HISTORY_COUNT_LIMIT = 10_000
 
 
 @router.get("/orders", response_class=HTMLResponse)
@@ -190,7 +193,7 @@ def orders_history(
     before: int | None = Query(None, ge=1),
     after: int | None = Query(None, ge=1),
     last: bool = False,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=0),  # 0: page beyond HISTORY_COUNT_LIMIT
     page_size: int = Query(DEFAULT_PAGE_SIZE),
     db: Session = Depends(get_db),
     user: User = Depends(require_admin),
@@ -223,6 +226,14 @@ def _parse_optional_unit_id(value: str) -> int | None:
     return unit_id
 
 
+def status_condition(status: str):
+    """Queue filter for one status. "error" also matches a failed historical
+    retrieve, as the dashboard's error count does."""
+    if status == "error":
+        return (Order.status == "error") | (Order.prior_status == "error")
+    return Order.status == status
+
+
 def _orders_response(
     request: Request,
     db: Session,
@@ -246,7 +257,7 @@ def _orders_response(
     if unit_id:
         filt = filt.where(Order.unit_id == unit_id)
     if status:
-        filt = filt.where(Order.status == status)
+        filt = filt.where(status_condition(status))
     if q:
         like = f"%{q.strip()}%"
         filt = filt.where(
@@ -256,6 +267,10 @@ def _orders_response(
                 Order.source_id.ilike(like),
             )
         )
+    # Archived orders are never waiting or running: the history shows only its
+    # total (counted up to HISTORY_COUNT_LIMIT by the pager). The queue counts
+    # its total and each situation in one scan of the filtered orders.
+    status_counts = None if history else _order_status_counts(db, filt)
     rows, pager = keyset_page(
         db,
         filt,
@@ -268,6 +283,8 @@ def _orders_response(
         last=last,
         keep={"unit_id": unit_id, "status": status, "q": q},
         options=(selectinload(Order.unit),),
+        count_limit=HISTORY_COUNT_LIMIT if history else None,
+        total=status_counts["total"] if status_counts else None,
     )
     for o in rows:
         o.status_label = STATUSES.get(o.status, o.status)  # type: ignore[attr-defined]
@@ -277,9 +294,51 @@ def _orders_response(
         o.prior_status_label = PRIOR_STATUS_LABELS.get(  # type: ignore[attr-defined]
             o.prior_status, o.prior_status
         )
+    order_summary = {
+        "total": pager["total"],
+        "total_label": pager["total_label"],
+    }
+    if status_counts:
+        order_summary |= {
+            key: status_counts[key] for key in ("waiting", "running", "done")
+        }
+    units = list(db.scalars(select(Unit).order_by(Unit.name)))
+    qs = query_keep(unit_id=unit_id, status=status, q=q, page_size=page_size)
+    return_to = request.url.path
+    if request.url.query:
+        return_to = f"{return_to}?{request.url.query}"
+    # O polling da fila pede só resumo e tabela; o histórico não muda sozinho.
+    partial = not history and request.headers.get("x-partial") == "1"
+    return templates.TemplateResponse(
+        request=request,
+        name="orders_partial.html" if partial else "orders.html",
+        context=ctx(
+            request,
+            db,
+            "order_history" if history else "orders",
+            poll_seconds=0 if history else ORDERS_POLL_SECONDS,
+            orders=rows,
+            units=units,
+            statuses=STATUSES,
+            unit_id=unit_id,
+            status=status,
+            q=q,
+            pager=pager,
+            order_summary=order_summary,
+            qs=qs,
+            history=history,
+            orders_path="/orders/history" if history else "/orders",
+            detail_return_qs=query_keep(return_to=return_to),
+        ),
+    )
+
+
+def _order_status_counts(db: Session, filt) -> dict[str, int]:
+    """Total, waiting, running and done of the filtered orders, in one scan."""
     filtered_orders = filt.subquery()
-    order_status_counts = db.execute(
+    row = db.execute(
         select(
+            func.count(),
             func.sum(
                 case(
                     (
@@ -314,41 +373,12 @@ def _orders_response(
             ),
         ).select_from(filtered_orders)
     ).one()
-    order_summary = {
-        "total": pager["total"],
-        "waiting": int(order_status_counts[0] or 0),
-        "running": int(order_status_counts[1] or 0),
-        "done": int(order_status_counts[2] or 0),
+    return {
+        "total": int(row[0] or 0),
+        "waiting": int(row[1] or 0),
+        "running": int(row[2] or 0),
+        "done": int(row[3] or 0),
     }
-    units = list(db.scalars(select(Unit).order_by(Unit.name)))
-    qs = query_keep(unit_id=unit_id, status=status, q=q, page_size=page_size)
-    return_to = request.url.path
-    if request.url.query:
-        return_to = f"{return_to}?{request.url.query}"
-    # O polling da fila pede só resumo e tabela; o histórico não muda sozinho.
-    partial = not history and request.headers.get("x-partial") == "1"
-    return templates.TemplateResponse(
-        request=request,
-        name="orders_partial.html" if partial else "orders.html",
-        context=ctx(
-            request,
-            db,
-            "order_history" if history else "orders",
-            poll_seconds=0 if history else ORDERS_POLL_SECONDS,
-            orders=rows,
-            units=units,
-            statuses=STATUSES,
-            unit_id=unit_id,
-            status=status,
-            q=q,
-            pager=pager,
-            order_summary=order_summary,
-            qs=qs,
-            history=history,
-            orders_path="/orders/history" if history else "/orders",
-            detail_return_qs=query_keep(return_to=return_to),
-        ),
-    )
 
 
 def _image_status_summary(counts: dict[str, int]) -> dict[str, int]:

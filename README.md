@@ -12,7 +12,10 @@ excluído depois de persistir `uploaded` no banco.
 1. Consulta a API Pedido PLERES de cada unidade a cada 30 segundos
 2. Filtra pedidos ainda não lidos e, quando configurado, pelo ID Posto
 3. Grava cada pedido na fila local e confirma `mirthReaded=true` junto com o `empresa_id` cadastrado na unidade
-4. Faz C-FIND no PACS (Accession + data de nascimento)
+4. Faz C-FIND no PACS (Accession + data de nascimento); pedidos ainda sem exame
+   no PACS são consultados no intervalo da unidade nos primeiros 15 min, depois
+   a cada 2× e, após 1 h, a cada 4× o intervalo (no máximo 5 min, ou o próprio
+   intervalo se ele for maior)
 5. Opcionalmente busca os exames dos últimos três anos do mesmo paciente e modalidade
 6. Espera 15 min (CT/MR) ou 10 min (resto) e faz o C-MOVE do exame atual pelo Study UID
 7. CT/MR têm um 2º C-MOVE ~90 min depois, incremental: um C-FIND por série
@@ -289,7 +292,10 @@ A fila e os Logs mantêm paginação por cursor para evitar o custo crescente de
 próxima e anterior. Nessas telas é possível exibir 10, 20, 30, 40 ou 50 itens por
 página; o padrão é 30. O PostgreSQL recebe índices parciais para registros ativos,
 histórico e limpeza automática, além de índices `pg_trgm` para busca por accession,
-Patient ID e ID de origem. Na inicialização, cada serviço (um de cada vez)
+Patient ID e ID de origem. As instâncias e transferências também só têm índice
+por estado nos estados ainda em aberto (fila, reserva, pendência, envio
+esgotado, publicação): as linhas concluídas, quase todas, ficam fora deles, e
+concluir uma imagem não acrescenta entrada nesses índices. Na inicialização, cada serviço (um de cada vez)
 converte para `bigint` os IDs que crescem a cada imagem (`image_transfers`,
 `dicom_instances`, `historical_image_links`, `dicom_rule_applications`) quando o
 banco ainda os tem como `integer`, cria com `CREATE INDEX CONCURRENTLY` os
@@ -302,13 +308,25 @@ se não obtiver o bloqueio em 60 s, o serviço reinicia e tenta de novo. A
 configuração do PostgreSQL (memória, checkpoints, timeout de transação parada e
 log de consultas lentas) fica no `command` do serviço `postgres` do Compose,
 ajustável pelas variáveis `PG_*` do `.env.example`. Os
-agregados da Visão geral têm cache curto de cinco
-segundos para que vários navegadores não repitam as mesmas varreduras do banco a
-cada atualização.
+agregados da Visão geral e a verificação da porta do receptor têm cache curto
+de cinco segundos para que vários navegadores não repitam as mesmas varreduras
+do banco nem abram uma conexão com o receptor a cada atualização. A fila de
+pedidos conta o total e cada situação numa única consulta. As limpezas
+automáticas (locks órfãos, pedidos sem exame após 24 horas e concluídos há 14
+dias) rodam uma vez por minuto.
 
 Na compactação, cada arquivo é lido, alterado (charset, token, regras) e
 codificado em um processo persistente e isolado; um crash ou travamento do
-codec derruba só aquele processo. O número de processos é
+codec derruba só aquele processo. A fila é consumida em fluxo contínuo: cada
+vaga do codec é reposta assim que o arquivo dela termina (até 2× os workers da
+unidade ficam reservados à frente), então um multiframe lento não deixa as
+outras vagas paradas esperando o fim de um lote. Cada drenagem dura até
+`COMPACT_DRAIN_SECONDS` (padrão 60) e então devolve o controle ao agendador.
+
+O receptor avisa o worker (`NOTIFY instances_received`) ao gravar instâncias
+novas, e a compactação avisa o envio ao publicar arquivos: cada etapa começa na
+hora, sem esperar o próximo ciclo de `WORKER_INTERVAL_SECONDS`, que continua
+como garantia caso um aviso se perca. O número de processos é
 `COMPACT_GLOBAL_WORKERS`, que por padrão (vazio ou `auto`) é o número de CPUs
 disponíveis para o container menos 2, com mínimo 1: 6 CPUs → 4, 4 → 2, 2 → 1.
 As duas CPUs livres ficam para o receptor, o PostgreSQL e o resto do worker;
@@ -345,8 +363,10 @@ e o envio continua, senão aguardam a próxima verificação. Também podem ser
 reenviadas pelo botão **Reenviar** no pedido ou **Reenviar falhas de envio** na
 unidade. Resultados são persistidos em lotes, com fallback individual, e a
 concorrência total entre unidades é limitada por `SEND_GLOBAL_CONCURRENCY`. Cada
-ciclo reutiliza a mesma sessão HTTP por até `SEND_DRAIN_SECONDS` (padrão 20 s) e
-então devolve o controle ao agendador.
+ciclo dura até `SEND_DRAIN_SECONDS` (padrão 20 s) e então devolve o controle ao
+agendador; a sessão HTTP fica aberta entre um ciclo e o seguinte, de modo que
+uma fila longa reaproveita as conexões já abertas com a nuvem em vez de refazer
+o handshake TLS de cada uma a cada ciclo.
 
 ## Cadastrar uma unidade
 
@@ -476,8 +496,11 @@ Se a consulta não encontrar exames anteriores, o histórico termina com sucesso
 nenhum C-MOVE é executado. O processo compartilha o limite de C-MOVEs paralelos
 da unidade: o histórico e o C-MOVE de novas imagens do monitoramento nunca usam
 a última vaga, reservada ao 1º retrieve dos exames novos, e cada um fica com no
-máximo metade das vagas (com 4: até 2 de cada, 3 no total). Cada série histórica concluída recebe um checkpoint e não
-é repetida se outra série precisar de retry. O exame atual continua sendo
+máximo metade das vagas (com 4: até 2 de cada, 3 no total). As séries são
+pedidas numa única associação com o PACS, e a chegada ao receptor é conferida
+uma vez por exame anterior, depois de todas as séries dele. Cada série
+histórica concluída recebe um checkpoint e não é repetida se outra série
+precisar de retry. O exame atual continua sendo
 recuperado pelo Study UID; seus tempos e o monitoramento de novas imagens não se
 aplicam aos exames anteriores.
 
@@ -511,8 +534,8 @@ um C-FIND no nível SERIES e compara o `NumberOfSeriesRelatedInstances` de cada
 série com as imagens já **recebidas** pela unidade, em qualquer estado.
 Imagens que falharam depois na compactação ou no envio contam como recebidas e
 não são pedidas de novo ao PACS. As séries que ganharam imagens são recuperadas
-por Study UID + Series UID; se o PACS não informar a contagem, o estudo inteiro
-é pedido. Cada verificação gera um evento na linha do tempo do pedido (contagens
+por Study UID + Series UID, uma após a outra na mesma associação; se o PACS não
+informar a contagem, o estudo inteiro é pedido. Cada verificação gera um evento na linha do tempo do pedido (contagens
 do PACS e recebidas, por série, nos detalhes técnicos), assim como cada C-MOVE
 de novas imagens.
 
@@ -532,7 +555,8 @@ imagens novas que o receptor registrou, não o total que o PACS reenviou (ele
 manda cada série inteira).
 
 Todo C-MOVE (1º retrieve, novas imagens, histórico e manual) é abortado quando o
-PACS passa `MOVE_IDLE_TIMEOUT_SECONDS` (padrão 120) sem enviar imagem, e só
+PACS passa `MOVE_IDLE_TIMEOUT_SECONDS` (padrão 120; no histórico,
+`PRIOR_MOVE_IDLE_TIMEOUT_SECONDS`, padrão 300) sem enviar imagem, e só
 conta como sucesso se o receptor registrar imagens do estudo em até
 `MOVE_RECEIVE_CONFIRM_SECONDS` (padrão 15). Se o PACS disser que enviou e nada
 chegar, o pedido mostra "nenhuma chegou ao receptor": confira no PACS o IP e a

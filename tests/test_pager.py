@@ -1,6 +1,6 @@
 import unittest
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.models import AuditLog
@@ -97,6 +97,55 @@ class KeysetPageTest(DatabaseTestCase):
         self.assertEqual(pager["page"], 3)
         self.assertTrue(pager["has_prev"])
         self.assertFalse(pager["has_next"])
+
+    def test_count_limit_caps_the_total_and_keeps_the_cursors_working(self):
+        first, pager = self.page(count_limit=20)
+        self.assertEqual(first, list(range(25, 15, -1)))
+        self.assertTrue(pager["capped"])
+        self.assertEqual(pager["total"], 20)
+        self.assertEqual(pager["total_label"], "mais de 20")
+        self.assertEqual((pager["page"], pager["from"], pager["to"]), (1, 1, 10))
+        self.assertEqual(pager["page_links"], [{"page": 1, "current": True}])
+        self.assertTrue(pager["has_next"])
+
+        second, pager = self.page(before=pager["next_cursor"], page=2, count_limit=20)
+        self.assertEqual(second, list(range(15, 5, -1)))
+        self.assertEqual((pager["page"], pager["from"], pager["to"]), (2, 11, 20))
+        self.assertEqual((pager["prev"], pager["next"]), (1, 3))
+
+        # The oldest page is the oldest rows; its number is unknown (0).
+        last, pager = self.page(last=True, page=0, count_limit=20)
+        self.assertEqual(last, list(range(10, 0, -1)))
+        self.assertEqual(
+            (pager["page"], pager["shown"], pager["page_links"]), (0, 10, [])
+        )
+        self.assertTrue(pager["has_prev"])
+        self.assertFalse(pager["has_next"])
+
+        newer, pager = self.page(after=pager["prev_cursor"], page=0, count_limit=20)
+        self.assertEqual(newer, list(range(20, 10, -1)))
+        self.assertEqual((pager["page"], pager["prev"]), (0, 0))
+
+    def test_count_limit_not_reached_keeps_the_exact_pager(self):
+        _ids, pager = self.page(count_limit=25)
+        self.assertFalse(pager["capped"])
+        self.assertEqual((pager["total"], pager["pages"]), (25, 3))
+        self.assertEqual(pager["total_label"], "25")
+        self.assertEqual(len(pager["page_links"]), 3)
+
+    def test_known_total_skips_the_count_query(self):
+        statements = []
+
+        def track(_conn, _cursor, statement, *_args):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", track)
+        self.addCleanup(event.remove, self.engine, "before_cursor_execute", track)
+        rows, pager = self.page(total=25)
+
+        self.assertEqual(rows, list(range(25, 15, -1)))
+        self.assertEqual((pager["total"], pager["pages"]), (25, 3))
+        self.assertFalse(any("count(" in statement for statement in statements))
 
     def test_page_without_cursor_falls_back_to_the_first_page(self):
         ids, pager = self.page(page=1)

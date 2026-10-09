@@ -45,6 +45,29 @@ _dashboard_folder_cache: dict[
 _dashboard_folder_lock = Lock()
 
 
+# Whether each store port accepts connections: every poll of every open
+# dashboard would otherwise open a TCP connection to the receiver per unit.
+STORE_LISTENING_CACHE_SECONDS = 5
+
+
+_store_listening_cache: dict[int, tuple[float, bool]] = {}
+
+
+_store_listening_lock = Lock()
+
+
+def _store_listening(port: int) -> bool:
+    now = monotonic()
+    with _store_listening_lock:
+        cached = _store_listening_cache.get(port)
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    listening = port_listening(port)
+    with _store_listening_lock:
+        _store_listening_cache[port] = (now + STORE_LISTENING_CACHE_SECONDS, listening)
+    return listening
+
+
 def _unit_runtime(unit: Unit) -> tuple[dict[str, int], bool]:
     cache_key = (
         unit.id,
@@ -65,7 +88,7 @@ def _unit_runtime(unit: Unit) -> tuple[dict[str, int], bool]:
             )
     return (
         folders,
-        port_listening(unit.store_port) if unit.enabled else False,
+        _store_listening(unit.store_port) if unit.enabled else False,
     )
 
 

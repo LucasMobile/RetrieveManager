@@ -31,18 +31,14 @@ import threading
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from concurrent.futures import Future
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
-import psycopg
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.filebase import DicomBytesIO
-from pydicom.filereader import read_dataset
 from pydicom.filewriter import write_file_meta_info
 from pydicom.uid import (
     JPEG2000,
@@ -87,9 +83,13 @@ from app.instances import (
     Decision,
     ReceivedObject,
     apply_decision,
-    record_instance,
+    identity_sha256,
+    notify_instances_received,
+    parse_header,
+    record_instances,
 )
 from app.models import DicomInstance, DicomStudy, Unit
+from app.notify import NotificationListener
 from app.observability import configure_logging, log_event
 from app.store_routing import (
     RoutingPlan,
@@ -141,8 +141,6 @@ REJECT_CALLING_AE = 0x03
 REJECT_CALLED_AE = 0x07
 REJECT_LOCAL_LIMIT = 0x02  # with SOURCE_PROVIDER_PRESENTATION
 
-_PIXEL_DATA_TAGS = frozenset({0x7FE00008, 0x7FE00009, 0x7FE00010})
-
 # What the database knows about an incoming object before its file is written.
 KNOWN_DUPLICATE = "duplicate"  # same content already handled: ack, write nothing
 NEVER_RECORDED = "new"  # the unit has no row for this SOP: may be acked early
@@ -150,10 +148,6 @@ KNOWN_SOP = "known"  # revival, conflict or lost source: wait for the commit
 # A duplicate marks its study as delivered again at most this often per
 # association (see Receiver._note_duplicate).
 DUPLICATE_TOUCH_SECONDS = 5.0
-
-
-def _stop_at_pixel_data(tag, _vr, _length) -> bool:
-    return int(tag) in _PIXEL_DATA_TAGS
 
 
 def _decode_aet(value) -> str:
@@ -168,31 +162,6 @@ def _safe_uid(value: str) -> str:
 
 def _safe_modality(value: str) -> str:
     return "".join(ch for ch in value.upper() if ch.isalnum())[:8] or "OT"
-
-
-def read_header(raw: bytes, transfer_syntax: UID, event=None) -> Dataset:
-    """Parse the dataset up to (not including) Pixel Data.
-
-    Deflated and big-endian streams, or any parse failure, fall back to the
-    fully decoded dataset from pynetdicom; the file is still written raw.
-    """
-    if (
-        transfer_syntax.is_little_endian
-        and transfer_syntax != DeflatedExplicitVRLittleEndian
-    ):
-        try:
-            return read_dataset(
-                BytesIO(raw),
-                transfer_syntax.is_implicit_VR,
-                True,
-                stop_when=_stop_at_pixel_data,
-            )
-        except Exception:
-            if event is None:
-                raise
-    if event is None:
-        raise ValueError("header parse requires the decoded C-STORE dataset")
-    return event.dataset
 
 
 def build_file_meta(
@@ -318,7 +287,8 @@ class InstanceWriter:
             return
         try:
             with self._session_factory() as db:
-                decisions = [record_instance(db, obj) for obj, _future in batch]
+                decisions = record_instances(db, [obj for obj, _future in batch])
+                _notify_compaction(db, [obj for obj, _future in batch], decisions)
                 db.commit()
         except Exception as exc:
             log_event(
@@ -352,13 +322,31 @@ class InstanceWriter:
         for attempt in (1, 2):
             try:
                 with self._session_factory() as db:
-                    decision = record_instance(db, obj)
+                    (decision,) = record_instances(db, [obj])
+                    _notify_compaction(db, [obj], [decision])
                     db.commit()
                     return decision
             except IntegrityError:
                 if attempt == 2:
                     raise
         raise RuntimeError("unreachable")
+
+
+# Outcomes that leave an instance waiting in the compaction queue.
+_COMPACTION_OUTCOMES = frozenset({"new", "revived"})
+
+
+def _notify_compaction(
+    db, objs: list[ReceivedObject], decisions: list[Decision]
+) -> None:
+    notify_instances_received(
+        db,
+        {
+            obj.unit_id
+            for obj, decision in zip(objs, decisions, strict=True)
+            if decision.outcome in _COMPACTION_OUTCOMES
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -839,7 +827,11 @@ class Receiver:
         try:
             transfer_syntax = UID(event.context.transfer_syntax)
             raw = event.encoded_dataset(include_meta=False)
-            header = read_header(raw, transfer_syntax, event)
+            # Header up to Pixel Data. Deflated and big-endian streams, or a
+            # parse failure, fall back to pynetdicom's fully decoded dataset;
+            # the file is still written raw.
+            parsed = parse_header(raw, transfer_syntax)
+            header = parsed if parsed is not None else event.dataset
             sop_uid = str(header.get("SOPInstanceUID", "") or "").strip()
             study_uid = str(header.get("StudyInstanceUID", "") or "").strip()
             if not sop_uid or not study_uid or max(len(sop_uid), len(study_uid)) > 64:
@@ -868,7 +860,12 @@ class Receiver:
                 )
                 return STATUS_OUT_OF_RESOURCES
 
-            digest = hashlib.sha256(raw).hexdigest()
+            raw_digest = hashlib.sha256(raw).hexdigest()
+            digest = (
+                identity_sha256(raw, transfer_syntax, parsed)
+                if parsed is not None
+                else raw_digest
+            )
             modality = str(header.get("Modality", "") or "").strip()
             name = f"{_safe_modality(modality)}.{_safe_uid(sop_uid)}.{digest[:16]}"
             path = route.receive_dir / name
@@ -881,6 +878,7 @@ class Receiver:
                 transfer_syntax=str(transfer_syntax),
                 modality=modality[:16],
                 sha256=digest,
+                raw_sha256=raw_digest,
                 size=len(raw),
                 path=str(path),
                 conflict_path=str(route.error_dir / name),
@@ -1095,7 +1093,7 @@ class Receiver:
             ).all()
         if not rows:
             return NEVER_RECORDED
-        same = next((row for row in rows if row.source_sha256 == obj.sha256), None)
+        same = next((row for row in rows if obj.matches(row.source_sha256)), None)
         if same is not None:
             if same.state in DONE_STATES:
                 return KNOWN_DUPLICATE
@@ -1121,73 +1119,17 @@ class Receiver:
         return enough
 
 
-class UnitChangeListener:
-    """Waits for the ``units_changed`` NOTIFY; the poll interval stays the cap.
-
-    Notifications sent while the receiver reconciles queue on the listening
-    connection, so none is lost. While the connection is down, the wait falls
-    back to plain polling and reconnects on the next call.
-    """
+class UnitChangeListener(NotificationListener):
+    """Waits for the ``units_changed`` NOTIFY; the poll interval stays the cap."""
 
     def __init__(self, url: URL = DATABASE_URL) -> None:
-        self._url = url
-        self._connection: psycopg.Connection | None = None
-        self._failing = False
+        super().__init__(
+            UNITS_CHANGED_CHANNEL, url=url, logger=log, action="dicom.receive.listen"
+        )
 
-    def _connect(self) -> psycopg.Connection:
-        if self._connection is None or self._connection.closed:
-            connection = psycopg.connect(
-                host=self._url.host,
-                port=self._url.port,
-                dbname=self._url.database,
-                user=self._url.username,
-                password=self._url.password,
-                autocommit=True,
-                connect_timeout=5,
-            )
-            connection.execute(f"LISTEN {UNITS_CHANGED_CHANNEL}")
-            self._connection = connection
-        return self._connection
-
-    def wait(self, stop: threading.Event, timeout: float) -> bool:
+    def wait(self, stop: threading.Event, timeout: float) -> bool:  # type: ignore[override]
         """True when a unit changed; False after ``timeout`` or on stop."""
-        deadline = monotonic() + timeout
-        while not stop.is_set():
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                return False
-            # Short slices keep SIGTERM handling as prompt as stop.wait().
-            slice_seconds = min(remaining, 1.0)
-            try:
-                connection = self._connect()
-                for _notify in connection.notifies(timeout=slice_seconds, stop_after=1):
-                    self._recovered()
-                    return True
-                self._recovered()
-            except psycopg.Error as exc:
-                self.close()
-                if not self._failing:
-                    self._failing = True
-                    log_event(
-                        log,
-                        logging.WARNING,
-                        "dicom.receive.listen",
-                        status="failure",
-                        error=exc,
-                    )
-                stop.wait(slice_seconds)
-        return False
-
-    def _recovered(self) -> None:
-        if self._failing:
-            self._failing = False
-            log_event(log, logging.INFO, "dicom.receive.listen", status="success")
-
-    def close(self) -> None:
-        if self._connection is not None:
-            with suppress(Exception):
-                self._connection.close()
-            self._connection = None
+        return super().wait(stop, timeout) is not None
 
 
 def main() -> None:

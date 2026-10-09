@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.dicom_net import (
     FindResult,
+    MoveSession,
     PacsNode,
     echo,
     find_prior_series,
@@ -287,6 +288,36 @@ class DicomNetworkTest(PacsReceiverFixture, unittest.TestCase):
         self.assertTrue(result.ok, result.summary)
         self.assertEqual(self.stored(), 3)
 
+    def test_session_moves_several_series_on_one_association(self):
+        with MoveSession(self.node) as session:
+            first = move_series(
+                self.node, STUDY, f"{STUDY}.1", timeout=30, session=session
+            )
+            second = move_series(
+                self.node, PRIOR, f"{PRIOR}.1", timeout=30, session=session
+            )
+        self.assertTrue(first.ok and second.ok, (first.summary, second.summary))
+        self.assertEqual(self.stored(), 5)
+        self.assertEqual(self.pacs.associations, 1)
+
+    def test_session_opens_a_new_association_after_an_aborted_move(self):
+        self.pacs.stall_after, self.pacs.stall_seconds = 1, 3
+        with MoveSession(self.node) as session:
+            stalled = session.move(
+                study_move_identifier(STUDY),
+                destination_aet="RETRIEVE",
+                timeout=30,
+                idle_timeout=1,
+            )
+            self.pacs.stall_after = None
+            again = session.move(
+                study_move_identifier(STUDY), destination_aet="RETRIEVE", timeout=30
+            )
+        self.assertFalse(stalled.ok)
+        self.assertTrue(again.ok, again.summary)
+        self.assertEqual(self.pacs.associations, 2)
+        self.assertEqual(self.stored(), 3)
+
 
 def move_status(code, **counts):
     status = Dataset()
@@ -372,6 +403,18 @@ class MonitoringTest(PacsReceiverFixture, unittest.TestCase):
         order, events = self.run_check()
         self.assertEqual(len(self.pacs.moves), self.moves_before + 1)
         self.assertTrue(events[-1].startswith("Verificação 2: nenhuma imagem nova"))
+
+    def test_new_images_in_several_series_share_one_association(self):
+        for series in (2, 3):
+            self.pacs.images.extend(
+                study_images(count=1, series_uid=f"{STUDY}.{series}")
+            )
+        associations_before = self.pacs.associations
+        order, events = self.run_check()
+        self.assertEqual(order.monitor_new_images, 2)
+        self.assertEqual(len(self.pacs.moves), self.moves_before + 2)
+        # One for the check's C-FIND, one for both series' C-MOVEs.
+        self.assertEqual(self.pacs.associations, associations_before + 2)
 
     def test_images_failed_after_reception_are_not_requested_again(self):
         with self.Session() as db:

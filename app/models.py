@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -355,6 +356,14 @@ class OrderEvent(Base):
     level: Mapped[str] = mapped_column(String(16), default="info")
     message: Mapped[str] = mapped_column(String(500), nullable=False)
     detail: Mapped[str] = mapped_column(Text, default="")
+    # Routine events of one kind in a row (the same C-FIND finding nothing,
+    # a monitoring check without news) share a row: the latest message, how
+    # many times it happened and when it last did.
+    kind: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    repeat_count: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1")
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
     order: Mapped[Order] = relationship(back_populates="events")
 
@@ -460,8 +469,9 @@ class ImageTransfer(Base):
     __tablename__ = "image_transfers"
     __table_args__ = (
         UniqueConstraint("unit_id", "filename", name="uq_transfer_unit_filename"),
-        Index("ix_transfer_unit_status_retry", "unit_id", "status", "next_attempt_at"),
         Index("ix_transfer_order_status", "order_id", "status"),
+        # Queues by state are partial indexes, created by
+        # app.db.ensure_postgresql_schema.
     )
 
     # bigint, like every id that grows with each image (instances, links, rule
@@ -523,8 +533,8 @@ class DicomInstance(Base):
             "unit_id", "sop_uid", "source_sha256", name="uq_dicom_instance_content"
         ),
         # The unique key also serves lookups by (unit_id, sop_uid); the partial
-        # indexes are created by app.db.ensure_postgresql_schema.
-        Index("ix_dicom_instance_unit_state_id", "unit_id", "state", "id"),
+        # indexes, by state among them, are created by
+        # app.db.ensure_postgresql_schema.
         Index("ix_dicom_instance_study", "study_id"),
     )
 

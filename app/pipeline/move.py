@@ -10,9 +10,10 @@ from time import monotonic, perf_counter, sleep
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.config import MOVE_RECEIVE_CONFIRM_SECONDS
+from app.config import MOVE_RECEIVE_CONFIRM_SECONDS, PRIOR_MOVE_IDLE_TIMEOUT_SECONDS
 from app.dicom_net import (
     MoveResult,
+    MoveSession,
     PacsNode,
     find_prior_series,
     move_series,
@@ -732,47 +733,53 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
                 # Torna os UIDs e checkpoints visíveis enquanto os C-MOVEs executam.
                 db.commit()
                 operation = "C-MOVE histórico"
-                for series_job in series_jobs:
-                    if not _prior_enabled(db, unit.id):
-                        # Turned off on the unit meanwhile: stop between series.
-                        stopped = True
-                        break
-                    remaining = int(deadline - monotonic())
-                    if remaining <= 0:
-                        failure = failure or "tempo total do histórico esgotado"
-                        append_diagnostic(outputs, "C-MOVE histórico", "TIMEOUT global")
-                        break
-                    series_job.status = "running"
-                    series_job.attempts += 1
-                    series_job.last_error = ""
-                    db.commit()
-                    move_started = datetime.now()
-                    moved = move_series(
-                        node,
-                        series_job.study_uid,
-                        series_job.series_uid,
-                        timeout=remaining,
-                    )
-                    moved = _confirm_arrival(
-                        db, unit, series_job.study_uid, moved, move_started
-                    ).moved
-                    append_diagnostic(
-                        outputs,
-                        "C-MOVE histórico "
-                        f"StudyUID={series_job.study_uid} "
-                        f"SeriesUID={series_job.series_uid}",
-                        moved.summary,
-                    )
-                    if moved.ok:
-                        series_job.status = "done"
-                        series_job.completed_at = datetime.now()
-                        series_job.last_error = ""
-                    else:
-                        series_job.status = "error"
-                        series_job.last_error = bounded_db_text(moved.error, 500)
-                    db.commit()
-                    if not moved.ok and not failure:
-                        failure = moved.error
+                # One association for every series; the arrival is confirmed
+                # once per study, after its series.
+                with MoveSession(node) as session:
+                    for study_uid, study_jobs in _by_study(series_jobs):
+                        moved_jobs: list[tuple[HistoricalSeries, MoveResult]] = []
+                        study_started = datetime.now()
+                        interrupted = False
+                        for series_job in study_jobs:
+                            if not _prior_enabled(db, unit.id):
+                                # Turned off on the unit meanwhile: stop
+                                # between series.
+                                stopped = interrupted = True
+                                break
+                            remaining = int(deadline - monotonic())
+                            if remaining <= 0:
+                                failure = failure or "tempo total do histórico esgotado"
+                                append_diagnostic(
+                                    outputs, "C-MOVE histórico", "TIMEOUT global"
+                                )
+                                interrupted = True
+                                break
+                            series_job.status = "running"
+                            series_job.attempts += 1
+                            series_job.last_error = ""
+                            db.commit()
+                            moved = move_series(
+                                node,
+                                study_uid,
+                                series_job.series_uid,
+                                timeout=remaining,
+                                session=session,
+                                idle_timeout=PRIOR_MOVE_IDLE_TIMEOUT_SECONDS,
+                            )
+                            append_diagnostic(
+                                outputs,
+                                "C-MOVE histórico "
+                                f"StudyUID={study_uid} "
+                                f"SeriesUID={series_job.series_uid}",
+                                moved.summary,
+                            )
+                            moved_jobs.append((series_job, moved))
+                        settled_failure = _settle_prior_series(
+                            db, unit, study_uid, moved_jobs, study_started, outputs
+                        )
+                        failure = failure or settled_failure
+                        if interrupted:
+                            break
         safe_output = "\n\n".join(outputs)
         finished_at = datetime.now()
         order.prior_heartbeat_at = finished_at
@@ -854,6 +861,59 @@ def _run_prior_move(db: Session, unit: Unit, order: Order) -> None:
             attempt=order.prior_attempts,
             error_type=failure or None,
         )
+
+
+def _by_study(
+    jobs: list[HistoricalSeries],
+) -> list[tuple[str, list[HistoricalSeries]]]:
+    """The series grouped by study, in the order the studies first appear."""
+    studies: dict[str, list[HistoricalSeries]] = {}
+    for job in jobs:
+        studies.setdefault(job.study_uid, []).append(job)
+    return list(studies.items())
+
+
+def _settle_prior_series(
+    db: Session,
+    unit: Unit,
+    study_uid: str,
+    moved_jobs: list[tuple[HistoricalSeries, MoveResult]],
+    started: datetime,
+    outputs: list[str],
+) -> str:
+    """Record the C-MOVEs of one study's series; return the first failure.
+
+    The receiver's arrival check is per study: one check covers every series
+    the PACS reported as sent since ``started``.
+    """
+    sent = [moved for _job, moved in moved_jobs if moved.ok]
+    arrival_error = ""
+    if sent:
+        combined = MoveResult(
+            True,
+            0x0000,
+            completed=sum(moved.completed for moved in sent),
+            warning=sum(moved.warning for moved in sent),
+        )
+        confirmed = _confirm_arrival(db, unit, study_uid, combined, started).moved
+        if not confirmed.ok:
+            arrival_error = confirmed.error
+            append_diagnostic(
+                outputs, f"Receptor StudyUID={study_uid}", confirmed.summary
+            )
+    first_failure = ""
+    for job, moved in moved_jobs:
+        error = moved.error if not moved.ok else arrival_error
+        if error:
+            job.status = "error"
+            job.last_error = bounded_db_text(error, 500)
+            first_failure = first_failure or error
+        else:
+            job.status = "done"
+            job.completed_at = datetime.now()
+            job.last_error = ""
+    db.commit()
+    return first_failure
 
 
 def _prior_enabled(db: Session, unit_id: int) -> bool:
@@ -1018,17 +1078,21 @@ def _run_update_move(db: Session, unit: Unit, order: Order) -> None:
 def _move_series_list(
     node: PacsNode, study_uid: str, series: tuple[str, ...], timeout: float
 ) -> MoveResult:
-    """C-MOVE the given series in turn; stops at the first failure."""
+    """C-MOVE the given series in turn, on one association; stops at the first
+    failure."""
     deadline = monotonic() + timeout
     totals = {"completed": 0, "failed": 0, "warning": 0}
-    for series_uid in series:
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            return MoveResult(False, error="tempo esgotado", remaining=0, **totals)
-        moved = move_series(node, study_uid, series_uid, timeout=remaining)
-        totals["completed"] += moved.completed
-        totals["failed"] += moved.failed
-        totals["warning"] += moved.warning
-        if not moved.ok:
-            return replace(moved, **totals)
+    with MoveSession(node) as session:
+        for series_uid in series:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return MoveResult(False, error="tempo esgotado", remaining=0, **totals)
+            moved = move_series(
+                node, study_uid, series_uid, timeout=remaining, session=session
+            )
+            totals["completed"] += moved.completed
+            totals["failed"] += moved.failed
+            totals["warning"] += moved.warning
+            if not moved.ok:
+                return replace(moved, **totals)
     return MoveResult(True, 0x0000, **totals)

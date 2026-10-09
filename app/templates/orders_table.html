@@ -6,7 +6,7 @@
       <div><h2 id="orders-table-title">{{ 'Pedidos arquivados' if history else 'Pedidos encontrados' }}</h2><p>Ordenados dos mais recentes para os mais antigos.</p></div>
       <div class="orders-table-card__meta">
         {% if poll_seconds %}<span class="live-indicator"><i aria-hidden="true"></i>Atualização automática a cada {{ poll_seconds }} segundos</span>{% endif %}
-        <span>{{ pager.total }} {{ pager.total | plural("resultado", "resultados") }}</span>
+        <span>{{ pager.total_label }} {{ pager.total | plural("resultado", "resultados") }}</span>
         <a class="btn btn--secondary btn--sm" href="{{ orders_path }}{% if qs %}?{{ qs }}{% endif %}" title="Atualizar pedidos" aria-label="Atualizar tabela de pedidos">{{ icon("retry") }} Atualizar</a>
       </div>
     </div>

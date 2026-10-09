@@ -177,6 +177,144 @@ def find(node: PacsNode, identifier: Dataset, *, timeout: float) -> FindResult:
     return FindResult(not error, tuple(responses), final, error)
 
 
+class MoveSession:
+    """C-MOVEs to one PACS over a single association.
+
+    The association opens on the first move and serves the next ones, saving
+    the connection and A-ASSOCIATE of each series. A move that ends it (time
+    limit, stall, network failure) makes the next move open another.
+    """
+
+    def __init__(self, node: PacsNode) -> None:
+        self._node = node
+        self._assoc: Association | None = None
+
+    def __enter__(self) -> MoveSession:
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._assoc is not None:
+            _close(self._assoc)
+            self._assoc = None
+
+    def move(
+        self,
+        identifier: Dataset,
+        *,
+        destination_aet: str,
+        timeout: float,
+        idle_timeout: float | None = None,
+    ) -> MoveResult:
+        """Study Root C-MOVE; success requires Success and zero failed sub-ops.
+
+        ``timeout`` bounds the whole operation. ``idle_timeout`` bounds the time
+        without progress once the PACS has sent its first pending response: a
+        PACS that reports each sub-operation and then goes silent, or keeps
+        answering without sending images, has stalled. The first response may
+        take longer, since some PACS only answer after preparing the study.
+        """
+        if idle_timeout is None:
+            idle_timeout = MOVE_IDLE_TIMEOUT_SECONDS
+        deadline = monotonic() + timeout
+        assoc = self._assoc
+        if assoc is None or not assoc.is_established:
+            assoc, error = _associate(
+                self._node, StudyRootQueryRetrieveInformationModelMove, timeout
+            )
+            if error:
+                self._assoc = None
+                return MoveResult(False, error=error)
+            self._assoc = assoc
+        else:
+            # The limits of a fresh association, for this move.
+            assoc.dimse_timeout = timeout
+            assoc.network_timeout = timeout
+        try:
+            result = _run_move(
+                assoc, identifier, destination_aet, deadline, idle_timeout
+            )
+        except BaseException:
+            # Unknown protocol state: never reuse this association.
+            self._assoc = None
+            assoc.abort()
+            raise
+        if not assoc.is_established:
+            self._assoc = None
+        return result
+
+
+def _run_move(
+    assoc: Association,
+    identifier: Dataset,
+    destination_aet: str,
+    deadline: float,
+    idle_timeout: float,
+) -> MoveResult:
+    counts = {"completed": 0, "failed": 0, "warning": 0, "remaining": 0}
+    final: int | None = None
+    error = ""
+    progress: tuple[int, ...] | None = None
+    last_response = last_progress = monotonic()
+    idle_armed = False
+    for status, _identifier in assoc.send_c_move(
+        identifier, destination_aet, StudyRootQueryRetrieveInformationModelMove
+    ):
+        now = monotonic()
+        if not status:
+            if idle_armed and now - last_response >= idle_timeout - 1:
+                error = f"PACS sem enviar imagens por {int(idle_timeout)} s"
+            else:
+                error = "tempo esgotado ou associação interrompida"
+            break
+        last_response = now
+        for key, keyword in (
+            ("completed", "NumberOfCompletedSuboperations"),
+            ("failed", "NumberOfFailedSuboperations"),
+            ("warning", "NumberOfWarningSuboperations"),
+            ("remaining", "NumberOfRemainingSuboperations"),
+        ):
+            value = status.get(keyword)
+            if value is not None:
+                counts[key] = int(value)
+        code = int(status.Status)
+        if code in _PENDING:
+            if now > deadline:
+                # Aborting stops the PACS from sending further sub-ops.
+                error = "tempo esgotado"
+                assoc.abort()
+                break
+            done = tuple(counts.values())
+            if done != progress:
+                progress, last_progress = done, now
+            elif idle_timeout and now - last_progress > idle_timeout:
+                error = f"PACS sem enviar imagens por {int(idle_timeout)} s"
+                assoc.abort()
+                break
+            # pynetdicom reads the association's DIMSE timeout before each
+            # wait: a silent PACS is now cut at the idle limit, and never
+            # past the overall deadline.
+            wait = max(1.0, deadline - now)
+            if idle_timeout:
+                idle_armed = True
+                wait = min(wait, idle_timeout)
+            assoc.dimse_timeout = wait
+            continue
+        final = code
+        # Pending counts are stale once the final response arrives.
+        counts["remaining"] = int(status.get("NumberOfRemainingSuboperations") or 0)
+        break
+    if not error and final is not None and final != 0x0000:
+        error = _status_error(final)
+    elif not error and final is None:
+        error = "sem status final"
+    if not error and counts["failed"]:
+        error = _status_error(STATUS_SUBOPERATIONS_FAILED)
+    return MoveResult(not error, final, error=error, **counts)
+
+
 def move(
     node: PacsNode,
     identifier: Dataset,
@@ -185,82 +323,14 @@ def move(
     timeout: float,
     idle_timeout: float | None = None,
 ) -> MoveResult:
-    """Study Root C-MOVE; success requires Success and zero failed sub-ops.
-
-    ``timeout`` bounds the whole operation. ``idle_timeout`` bounds the time
-    without progress once the PACS has sent its first pending response: a
-    PACS that reports each sub-operation and then goes silent, or keeps
-    answering without sending images, has stalled. The first response may
-    take longer, since some PACS only answer after preparing the study.
-    """
-    if idle_timeout is None:
-        idle_timeout = MOVE_IDLE_TIMEOUT_SECONDS
-    deadline = monotonic() + timeout
-    assoc, error = _associate(node, StudyRootQueryRetrieveInformationModelMove, timeout)
-    if error:
-        return MoveResult(False, error=error)
-    counts = {"completed": 0, "failed": 0, "warning": 0, "remaining": 0}
-    final: int | None = None
-    progress: tuple[int, ...] | None = None
-    last_response = last_progress = monotonic()
-    idle_armed = False
-    try:
-        for status, _identifier in assoc.send_c_move(
-            identifier, destination_aet, StudyRootQueryRetrieveInformationModelMove
-        ):
-            now = monotonic()
-            if not status:
-                if idle_armed and now - last_response >= idle_timeout - 1:
-                    error = f"PACS sem enviar imagens por {int(idle_timeout)} s"
-                else:
-                    error = "tempo esgotado ou associação interrompida"
-                break
-            last_response = now
-            for key, keyword in (
-                ("completed", "NumberOfCompletedSuboperations"),
-                ("failed", "NumberOfFailedSuboperations"),
-                ("warning", "NumberOfWarningSuboperations"),
-                ("remaining", "NumberOfRemainingSuboperations"),
-            ):
-                value = status.get(keyword)
-                if value is not None:
-                    counts[key] = int(value)
-            code = int(status.Status)
-            if code in _PENDING:
-                if now > deadline:
-                    # Aborting stops the PACS from sending further sub-ops.
-                    error = "tempo esgotado"
-                    assoc.abort()
-                    break
-                done = tuple(counts.values())
-                if done != progress:
-                    progress, last_progress = done, now
-                elif idle_timeout and now - last_progress > idle_timeout:
-                    error = f"PACS sem enviar imagens por {int(idle_timeout)} s"
-                    assoc.abort()
-                    break
-                # pynetdicom reads the association's DIMSE timeout before each
-                # wait: a silent PACS is now cut at the idle limit, and never
-                # past the overall deadline.
-                wait = max(1.0, deadline - now)
-                if idle_timeout:
-                    idle_armed = True
-                    wait = min(wait, idle_timeout)
-                assoc.dimse_timeout = wait
-                continue
-            final = code
-            # Pending counts are stale once the final response arrives.
-            counts["remaining"] = int(status.get("NumberOfRemainingSuboperations") or 0)
-            break
-    finally:
-        _close(assoc)
-    if not error and final is not None and final != 0x0000:
-        error = _status_error(final)
-    elif not error and final is None:
-        error = "sem status final"
-    if not error and counts["failed"]:
-        error = _status_error(STATUS_SUBOPERATIONS_FAILED)
-    return MoveResult(not error, final, error=error, **counts)
+    """One C-MOVE on its own association (see MoveSession.move)."""
+    with MoveSession(node) as session:
+        return session.move(
+            identifier,
+            destination_aet=destination_aet,
+            timeout=timeout,
+            idle_timeout=idle_timeout,
+        )
 
 
 # -- identifiers ---------------------------------------------------------
@@ -346,23 +416,55 @@ def find_prior_series(node: PacsNode, *, timeout: float, **criteria) -> FindResu
     return find(node, prior_series_query(**criteria), timeout=timeout)
 
 
-def move_study(node: PacsNode, study_uid: str, *, timeout: float) -> MoveResult:
+def move_study(
+    node: PacsNode,
+    study_uid: str,
+    *,
+    timeout: float,
+    session: MoveSession | None = None,
+) -> MoveResult:
     # The unit's Calling AET is also the receiver's AE: the PACS sends the
     # images back to us, as movescu did with its default move destination.
-    return move(
-        node,
-        study_move_identifier(study_uid),
-        destination_aet=node.calling_aet,
-        timeout=timeout,
-    )
+    return _move_on(node, study_move_identifier(study_uid), timeout, session)
 
 
 def move_series(
-    node: PacsNode, study_uid: str, series_uid: str, *, timeout: float
+    node: PacsNode,
+    study_uid: str,
+    series_uid: str,
+    *,
+    timeout: float,
+    session: MoveSession | None = None,
+    idle_timeout: float | None = None,
 ) -> MoveResult:
-    return move(
+    """C-MOVE one series; with ``session``, on its shared association."""
+    return _move_on(
         node,
         series_move_identifier(study_uid, series_uid),
+        timeout,
+        session,
+        idle_timeout,
+    )
+
+
+def _move_on(
+    node: PacsNode,
+    identifier: Dataset,
+    timeout: float,
+    session: MoveSession | None,
+    idle_timeout: float | None = None,
+) -> MoveResult:
+    if session is None:
+        return move(
+            node,
+            identifier,
+            destination_aet=node.calling_aet,
+            timeout=timeout,
+            idle_timeout=idle_timeout,
+        )
+    return session.move(
+        identifier,
         destination_aet=node.calling_aet,
         timeout=timeout,
+        idle_timeout=idle_timeout,
     )

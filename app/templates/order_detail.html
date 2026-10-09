@@ -141,7 +141,7 @@
         {% for e in events %}
         <li class="timeline__item">
           <span class="timeline__marker" aria-hidden="true"></span>
-          <div class="timeline__meta">{{ e.created_at.strftime('%d/%m/%Y · %H:%M:%S') }} · {{ e.level }}</div>
+          <div class="timeline__meta">{{ e.created_at.strftime('%d/%m/%Y · %H:%M:%S') }} · {{ e.level }}{% if e.repeat_count and e.repeat_count > 1 %} · {{ e.repeat_count }} vezes{% if e.last_seen_at %}, última às {{ e.last_seen_at.strftime('%H:%M:%S') }}{% endif %}{% endif %}</div>
           <p class="timeline__message">{{ e.message }}</p>
           {% if e.detail %}<details><summary>Ver detalhes técnicos</summary><pre class="log-box">{{ e.detail[-8000:] }}</pre></details>{% endif %}
         </li>

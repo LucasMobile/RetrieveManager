@@ -16,7 +16,12 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
    - cada resposta é persistida imediatamente, sem esperar o restante do lote;
    - um job lento de confirmação não bloqueia C-FIND, C-MOVE ou outra unidade.
 2. **Localização no PACS (`dicom.find`)**
-   - consulta pedidos em `watching` no intervalo configurado;
+   - consulta pedidos em `watching` no intervalo configurado; cada vaga segue
+     consultando pedidos vencidos (até `FIND_BATCH_SIZE` por rodada), em vez de
+     um pedido por ciclo do agendador;
+   - pedidos sem exame no PACS são consultados com menos frequência conforme
+     envelhecem: o intervalo da unidade nos primeiros 15 min, 2× até 1 h e 4×
+     depois, sem passar de 5 min (ou do próprio intervalo, se maior);
    - C-FIND em pynetdicom: status final Success sem Study UID significa apenas
      “ainda não encontrado”;
    - associação recusada, sem conexão, tempo esgotado ou status de falha são
@@ -114,9 +119,18 @@ permitem reconstruir cada execução sem registrar dados clínicos em texto livr
      UID enviam o arquivo para quarentena, sem criar pedido ou enviar à nuvem;
    - pedidos arquivados do mesmo Study UID são restaurados em vez de duplicados.
 7. **Compactação (`dicom.compact.*`)**
-   - reserva até `COMPACT_BATCH_SIZE` instâncias `received` com `SKIP LOCKED`,
-     sem varrer a pasta; o estado final (`compacted`, `discarded`, `rejected`,
-     `error`) é gravado na mesma transação da transferência;
+   - reserva instâncias `received` com `SKIP LOCKED`, sem varrer a pasta, em
+     fluxo contínuo: até 2× os workers da unidade ficam reservados à frente e
+     cada vaga do codec é reposta assim que o arquivo dela termina, de modo que
+     um arquivo lento ocupa só a própria vaga; a drenagem dura até
+     `COMPACT_DRAIN_SECONDS` e os resultados são gravados e publicados em lotes
+     de `COMPACT_DB_BATCH_SIZE` ou a cada segundo; o estado final (`compacted`,
+     `discarded`, `rejected`, `error`) é gravado na mesma transação da
+     transferência;
+   - o receptor avisa o worker (`NOTIFY instances_received`) ao gravar
+     instâncias novas, e a compactação avisa o envio ao publicar arquivos: as
+     etapas começam na hora, sem esperar o próximo ciclo de
+     `WORKER_INTERVAL_SECONDS`, que continua como garantia;
    - reservas de um worker que caiu voltam à fila após o timeout; arquivo
      ausente vira `missing`;
    - arquivos sem registro na pasta de recebimento são adotados após
@@ -192,6 +206,10 @@ estado `cancelled`.
 - `dicom.compact.persist.batch status=fallback`: conflito no lote de banco,
   tratado novamente de forma isolada por arquivo;
 - `dicom.compact.temp.cleanup status=failure`: temporário antigo não pôde ser removido;
+- `db.pool.saturated`: todas as conexões do pool do serviço estavam em uso (as
+  próximas esperam até `DB_POOL_TIMEOUT_SECONDS`); `occurrences` conta quantas
+  vezes isso ocorreu desde o aviso anterior (no máximo um por minuto). Se for
+  frequente, aumente `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` daquele serviço;
 - `order.storescp.ingest`: pedido direto criado, associado, reutilizado ou restaurado;
 - `dicom.inbound.reject`: objeto direto rejeitado por identidade incompleta ou conflitante;
 - `dicom.inbound.reject error_type=UnauthorizedSender`: Calling AET fora da lista
@@ -220,6 +238,7 @@ Variáveis novas e seus padrões:
 
 - `FIND_BATCH_SIZE=10`
 - `COMPACT_BATCH_SIZE=250`
+- `COMPACT_DRAIN_SECONDS=60`
 - `COMPACT_GLOBAL_WORKERS=` (vazio = CPUs disponíveis − 2, mínimo 1)
 - `COMPACT_DB_BATCH_SIZE=25`
 - `COMPACT_TEMP_MAX_AGE_SECONDS=3600`
