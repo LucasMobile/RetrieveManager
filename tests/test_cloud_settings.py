@@ -1,3 +1,4 @@
+import time
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -171,6 +172,25 @@ class UnitCloudSettingsTest(DatabaseTestCase):
             _schedule_find_jobs(find_pool, jobs)
 
         self.assertEqual(find_pool.submit.call_count, 5)
+
+    def test_maintenance_runs_once_per_interval(self):
+        pool = MagicMock()
+        with (
+            patch("app.worker.SessionLocal", self.Session),
+            patch("app.worker._maintenance_due_at", 0.0),
+            patch("app.worker.recover_stale_locks") as recover,
+            patch("app.worker.cleanup_unmatched_orders") as cleanup,
+            patch("app.worker.archive_completed_orders") as archive,
+        ):
+            _tick(pool)
+            _tick(pool)
+            for stage in (recover, cleanup, archive):
+                self.assertEqual(stage.call_count, 1)
+
+            with patch("app.worker.monotonic", return_value=time.monotonic() + 61):
+                _tick(pool)
+            for stage in (recover, cleanup, archive):
+                self.assertEqual(stage.call_count, 2)
 
     def test_failure_in_one_unit_does_not_block_the_next_unit(self):
         with self.Session() as db:

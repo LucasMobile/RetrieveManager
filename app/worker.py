@@ -4,12 +4,13 @@ import logging
 import signal
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, Thread
-from time import perf_counter
+from time import monotonic, perf_counter
 
 from sqlalchemy import select
 
 from app.config import (
     COMPACT_UNIT_SCHEDULERS,
+    FIND_BATCH_SIZE,
     FIND_ORDERS_PER_UNIT,
     FIND_UNIT_SCHEDULERS,
     MONITOR_BATCH_SIZE,
@@ -21,8 +22,9 @@ from app.config import (
     WORKER_HEALTH_FILE,
     WORKER_INTERVAL_SECONDS,
 )
-from app.db import SessionLocal, init_db
+from app.db import INSTANCES_RECEIVED_CHANNEL, SessionLocal, init_db
 from app.models import Unit
+from app.notify import NotificationListener
 from app.observability import configure_logging, log_event
 from app.pipeline import (
     acknowledge_pending_orders,
@@ -38,15 +40,23 @@ from app.pipeline import (
     run_claimed_move,
     send_unit,
 )
+from app.pipeline.send import close_upload_runtimes
+from app.wakeup import COMPACT, SEND, wakeups
 
 log = logging.getLogger("worker")
 
 stop_event = Event()
 _health_touch_error_logged = False
 
+# Orphan locks (minutes old before they count), unmatched orders (24 h) and
+# completed orders (14 days) need no faster sweep than this.
+MAINTENANCE_INTERVAL_SECONDS = 60
+_maintenance_due_at = 0.0
+
 
 def _stop(*_args) -> None:
     stop_event.set()
+    wakeups.poke()
 
 
 def _touch_health() -> None:
@@ -159,19 +169,28 @@ def _compact_job(unit_id: int) -> None:
         has_more = _run_unit_stage(
             unit_id,
             "dicom.compact.batch",
-            compact_unit,
+            lambda db, unit: compact_unit(db, unit, stop=stop_event),
         )
         if has_more is not True:
             return
 
 
 def _find_job(unit_id: int) -> None:
-    """Claim and search one order in an isolated database session."""
-    _run_unit_stage(
-        unit_id,
-        "dicom.find.order",
-        lambda db, unit: find_pending(db, unit, max_orders=1),
-    )
+    """Search the unit's due orders one at a time, each in its own session.
+
+    The slot keeps searching while orders are due (up to FIND_BATCH_SIZE), so
+    the C-FIND rate is not capped at one order per scheduler interval.
+    """
+    for _ in range(max(1, FIND_BATCH_SIZE)):
+        if stop_event.is_set():
+            return
+        claimed = _run_unit_stage(
+            unit_id,
+            "dicom.find.order",
+            lambda db, unit: find_pending(db, unit, max_orders=1),
+        )
+        if not claimed:
+            return
 
 
 def _monitor_job(unit_id: int) -> None:
@@ -279,11 +298,14 @@ def _schedule_unit_job(
     unit_id: int,
     callback,
     stage: str,
-) -> None:
-    """Keep at most one background job of a given stage active per unit."""
+) -> bool:
+    """Keep at most one background job of a given stage active per unit.
+
+    Returns False when the unit's job is still running (or cannot start).
+    """
     existing = jobs.get(unit_id)
     if existing is not None and not existing.done():
-        return
+        return False
     if existing is not None:
         try:
             existing.result()
@@ -311,6 +333,46 @@ def _schedule_unit_job(
             stage=stage,
             unit_id=unit_id,
         )
+        return False
+    return True
+
+
+def _dispatch_wakeups(
+    requests: dict[str, set[int]],
+    compact_pool: ThreadPoolExecutor,
+    compact_jobs: dict[int, Future],
+    send_pool: ThreadPoolExecutor,
+    send_jobs: dict[int, Future],
+) -> None:
+    """Start the stages other stages asked for, without waiting for a tick.
+
+    A unit whose job is still running is asked again when it ends: the job
+    may have read its queue before the new work was committed.
+    """
+    targets = {
+        COMPACT: (compact_pool, compact_jobs, _compact_job, "dicom.compact.batch"),
+        SEND: (send_pool, send_jobs, _send_job, "cloud.send.batch"),
+    }
+    for stage, unit_ids in requests.items():
+        pool, jobs, callback, stage_name = targets[stage]
+        for unit_id in unit_ids:
+            if stop_event.is_set():
+                return
+            if not _schedule_unit_job(pool, jobs, unit_id, callback, stage_name):
+                running = jobs.get(unit_id)
+                if running is not None and not running.done():
+                    wakeups.request_after(stage, unit_id, running)
+
+
+def _received_listener_loop(listener: NotificationListener) -> None:
+    """Turn the receiver's NOTIFY of new instances into compaction wakeups."""
+    try:
+        while not stop_event.is_set():
+            payload = listener.wait(stop_event, WORKER_INTERVAL_SECONDS)
+            if payload and payload.isdecimal():
+                wakeups.request(COMPACT, int(payload))
+    finally:
+        listener.close()
 
 
 def main() -> None:
@@ -364,25 +426,44 @@ def main() -> None:
             unit_count=len(units),
             enabled_unit_count=sum(1 for unit in units if unit.enabled),
         )
+    received_listener = Thread(
+        target=_received_listener_loop,
+        args=(
+            NotificationListener(
+                INSTANCES_RECEIVED_CHANNEL, logger=log, action="worker.listen"
+            ),
+        ),
+        name="received-listener",
+        daemon=True,
+    )
     find_scheduler.start()
+    received_listener.start()
+    next_tick = 0.0
     try:
         while not stop_event.is_set():
             # A healthcheck deve provar que o loop está vivo mesmo quando uma etapa
             # legítima (por exemplo, compactação) ocupa vários segundos.
             _touch_health()
             try:
-                _tick(
-                    pool,
-                    ack_pool,
-                    ack_jobs,
-                    compact_pool,
-                    compact_jobs,
-                    send_pool,
-                    send_jobs,
-                    ingest_pool=ingest_pool,
-                    ingest_jobs=ingest_jobs,
+                if monotonic() >= next_tick:
+                    _tick(
+                        pool,
+                        ack_pool,
+                        ack_jobs,
+                        compact_pool,
+                        compact_jobs,
+                        send_pool,
+                        send_jobs,
+                        ingest_pool=ingest_pool,
+                        ingest_jobs=ingest_jobs,
+                    )
+                    next_tick = monotonic() + WORKER_INTERVAL_SECONDS
+                    _touch_health()
+                # Work announced by the receiver or by the compaction starts at
+                # once; the tick above remains the guarantee for everything.
+                _dispatch_wakeups(
+                    wakeups.take(), compact_pool, compact_jobs, send_pool, send_jobs
                 )
-                _touch_health()
             except Exception as exc:
                 log_event(
                     log,
@@ -392,10 +473,12 @@ def main() -> None:
                     status="failure",
                     error=exc,
                 )
-            stop_event.wait(WORKER_INTERVAL_SECONDS)
+                next_tick = monotonic() + WORKER_INTERVAL_SECONDS
+            wakeups.wait(next_tick - monotonic())
     finally:
         stop_event.set()
         find_scheduler.join(timeout=5)
+        received_listener.join(timeout=5)
         pool.shutdown(wait=True)
         ack_pool.shutdown(wait=True, cancel_futures=True)
         ingest_pool.shutdown(wait=True, cancel_futures=True)
@@ -403,6 +486,7 @@ def main() -> None:
         monitor_pool.shutdown(wait=True, cancel_futures=True)
         compact_pool.shutdown(wait=True, cancel_futures=True)
         send_pool.shutdown(wait=True, cancel_futures=True)
+        close_upload_runtimes()
         try:
             WORKER_HEALTH_FILE.unlink(missing_ok=True)
         except OSError as exc:
@@ -434,9 +518,12 @@ def _tick(
     ingest_pool: ThreadPoolExecutor | None = None,
     ingest_jobs: dict[int, Future] | None = None,
 ) -> None:
-    _run_db_stage("locks.recover", recover_stale_locks)
-    _run_db_stage("orders.cleanup_unmatched", cleanup_unmatched_orders)
-    _run_db_stage("orders.archive_completed", archive_completed_orders)
+    global _maintenance_due_at
+    if monotonic() >= _maintenance_due_at:
+        _run_db_stage("locks.recover", recover_stale_locks)
+        _run_db_stage("orders.cleanup_unmatched", cleanup_unmatched_orders)
+        _run_db_stage("orders.archive_completed", archive_completed_orders)
+        _maintenance_due_at = monotonic() + MAINTENANCE_INTERVAL_SECONDS
 
     with SessionLocal() as db:
         units = list(db.scalars(select(Unit).where(Unit.deleted_at.is_(None))))

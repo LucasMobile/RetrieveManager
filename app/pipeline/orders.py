@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import datetime, timedelta
 from time import monotonic, perf_counter
 
@@ -204,6 +205,8 @@ def ingest_unit(db: Session, unit: Unit) -> int:
 
     payload: list[dict] = []
     get_started_at = perf_counter()
+    # The GET snapshot predates any PUT that confirms during the request.
+    get_requested_at = datetime.now()
     try:
         # db.get(Unit) abriu uma transação; não retenha a conexão durante
         # um GET que pode consumir todo o timeout e suas tentativas.
@@ -242,12 +245,16 @@ def ingest_unit(db: Session, unit: Unit) -> int:
             "duplicate_payload",
             "existing",
             "existing_archived",
+            "confirmed_during_get",
             "persist_failed",
         ),
         0,
     )
     seen: set[str] = set()
     station_id = (unit.orders_api_station_id or "").strip()
+    # One read for every order the payload names, instead of one per item: a
+    # GET usually repeats many orders already recorded and not yet confirmed.
+    existing = _existing_orders(db, unit.id, payload)
     for item in payload:
         if not isinstance(item, dict):
             counts["invalid"] += 1
@@ -288,23 +295,26 @@ def ingest_unit(db: Session, unit: Unit) -> int:
             continue
         seen.add(parsed.accession_number)
 
+        exists = existing.get(parsed.accession_number)
+        if exists is not None:
+            if (
+                exists.api_read_status == "confirmed"
+                and exists.api_read_at is not None
+                and exists.api_read_at >= get_requested_at
+            ):
+                # Stale snapshot: the PUT landed while this GET was in flight.
+                # A second PUT would make the PLERES upsert create a stray
+                # document without the order's attachments.
+                counts["confirmed_during_get"] += 1
+                continue
+            counts["existing_archived" if exists.archived_at else "existing"] += 1
+            # A API ainda informou mirthReaded != true; ACK idempotente.
+            exists.api_read_status = "pending"
+            exists.api_read_last_error = ""
+            continue
         correlation_id = new_correlation_id()
         try:
             with db.begin_nested():
-                exists = db.scalar(
-                    select(Order).where(
-                        Order.unit_id == unit.id,
-                        Order.acc == parsed.accession_number,
-                    )
-                )
-                if exists:
-                    counts[
-                        "existing_archived" if exists.archived_at else "existing"
-                    ] += 1
-                    # A API ainda informou mirthReaded != true; ACK idempotente.
-                    exists.api_read_status = "pending"
-                    exists.api_read_last_error = ""
-                    continue
                 order = Order(
                     unit_id=unit.id,
                     source_id=parsed.source_id,
@@ -373,6 +383,26 @@ def ingest_unit(db: Session, unit: Unit) -> int:
         **{f"{key}_count": value for key, value in counts.items()},
     )
     return created
+
+
+def _existing_orders(db: Session, unit_id: int, payload: list) -> dict[str, Order]:
+    """The unit's orders named by the payload's accession numbers."""
+    accessions: set[str] = set()
+    for item in payload:
+        if isinstance(item, dict) and item.get("mirthReaded") is not True:
+            # Parsed as the loop does, so the keys match its accession numbers.
+            with suppress(InvalidApiOrder):
+                accessions.add(parse_api_order(item).accession_number)
+    if not accessions:
+        return {}
+    return {
+        order.acc: order
+        for order in db.scalars(
+            select(Order).where(
+                Order.unit_id == unit_id, Order.acc.in_(sorted(accessions))
+            )
+        )
+    }
 
 
 def acknowledge_pending_orders(db: Session, unit: Unit) -> None:

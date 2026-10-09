@@ -301,6 +301,8 @@ def _check_one(db: Session, unit: Unit, order: Order) -> None:
                     f"Verificação {number}: nenhuma imagem nova. {counts} {next_step}",
                     plan.detail,
                     level,
+                    # The closing check stays a line of its own.
+                    kind="monitor_no_change" if order.status == "monitoring" else "",
                 )
                 result = "no_change"
         db.commit()

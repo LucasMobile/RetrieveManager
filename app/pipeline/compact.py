@@ -7,12 +7,12 @@ import os
 import shutil
 from collections import Counter
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Condition, Lock
+from threading import Condition, Event, Lock
 from time import monotonic, perf_counter
 
 import pydicom
@@ -27,6 +27,7 @@ from app.compression import compression_runtime_settings
 from app.config import (
     COMPACT_BATCH_SIZE,
     COMPACT_DB_BATCH_SIZE,
+    COMPACT_DRAIN_SECONDS,
     COMPACT_FILE_TIMEOUT_SECONDS,
     COMPACT_GLOBAL_WORKERS,
     COMPACT_MAX_ENCODE_BYTES,
@@ -64,6 +65,7 @@ from app.pipeline.records import (
     persist_compact_chunk,
 )
 from app.validation import store_allowed_senders
+from app.wakeup import SEND, wakeups
 
 
 class FairSlots:
@@ -215,6 +217,8 @@ def _publish_outputs(
             execution_options={"synchronize_session": False},
         )
         db.commit()
+        # Upload them now rather than at the worker's next tick.
+        wakeups.request(SEND, unit.id)
     except SQLAlchemyError as exc:
         db.rollback()
         log_event(
@@ -588,8 +592,22 @@ def _adopt_receive_files(db: Session, unit: Unit, origin: Path, error_dir: Path)
     return adopted
 
 
-def compact_unit(db: Session, unit: Unit) -> bool:
-    """Process one bounded batch and report whether more work may be available."""
+# The stream reads an empty queue again at most this often while files of the
+# drain are still in the codec.
+_QUEUE_RECHECK_SECONDS = 1.0
+# A result waits at most this long to be recorded and published.
+_PERSIST_FLUSH_SECONDS = 1.0
+
+
+def compact_unit(db: Session, unit: Unit, stop: Event | None = None) -> bool:
+    """Compact the unit's queue as a stream; report whether more may be waiting.
+
+    Each codec slot is refilled as soon as its file ends (up to twice the
+    unit's workers are claimed ahead), so a slow file holds only its own slot
+    instead of the whole batch. Refilling stops when the queue is empty, after
+    COMPACT_DRAIN_SECONDS or on ``stop``; the files already claimed are
+    finished before returning.
+    """
     origin = Path(unit.receive_dir)
     dest_dir = Path(unit.send_dir)
     error_dir = Path(unit.error_dir)
@@ -614,99 +632,130 @@ def compact_unit(db: Session, unit: Unit) -> bool:
     _recover_stale_instance_claims(db, unit)
     _recover_publishing_transfers(db, unit)
     _adopt_receive_files(db, unit, origin, error_dir)
-    claims = _claim_received_instances(db, unit, COMPACT_BATCH_SIZE)
-    if not claims:
-        return False
-    jobs = [path for _instance_id, path in claims]
-    instance_by_path = {path: instance_id for instance_id, path in claims}
-    batch_correlation = new_correlation_id()
-    started_at = perf_counter()
+    # As regras já foram materializadas em valores simples. Devolva a conexão
+    # ao pool enquanto o codec processa os arquivos.
+    db.commit()
     # The unit's own cap; the server-wide slots are shared between units.
     workers = max(1, unit.compact_workers or COMPACT_GLOBAL_WORKERS)
-    with log_context(batch_correlation):
-        log_event(
-            log,
-            logging.INFO,
-            "dicom.compact.batch",
-            resource=f"unit:{unit.id}",
-            status="started",
-            unit_id=unit.id,
-            file_count=len(jobs),
-            unit_worker_limit=workers,
-            global_worker_limit=max(1, COMPACT_GLOBAL_WORKERS),
-        )
+    ahead = 2 * workers
+    deadline = monotonic() + COMPACT_DRAIN_SECONDS
+    batch_correlation = new_correlation_id()
+    started_at = perf_counter()
+    claimed_count = 0
     processed_count = 0
     failed_count = 0
     codec_counts = {METHOD_LOSSLESS: 0, METHOD_LOSSY: 0, METHOD_COPY: 0}
-    persistence_buffer: list[CompactResult] = []
-    # As regras já foram materializadas em valores simples. Devolva a conexão
-    # ao pool enquanto o codec processa os arquivos deste lote.
-    db.commit()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {
-            pool.submit(
-                _compact_one_limited,
-                unit.id,
-                str(p),
-                str(dest_dir / (p.name + ".dcm")),
-                str(error_dir / p.name),
-                str(work_dir),
-                unit.token,
-                drops,
-                compress_map,
-                dicom_rules,
-                allowed_senders,
-            ): p
-            for p in jobs
-        }
-        for future in as_completed(futs):
-            try:
-                result = future.result()
-            except Exception as exc:
-                failed_count += 1
-                source = futs[future]
-                quarantine_error = None
-                try:
-                    _quarantine_failed_source(source, error_dir)
-                except OSError as quarantine_exc:
-                    quarantine_error = safe_error_detail(quarantine_exc)
-                _mark_instance_failed(db, instance_by_path[source], type(exc).__name__)
-                log_event(
-                    log,
-                    logging.ERROR,
-                    "dicom.compact.file",
-                    resource=f"unit:{unit.id}",
-                    status="failure",
-                    error=exc,
-                    unit_id=unit.id,
-                    filename=source.name,
-                    quarantine_error=quarantine_error,
-                )
-                continue
-            if result.codec_method in codec_counts:
-                codec_counts[result.codec_method] += 1
-            persistence_buffer.append(
-                replace(result, instance_id=instance_by_path[futs[future]])
-            )
-            if len(persistence_buffer) >= max(1, COMPACT_DB_BATCH_SIZE):
-                recorded, persist_failures = persist_compact_chunk(
-                    db,
-                    unit,
-                    persistence_buffer,
-                )
-                _publish_outputs(db, unit, persistence_buffer, recorded)
-                processed_count += len(recorded)
-                failed_count += persist_failures
-                persistence_buffer.clear()
-    if persistence_buffer:
-        recorded, persist_failures = persist_compact_chunk(
-            db,
-            unit,
-            persistence_buffer,
-        )
-        _publish_outputs(db, unit, persistence_buffer, recorded)
+    pending: dict[Future, tuple[int, Path]] = {}
+    buffer: list[CompactResult] = []
+    buffered_at = 0.0
+    # When a claim last came back short: the queue was (nearly) empty then.
+    empty_at: float | None = None
+
+    def flush() -> None:
+        nonlocal processed_count, failed_count
+        recorded, persist_failures = persist_compact_chunk(db, unit, buffer)
+        _publish_outputs(db, unit, buffer, recorded)
         processed_count += len(recorded)
         failed_count += persist_failures
+        buffer.clear()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while True:
+            now = monotonic()
+            refilling = not (stop is not None and stop.is_set()) and (
+                now < deadline or (claimed_count == 0 and empty_at is None)
+            )
+            if (
+                refilling
+                and len(pending) < ahead
+                and (
+                    empty_at is None
+                    or not pending
+                    or now - empty_at >= _QUEUE_RECHECK_SECONDS
+                )
+            ):
+                wanted = min(max(1, COMPACT_BATCH_SIZE), ahead - len(pending))
+                claims = _claim_received_instances(db, unit, wanted)
+                empty_at = monotonic() if len(claims) < wanted else None
+                if claims and not claimed_count:
+                    with log_context(batch_correlation):
+                        log_event(
+                            log,
+                            logging.INFO,
+                            "dicom.compact.batch",
+                            resource=f"unit:{unit.id}",
+                            status="started",
+                            unit_id=unit.id,
+                            file_count=len(claims),
+                            unit_worker_limit=workers,
+                            global_worker_limit=max(1, COMPACT_GLOBAL_WORKERS),
+                        )
+                claimed_count += len(claims)
+                for instance_id, source in claims:
+                    future = pool.submit(
+                        _compact_one_limited,
+                        unit.id,
+                        str(source),
+                        str(dest_dir / (source.name + ".dcm")),
+                        str(error_dir / source.name),
+                        str(work_dir),
+                        unit.token,
+                        drops,
+                        compress_map,
+                        dicom_rules,
+                        allowed_senders,
+                    )
+                    pending[future] = (instance_id, source)
+            if not pending:
+                break
+            timeout = None
+            if buffer:
+                timeout = max(0.0, buffered_at + _PERSIST_FLUSH_SECONDS - now)
+            if refilling and empty_at is not None and len(pending) < ahead:
+                recheck = max(0.0, empty_at + _QUEUE_RECHECK_SECONDS - now)
+                timeout = recheck if timeout is None else min(timeout, recheck)
+            done, _running = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            for future in done:
+                instance_id, source = pending.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failed_count += 1
+                    quarantine_error = None
+                    try:
+                        _quarantine_failed_source(source, error_dir)
+                    except OSError as quarantine_exc:
+                        quarantine_error = safe_error_detail(quarantine_exc)
+                    _mark_instance_failed(db, instance_id, type(exc).__name__)
+                    log_event(
+                        log,
+                        logging.ERROR,
+                        "dicom.compact.file",
+                        resource=f"unit:{unit.id}",
+                        status="failure",
+                        error=exc,
+                        unit_id=unit.id,
+                        filename=source.name,
+                        quarantine_error=quarantine_error,
+                    )
+                    continue
+                if result.codec_method in codec_counts:
+                    codec_counts[result.codec_method] += 1
+                if not buffer:
+                    buffered_at = monotonic()
+                buffer.append(replace(result, instance_id=instance_id))
+            if buffer and (
+                not pending
+                or len(buffer) >= max(1, COMPACT_DB_BATCH_SIZE)
+                or monotonic() - buffered_at >= _PERSIST_FLUSH_SECONDS
+            ):
+                flush()
+    if buffer:
+        flush()
+    if not claimed_count:
+        return False
+    # Refilling ended by time or stop while the claims still came back full.
+    has_more = empty_at is None
     elapsed_seconds = max(perf_counter() - started_at, 0.001)
     with log_context(batch_correlation):
         log_event(
@@ -717,17 +766,17 @@ def compact_unit(db: Session, unit: Unit) -> bool:
             status="partial" if failed_count else "success",
             started_at=started_at,
             unit_id=unit.id,
-            file_count=len(jobs),
+            file_count=claimed_count,
             processed_count=processed_count,
             failed_count=failed_count,
-            backlog_hint=len(jobs) >= COMPACT_BATCH_SIZE,
+            backlog_hint=has_more,
             files_per_second=round(processed_count / elapsed_seconds, 2),
             lossless_count=codec_counts[METHOD_LOSSLESS],
             lossy_count=codec_counts[METHOD_LOSSY],
             copy_count=codec_counts[METHOD_COPY],
             db_batch_size=max(1, COMPACT_DB_BATCH_SIZE),
         )
-    return len(jobs) >= COMPACT_BATCH_SIZE
+    return has_more
 
 
 _codec_pool = CodecPool("app.compaction:prepare", COMPACT_GLOBAL_WORKERS)

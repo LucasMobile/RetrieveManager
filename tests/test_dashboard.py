@@ -6,9 +6,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.models import Order, Unit
+from app.pipeline.common import folder_counts
 from app.routes.dashboard import (
     _dashboard_folder_cache,
     _dashboard_units,
+    _store_listening_cache,
     _unit_runtime,
 )
 from tests.support import DatabaseTestCase, make_unit
@@ -18,6 +20,8 @@ class DashboardTest(DatabaseTestCase):
     def setUp(self):
         super().setUp()
         self.temp_dir = tempfile.TemporaryDirectory()
+        _store_listening_cache.clear()
+        self.addCleanup(_store_listening_cache.clear)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -114,6 +118,41 @@ class DashboardTest(DatabaseTestCase):
             self.assertEqual(active_view.counts["running"], 1)
             self.assertEqual(active_view.counts["error"], 2)
 
+    def test_queue_error_filter_matches_dashboard_error_count(self):
+        from sqlalchemy import select
+
+        from app.routes.orders import status_condition
+
+        with self.Session() as db:
+            unit = self._unit("A", enabled=True)
+            db.add(unit)
+            db.flush()
+            for acc, status, prior in (
+                ("1", "error", "disabled"),
+                ("2", "done", "error"),
+                ("3", "done", "done"),
+            ):
+                db.add(
+                    Order(
+                        unit_id=unit.id,
+                        source_id=acc,
+                        acc=acc,
+                        birth_date="20000101",
+                        status=status,
+                        prior_status=prior,
+                    )
+                )
+            db.commit()
+
+            _units, _pager, summary = _dashboard_units(db, 1)
+            listed = db.scalars(
+                select(Order.acc).where(status_condition("error")).order_by(Order.acc)
+            ).all()
+            self.assertEqual(listed, ["1", "2"])
+            self.assertEqual(summary["error"], len(listed))
+            done = db.scalars(select(Order.acc).where(status_condition("done"))).all()
+            self.assertEqual(sorted(done), ["2", "3"])
+
     def test_unit_runtime_checks_run_concurrently(self):
         barrier = threading.Barrier(2)
 
@@ -137,6 +176,20 @@ class DashboardTest(DatabaseTestCase):
         self.assertEqual(len(units), 2)
         self.assertTrue(all(unit.store_up for unit in units))
 
+    def test_folder_counts_skip_hidden_files_and_folders(self):
+        root = Path(self.temp_dir.name)
+        receive = root / "receive"
+        (receive / "sub").mkdir(parents=True)
+        (receive / "CT.1").write_bytes(b"x")
+        (receive / "CT.2").write_bytes(b"x")
+        (receive / ".rx-partial.tmp").write_bytes(b"x")
+        unit = make_unit(
+            receive_dir=str(receive),
+            send_dir=str(root / "missing"),
+            error_dir=str(receive / "CT.1"),  # not a folder
+        )
+        self.assertEqual(folder_counts(unit), {"receive": 2, "send": 0, "error": 0})
+
     def test_folder_counts_are_cached_between_dashboard_refreshes(self):
         unit = self._unit("A", enabled=True)
         unit.id = 999
@@ -159,7 +212,8 @@ class DashboardTest(DatabaseTestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(counts.call_count, 1)
-        self.assertEqual(port.call_count, 2)
+        # The store port is checked once for both refreshes too.
+        self.assertEqual(port.call_count, 1)
         _dashboard_folder_cache.pop(cache_key, None)
 
 

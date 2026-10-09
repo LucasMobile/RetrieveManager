@@ -748,6 +748,48 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn("data-poll=", page.text)
         self.assertNotIn("Atualização automática", page.text)
 
+    def test_large_history_caps_its_count_and_shows_only_the_total(self):
+        self.login()
+        with self.Session() as db:
+            unit = make_unit()
+            db.add(unit)
+            db.flush()
+            db.add_all(
+                Order(
+                    unit_id=unit.id,
+                    acc=f"archived-{index}",
+                    birth_date="20000101",
+                    status="done",
+                    archived_at=datetime.now(),
+                    archive_reason="Teste",
+                )
+                for index in range(5)
+            )
+            db.commit()
+
+        with patch("app.routes.orders.HISTORY_COUNT_LIMIT", 10):
+            exact = self.client.get("/orders/history")
+        self.assertEqual(exact.status_code, 200)
+        self.assertIn("5 resultados", exact.text)
+        # Archived orders are never waiting or running: no such counters.
+        self.assertNotIn("em processamento", exact.text)
+        self.assertNotIn(">aguardando<", exact.text)
+
+        with patch("app.routes.orders.HISTORY_COUNT_LIMIT", 3):
+            capped = self.client.get("/orders/history", params={"page_size": 10})
+            self.assertEqual(capped.status_code, 200)
+            self.assertIn("mais de 3 resultados", capped.text)
+            self.assertIn("Exibindo 1–5 de mais de 3 | Página 1", capped.text)
+            self.assertNotIn("Página 1 de", capped.text)
+
+            # The oldest page: its number is unknown beyond the limit.
+            oldest = self.client.get(
+                "/orders/history", params={"last": 1, "page": 0, "page_size": 10}
+            )
+            self.assertEqual(oldest.status_code, 200)
+            self.assertIn("archived-0", oldest.text)
+            self.assertIn("Exibindo 5 de mais de 3", oldest.text)
+
     def test_missing_order_detail_redirects_with_notice(self):
         self.login()
         response = self.client.get("/orders/999999", follow_redirects=False)

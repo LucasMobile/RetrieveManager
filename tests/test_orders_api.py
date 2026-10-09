@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from app.models import AuditLog, Order, Unit
 from app.orders_api import (
@@ -137,6 +137,37 @@ class OrdersApiIngestionTest(DatabaseTestCase):
             self.assertEqual(audit.resource_type, "order")
             self.assertEqual(audit.resource_id, str(orders[0].id))
 
+    def test_known_orders_are_read_in_one_query(self):
+        def run(count):
+            _last_orders_api_poll.clear()
+            payload = [self._payload(f"ACC-{index}") for index in range(count)]
+            statements = []
+
+            def track(_conn, _cursor, statement, *_args):
+                statements.append(statement)
+
+            event.listen(self.engine, "before_cursor_execute", track)
+            try:
+                with patch(
+                    "app.pipeline.orders.fetch_orders",
+                    new=AsyncMock(return_value=payload),
+                ):
+                    ingest_unit(db, unit)
+            finally:
+                event.remove(self.engine, "before_cursor_execute", track)
+            return [s for s in statements if s.lstrip().startswith("SELECT")]
+
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.commit()
+            # Every order of the second GET is already recorded (no ACK yet).
+            run(30)
+            self.assertEqual(len(run(30)), 1)
+            orders = list(db.scalars(select(Order)))
+            self.assertEqual(len(orders), 30)
+            self.assertEqual({order.api_read_status for order in orders}, {"pending"})
+
     def test_failed_background_ack_is_retried_without_duplicate_order(self):
         with self.Session() as db:
             unit = self._unit()
@@ -174,6 +205,42 @@ class OrdersApiIngestionTest(DatabaseTestCase):
             self.assertEqual(db.scalar(select(Order)).api_read_status, "confirmed")
             self.assertEqual(db.scalar(select(Order)).api_read_attempts, 2)
             self.assertEqual(len(list(db.scalars(select(Order)))), 1)
+
+    def test_get_snapshot_older_than_confirmation_does_not_reack(self):
+        with self.Session() as db:
+            unit = self._unit()
+            db.add(unit)
+            db.commit()
+            with patch(
+                "app.pipeline.orders.fetch_orders",
+                new=AsyncMock(return_value=[self._payload()]),
+            ):
+                self.assertEqual(ingest_unit(db, unit), 1)
+
+            def ack_during_get(*_args, **_kwargs):
+                # The ACK job's PUT confirms while this GET is still in flight.
+                order = db.scalar(select(Order))
+                order.api_read_status = "confirmed"
+                order.api_read_at = datetime.now()
+                db.commit()
+                return [self._payload()]
+
+            _last_orders_api_poll.clear()
+            with patch(
+                "app.pipeline.orders.fetch_orders",
+                new=AsyncMock(side_effect=ack_during_get),
+            ):
+                ingest_unit(db, unit)
+            self.assertEqual(db.scalar(select(Order)).api_read_status, "confirmed")
+
+            # A later GET that still reports it unread re-acknowledges.
+            _last_orders_api_poll.clear()
+            with patch(
+                "app.pipeline.orders.fetch_orders",
+                new=AsyncMock(return_value=[self._payload()]),
+            ):
+                ingest_unit(db, unit)
+            self.assertEqual(db.scalar(select(Order)).api_read_status, "pending")
 
     def test_get_failure_logs_the_safe_error_detail(self):
         with self.Session() as db:

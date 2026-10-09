@@ -168,6 +168,11 @@ FIND_TIMEOUT_SECONDS = _env_int("FIND_TIMEOUT_SECONDS", 20)
 # this long is aborted, so a stalled transfer frees its slot instead of holding
 # it for the whole unit timeout. 0 disables the check.
 MOVE_IDLE_TIMEOUT_SECONDS = _env_int("MOVE_IDLE_TIMEOUT_SECONDS", 120, minimum=0)
+# The same check for the historical retrieve: old studies often sit on slower
+# PACS storage and pause longer between images.
+PRIOR_MOVE_IDLE_TIMEOUT_SECONDS = _env_int(
+    "PRIOR_MOVE_IDLE_TIMEOUT_SECONDS", 300, minimum=0
+)
 # After a C-MOVE the PACS calls successful, how long to wait for the receiver
 # to record at least one image of it before treating the images as lost.
 MOVE_RECEIVE_CONFIRM_SECONDS = _env_int("MOVE_RECEIVE_CONFIRM_SECONDS", 15, minimum=0)
@@ -177,6 +182,9 @@ MONITOR_UNIT_SCHEDULERS = _env_int("MONITOR_UNIT_SCHEDULERS", 4)
 MONITOR_CHECKS_PER_UNIT = _env_int("MONITOR_CHECKS_PER_UNIT", 2)
 MONITOR_BATCH_SIZE = _env_int("MONITOR_BATCH_SIZE", 25)
 COMPACT_BATCH_SIZE = _env_int("COMPACT_BATCH_SIZE", 250)
+# One compaction drain keeps refilling its codec slots for this long before
+# returning control to the worker scheduler (0 = a single claim per call).
+COMPACT_DRAIN_SECONDS = _env_int("COMPACT_DRAIN_SECONDS", 60, minimum=0)
 # Codec processes of the whole server, shared fairly by the units compacting
 # at the same time (pipeline.compact.FairSlots).
 COMPACT_GLOBAL_WORKERS = _env_compact_workers()

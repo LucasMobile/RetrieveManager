@@ -69,6 +69,8 @@ class FakePacs:
         self.stall_seconds = stall_seconds
         self.port = free_port()
         self.moves: list[str] = []
+        # Associations requested by the SCU (C-FIND, C-MOVE) and accepted.
+        self.associations = 0
         self._server = None
 
     def start(self) -> FakePacs:
@@ -86,6 +88,7 @@ class FakePacs:
             evt_handlers=[
                 (evt.EVT_C_FIND, self._on_find),
                 (evt.EVT_C_MOVE, self._on_move),
+                (evt.EVT_ACCEPTED, self._on_accepted),
             ],
         )
         return self
@@ -93,6 +96,9 @@ class FakePacs:
     def stop(self) -> None:
         if self._server is not None:
             self._server.shutdown()
+
+    def _on_accepted(self, _event) -> None:
+        self.associations += 1
 
     def _select(self, query: Dataset) -> list[Dataset]:
         return [image for image in self.images if _matches(image, query)]

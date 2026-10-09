@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import os
 
 from app.models import (
     Order,
@@ -36,15 +36,15 @@ def append_diagnostic(parts: list[str], label: str, output: str) -> None:
 
 def folder_counts(unit: Unit) -> dict[str, int]:
     def count(p: str) -> int:
-        path = Path(p)
+        # scandir reads the file type with each name: no stat() per file, which
+        # matters with tens of thousands of files waiting in a folder.
         try:
-            if not path.is_dir():
-                return 0
-            return sum(
-                1
-                for file in path.iterdir()
-                if file.is_file() and not file.name.startswith(".")
-            )
+            with os.scandir(p) as entries:
+                return sum(
+                    1
+                    for entry in entries
+                    if not entry.name.startswith(".") and entry.is_file()
+                )
         except OSError:
             return 0
 

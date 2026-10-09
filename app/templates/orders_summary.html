@@ -1,7 +1,14 @@
 {% from "components/summary.html" import summary_item %}
+  {% if history %}
+  {# Arquivados nunca estão aguardando nem em processamento: só o total. #}
+  <section class="summary-strip summary-strip--surface" aria-label="Resumo da seleção" data-poll-slot="summary">
+    {{ summary_item("orders", order_summary.total_label, order_summary.total | plural("pedido arquivado", "pedidos arquivados")) }}
+  </section>
+  {% else %}
   <section class="summary-strip summary-strip--four summary-strip--surface" aria-label="Resumo da seleção" data-poll-slot="summary">
-    {{ summary_item("orders", order_summary.total, order_summary.total | plural("pedido arquivado", "pedidos arquivados") if history else order_summary.total | plural("pedido na seleção", "pedidos na seleção")) }}
+    {{ summary_item("orders", order_summary.total, order_summary.total | plural("pedido na seleção", "pedidos na seleção")) }}
     {{ summary_item("clock", order_summary.waiting, "aguardando", "warning") }}
     {{ summary_item("activity", order_summary.running, "em processamento") }}
     {{ summary_item("check", order_summary.done, order_summary.done | plural("concluído", "concluídos"), "success") }}
   </section>
+  {% endif %}
